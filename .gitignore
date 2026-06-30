@@ -1,0 +1,14 @@
+# Investigation clones and temporary references
+upstream/
+.cpa-reference/
+
+# Build outputs
+dist/
+*.dll
+*.so
+*.dylib
+*.h
+
+# Local config/secrets
+.env
+config.yaml
