@@ -5,7 +5,6 @@ import (
 	"testing"
 )
 
-
 func TestDefaultConfigEnabledTrue(t *testing.T) {
 	cfg := defaultConfig()
 	if !cfg.Enabled {
