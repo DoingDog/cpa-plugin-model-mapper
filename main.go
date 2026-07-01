@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -8,6 +9,86 @@ import (
 )
 
 func main() {}
+
+type sseRewriter struct {
+	originalModel string
+	buf           []byte
+}
+
+func newSSERewriter(originalModel string) *sseRewriter {
+	return &sseRewriter{originalModel: originalModel}
+}
+
+func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
+	r.buf = append(r.buf, p...)
+	var out [][]byte
+	for {
+		delim, n := sseEventDelimiter(r.buf)
+		if n == 0 {
+			break
+		}
+		event := append([]byte(nil), r.buf[:delim]...)
+		r.buf = r.buf[delim+n:]
+		rewritten, err := r.rewriteEvent(event)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rewritten...)
+		out = append(out, r.delimiterBytes(n))
+	}
+	return out, nil
+}
+
+func (r *sseRewriter) Flush() ([][]byte, error) {
+	if len(r.buf) == 0 {
+		return nil, nil
+	}
+	out := [][]byte{append([]byte(nil), r.buf...)}
+	r.buf = nil
+	return out, nil
+}
+
+func (r *sseRewriter) rewriteEvent(event []byte) ([][]byte, error) {
+	lines := strings.Split(string(event), "\n")
+	out := make([][]byte, 0, len(lines))
+	for _, raw := range lines {
+		line := strings.TrimSuffix(raw, "\r")
+		if strings.HasPrefix(line, "data:") {
+			value := strings.TrimSpace(line[len("data:"):])
+			if value == "[DONE]" || value == "" {
+				out = append(out, []byte(line))
+				continue
+			}
+			restored, changed, err := restoreResponseModel([]byte(value), r.originalModel)
+			if err != nil {
+				return nil, err
+			}
+			if changed {
+				out = append(out, append([]byte("data: "), restored...))
+				continue
+			}
+		}
+		out = append(out, []byte(line))
+	}
+	return out, nil
+}
+
+func sseEventDelimiter(buf []byte) (eventLen, delimLen int) {
+	if i := bytes.Index(buf, []byte("\r\n\r\n")); i >= 0 {
+		return i, 4
+	}
+	if i := bytes.Index(buf, []byte("\n\n")); i >= 0 {
+		return i, 2
+	}
+	return 0, 0
+}
+
+func (r *sseRewriter) delimiterBytes(n int) []byte {
+	if n == 4 {
+		return []byte("\r\n\r\n")
+	}
+	return []byte("\n\n")
+}
 
 type Config struct {
 	Enabled                bool   `json:"enabled"`

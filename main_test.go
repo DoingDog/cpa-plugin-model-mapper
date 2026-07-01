@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -271,5 +273,75 @@ func TestRestoreResponseModelLeavesUnsupportedBodiesUnchanged(t *testing.T) {
 		if changed || string(got) != string(body) {
 			t.Fatalf("restoreResponseModel(%s)=(%s,%v), want unchanged false", body, got, changed)
 		}
+	}
+}
+
+func flattenChunks(chunks [][]byte) string {
+	var b strings.Builder
+	for _, chunk := range chunks {
+		b.Write(chunk)
+	}
+	return b.String()
+}
+
+func TestSSERewriterRestoresCompleteJSONEvent(t *testing.T) {
+	r := newSSERewriter("A")
+	out, err := r.Write([]byte("data: {\"model\":\"B\",\"id\":\"1\"}\n\n"))
+	if err != nil {
+		t.Fatalf("Write error = %v", err)
+	}
+	got := flattenChunks(out)
+	if !strings.Contains(got, `"model":"A"`) || strings.Contains(got, `"model":"B"`) {
+		t.Fatalf("rewritten event = %q", got)
+	}
+}
+
+func TestSSERewriterBuffersSplitJSONUntilComplete(t *testing.T) {
+	r := newSSERewriter("A")
+	out, err := r.Write([]byte("data: {\"model\":\"B"))
+	if err != nil {
+		t.Fatalf("first Write error = %v", err)
+	}
+	if len(out) != 0 {
+		t.Fatalf("first Write emitted %q, want no partial output", flattenChunks(out))
+	}
+	out, err = r.Write([]byte("\"}\n\n"))
+	if err != nil {
+		t.Fatalf("second Write error = %v", err)
+	}
+	got := flattenChunks(out)
+	if !strings.Contains(got, `"model":"A"`) || strings.Contains(got, `"model":"B"`) {
+		t.Fatalf("rewritten split event = %q", got)
+	}
+}
+
+func TestSSERewriterPassesThroughDoneCommentsAndNonJSON(t *testing.T) {
+	r := newSSERewriter("A")
+	input := ": keepalive\n\ndata: [DONE]\n\ndata: hello\n\n"
+	out, err := r.Write([]byte(input))
+	if err != nil {
+		t.Fatalf("Write error = %v", err)
+	}
+	if got := flattenChunks(out); got != input {
+		t.Fatalf("got %q, want %q", got, input)
+	}
+}
+
+func TestSSERewriterHandlesMultipleEventsCRLFAndFlush(t *testing.T) {
+	r := newSSERewriter("A")
+	out, err := r.Write([]byte("data: {\"model\":\"B\"}\r\n\r\ndata: [DONE]\r\n\r\nleftover"))
+	if err != nil {
+		t.Fatalf("Write error = %v", err)
+	}
+	got := flattenChunks(out)
+	if !strings.Contains(got, `"model":"A"`) || !strings.Contains(got, "data: [DONE]") || strings.Contains(got, "leftover") {
+		t.Fatalf("Write output = %q", got)
+	}
+	flushed, err := r.Flush()
+	if err != nil {
+		t.Fatalf("Flush error = %v", err)
+	}
+	if string(bytes.Join(flushed, nil)) != "leftover" {
+		t.Fatalf("Flush output = %q", string(bytes.Join(flushed, nil)))
 	}
 }
