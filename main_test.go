@@ -3,9 +3,57 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
+
+	pluginabi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
+	pluginapi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
+
+func TestPluginRegistrationMetadataAndConfigFields(t *testing.T) {
+	reg := pluginRegistration()
+	if reg.SchemaVersion != pluginabi.SchemaVersion {
+		t.Fatalf("schema version=%d, want %d", reg.SchemaVersion, pluginabi.SchemaVersion)
+	}
+	if reg.Metadata.Name != "model-mapper" {
+		t.Fatalf("plugin name=%q", reg.Metadata.Name)
+	}
+	if !reg.Capabilities.ModelRouter || !reg.Capabilities.Executor {
+		t.Fatalf("capabilities=%#v, want model router and executor", reg.Capabilities)
+	}
+	if reg.Capabilities.ExecutorModelScope != string(pluginapi.ExecutorModelScopeStatic) {
+		t.Fatalf("executor scope=%q", reg.Capabilities.ExecutorModelScope)
+	}
+	wantFields := []string{"enabled", "global_rules", "claude_messages_rules", "codex_responses_rules", "openai_completions_rules"}
+	got := make([]string, 0, len(reg.Metadata.ConfigFields))
+	for _, field := range reg.Metadata.ConfigFields {
+		got = append(got, field.Name)
+	}
+	if !reflect.DeepEqual(got, wantFields) {
+		t.Fatalf("config fields=%v, want %v", got, wantFields)
+	}
+}
+
+func TestDecodeConfigDefaultAndBadRules(t *testing.T) {
+	cfg, err := decodeConfig(nil)
+	if err != nil {
+		t.Fatalf("decodeConfig nil error = %v", err)
+	}
+	if !cfg.Enabled {
+		t.Fatalf("decoded default enabled=false")
+	}
+	if _, err := decodeConfig(json.RawMessage(`{"enabled":true,"global_rules":"bad rule"}`)); err == nil {
+		t.Fatalf("decodeConfig bad rules error = nil")
+	}
+	cfg, err = decodeConfig(json.RawMessage(`{"enabled":false,"global_rules":"a=>b"}`))
+	if err != nil {
+		t.Fatalf("decodeConfig valid error = %v", err)
+	}
+	if cfg.Enabled {
+		t.Fatalf("enabled=true, want false from config")
+	}
+}
 
 func TestDefaultConfigEnabledTrue(t *testing.T) {
 	cfg := defaultConfig()

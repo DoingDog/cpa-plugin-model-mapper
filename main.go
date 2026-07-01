@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
+
+	pluginabi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
+	pluginapi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 func main() {}
@@ -112,6 +115,72 @@ type Config struct {
 	ClaudeMessagesRules    string `json:"claude_messages_rules"`
 	CodexResponsesRules    string `json:"codex_responses_rules"`
 	OpenAICompletionsRules string `json:"openai_completions_rules"`
+}
+
+type registration struct {
+	SchemaVersion uint32                   `json:"schema_version"`
+	Metadata      pluginapi.Metadata       `json:"metadata"`
+	Capabilities  registrationCapabilities `json:"capabilities"`
+}
+
+type registrationCapabilities struct {
+	ModelRouter           bool     `json:"model_router"`
+	Executor              bool     `json:"executor"`
+	ExecutorModelScope    string   `json:"executor_model_scope"`
+	ExecutorInputFormats  []string `json:"executor_input_formats"`
+	ExecutorOutputFormats []string `json:"executor_output_formats"`
+}
+
+func pluginRegistration() registration {
+	return registration{
+		SchemaVersion: pluginabi.SchemaVersion,
+		Metadata: pluginapi.Metadata{
+			Name: "model-mapper",
+			ConfigFields: []pluginapi.ConfigField{
+				{Name: "enabled", Type: pluginapi.ConfigFieldTypeBoolean},
+				{Name: "global_rules", Type: pluginapi.ConfigFieldTypeString},
+				{Name: "claude_messages_rules", Type: pluginapi.ConfigFieldTypeString},
+				{Name: "codex_responses_rules", Type: pluginapi.ConfigFieldTypeString},
+				{Name: "openai_completions_rules", Type: pluginapi.ConfigFieldTypeString},
+			},
+		},
+		Capabilities: registrationCapabilities{
+			ModelRouter:        true,
+			Executor:           true,
+			ExecutorModelScope: string(pluginapi.ExecutorModelScopeStatic),
+		},
+	}
+}
+
+func decodeConfig(raw json.RawMessage) (Config, error) {
+	cfg := defaultConfig()
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("{}")) {
+		return cfg, nil
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return Config{}, err
+	}
+	for _, rules := range []string{cfg.GlobalRules, cfg.ClaudeMessagesRules, cfg.CodexResponsesRules, cfg.OpenAICompletionsRules} {
+		if rules == "" {
+			continue
+		}
+		if _, err := parseRules(rules); err != nil {
+			return Config{}, err
+		}
+	}
+	return cfg, nil
+}
+
+func handlePluginRegister(raw []byte) ([]byte, error) {
+	return json.Marshal(pluginRegistration())
+}
+
+func handlePluginReconfigure(raw []byte) ([]byte, error) {
+	cfg, err := decodeConfig(raw)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(map[string]any{"ok": true, "enabled": cfg.Enabled})
 }
 
 type routeDecision struct {
