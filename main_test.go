@@ -335,7 +335,7 @@ func TestHandleModelRouteHandledSelfForChangedModel(t *testing.T) {
 }
 
 func TestRewriteRequestModelTopLevelOnly(t *testing.T) {
-	got, changed, err := rewriteRequestModel([]byte(`{"model":"A","messages":[]}`), "B")
+	got, changed, err := rewriteRequestModel([]byte(`{"model":"A","messages":[],"message":{"model":"A"},"response":{"model":"A"},"modelVersion":"A"}`), "B")
 	if err != nil {
 		t.Fatalf("rewriteRequestModel error = %v", err)
 	}
@@ -348,6 +348,14 @@ func TestRewriteRequestModelTopLevelOnly(t *testing.T) {
 	}
 	if decoded["model"] != "B" {
 		t.Fatalf("model=%v, want B", decoded["model"])
+	}
+	if decoded["modelVersion"] != "A" {
+		t.Fatalf("request modelVersion=%v, want unchanged A", decoded["modelVersion"])
+	}
+	message, _ := decoded["message"].(map[string]any)
+	response, _ := decoded["response"].(map[string]any)
+	if message["model"] != "A" || response["model"] != "A" {
+		t.Fatalf("request nested model fields changed: %s", got)
 	}
 }
 
@@ -474,6 +482,45 @@ func TestSSERewriterHandlesMultipleEventsCRLFAndFlush(t *testing.T) {
 	}
 }
 
+func TestSSERewriterFlushRestoresUnterminatedDataLine(t *testing.T) {
+	r := newSSERewriter("A")
+	out, err := r.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"model\":\"B\"}}"))
+	if err != nil {
+		t.Fatalf("Write error = %v", err)
+	}
+	if len(out) != 0 {
+		t.Fatalf("Write emitted %q, want no partial output", flattenChunks(out))
+	}
+	flushed, err := r.Flush()
+	if err != nil {
+		t.Fatalf("Flush error = %v", err)
+	}
+	got := string(bytes.Join(flushed, nil))
+	if !strings.Contains(got, `"response":{"model":"A"`) || strings.Contains(got, `"model":"B"`) {
+		t.Fatalf("Flush output = %q", got)
+	}
+}
+
+func TestSSERewriterInsertsLineBreakBetweenSplitFields(t *testing.T) {
+	r := newSSERewriter("A")
+	out, err := r.Write([]byte("data: {\"model\":\"B\"}"))
+	if err != nil {
+		t.Fatalf("first Write error = %v", err)
+	}
+	if len(out) != 0 {
+		t.Fatalf("first Write emitted %q, want no partial output", flattenChunks(out))
+	}
+	out, err = r.Write([]byte("event: response.in_progress\ndata: {\"model\":\"B\"}\n\n"))
+	if err != nil {
+		t.Fatalf("second Write error = %v", err)
+	}
+	got := flattenChunks(out)
+	want := "data: {\"model\":\"A\"}\nevent: response.in_progress\ndata: {\"model\":\"A\"}\n\n"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
 func TestSSERewriterPreservesMultilineEventBoundaries(t *testing.T) {
 	r := newSSERewriter("A")
 	out, err := r.Write([]byte("event: message\ndata: {\"model\":\"B\"}\nid: 1\n\n"))
@@ -564,6 +611,43 @@ func TestHandleExecutorExecuteForwardsMappedRequestAndRestoresResponse(t *testin
 	}
 	if !strings.Contains(string(resp.Payload), `"model":"deepseek-v4-pro"`) {
 		t.Fatalf("payload=%s", resp.Payload)
+	}
+}
+
+func TestHandleExecutorExecuteRestoresKnownResponseModelFields(t *testing.T) {
+	setLoadedConfigForTest(Config{Enabled: true, ClaudeMessagesRules: "claude-*=>gpt-5.5"})
+	req := rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{Model: "claude-opus-4", Format: "claude", SourceFormat: "claude", OriginalRequest: []byte(`{"model":"claude-opus-4"}`)}, HostCallbackID: "callback-1"}
+	rawReq, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal req: %v", err)
+	}
+	respRaw, err := handleExecutorExecute(rawReq, func(string, any) (json.RawMessage, error) {
+		return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: 200, Body: []byte(`{"model":"gpt-5.5","modelVersion":"gpt-5.5","message":{"model":"gpt-5.5"},"response":{"model":"gpt-5.5","modelVersion":"gpt-5.5"},"content":[{"text":"gpt-5.5 should stay in content"}]}`)})
+	})
+	if err != nil {
+		t.Fatalf("handleExecutorExecute error = %v", err)
+	}
+	var resp pluginapi.ExecutorResponse
+	if err := json.Unmarshal(respRaw, &resp); err != nil {
+		t.Fatalf("decode executor response: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(resp.Payload, &payload); err != nil {
+		t.Fatalf("decode payload: %v: %s", err, resp.Payload)
+	}
+	if payload["model"] != "claude-opus-4" || payload["modelVersion"] != "claude-opus-4" {
+		t.Fatalf("payload=%s, top-level model fields not restored", resp.Payload)
+	}
+	message, ok := payload["message"].(map[string]any)
+	if !ok || message["model"] != "claude-opus-4" {
+		t.Fatalf("payload=%s, message.model not restored", resp.Payload)
+	}
+	response, ok := payload["response"].(map[string]any)
+	if !ok || response["model"] != "claude-opus-4" || response["modelVersion"] != "claude-opus-4" {
+		t.Fatalf("payload=%s, response model fields not restored", resp.Payload)
+	}
+	if !strings.Contains(string(resp.Payload), `gpt-5.5 should stay in content`) {
+		t.Fatalf("payload=%s, content text should not be rewritten", resp.Payload)
 	}
 }
 
@@ -697,7 +781,278 @@ func TestHandleExecutorExecuteStreamRestoresRawJSONWebSocketLikeChunks(t *testin
 	}
 }
 
+func TestHandleExecutorExecuteStreamRestoresRawJSONNestedResponseModel(t *testing.T) {
+	setLoadedConfigForTest(Config{Enabled: true, CodexResponsesRules: "codex-ws*=>deepseek-v4-flash"})
+	req := rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "codex-ws-client",
+			Format:          "openai-response",
+			SourceFormat:    "openai-response",
+			Stream:          true,
+			OriginalRequest: []byte(`{"model":"codex-ws-client","stream":true}`),
+		},
+		HostCallbackID: "callback-1",
+		StreamID:       "plugin-stream-raw-nested-1",
+	}
+	reads := []pluginapi.HostModelStreamReadResponse{
+		{Payload: []byte(`{"type":"response.completed","response":{"model":"deepseek-v4-flash","output":[]}}`)},
+		{Done: true},
+	}
+	emitted, _, _, _, err := runExecutorStreamTestWithHostContentType(req, reads, "application/json")
+	if err != nil {
+		t.Fatalf("handleExecutorExecuteStream error = %v", err)
+	}
+	joined := strings.Join(emitted, "")
+	if !strings.Contains(joined, `"response":{"model":"codex-ws-client"`) || strings.Contains(joined, `deepseek-v4-flash`) || strings.Contains(joined, "data: ") {
+		t.Fatalf("emitted=%q", joined)
+	}
+}
+
+func TestHandleExecutorExecuteStreamRestoresLineDelimitedRawJSONEvents(t *testing.T) {
+	setLoadedConfigForTest(Config{Enabled: true, CodexResponsesRules: "codex-ws*=>deepseek-v4-flash"})
+	req := rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "codex-ws-client",
+			Format:          "openai-response",
+			SourceFormat:    "openai-response",
+			Stream:          true,
+			OriginalRequest: []byte(`{"model":"codex-ws-client","stream":true}`),
+		},
+		HostCallbackID: "callback-1",
+		StreamID:       "plugin-stream-raw-lines-1",
+	}
+	reads := []pluginapi.HostModelStreamReadResponse{
+		{Payload: []byte(`{"type":"response.created","response":{"id":"r1"}}` + "\n" + `{"type":"response.completed","response":{"model":"deepseek-v4-flash","output":[]}}`)},
+		{Done: true},
+	}
+	emitted, _, _, _, err := runExecutorStreamTest(req, reads)
+	if err != nil {
+		t.Fatalf("handleExecutorExecuteStream error = %v", err)
+	}
+	joined := strings.Join(emitted, "")
+	if !strings.Contains(joined, `"response":{"model":"codex-ws-client"`) || strings.Contains(joined, `deepseek-v4-flash`) {
+		t.Fatalf("emitted=%q", joined)
+	}
+	if strings.Count(joined, "data: ") < 2 {
+		t.Fatalf("emitted=%q, want each raw JSON event framed for Responses SSE", joined)
+	}
+}
+
+func TestHandleExecutorExecuteStreamRestoresLineDelimitedRawJSONForWebSocket(t *testing.T) {
+	setLoadedConfigForTest(Config{Enabled: true, CodexResponsesRules: "codex-ws*=>deepseek-v4-flash"})
+	req := rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "codex-ws-client",
+			Format:          "openai-response",
+			SourceFormat:    "openai-response",
+			Stream:          true,
+			OriginalRequest: []byte(`{"model":"codex-ws-client","stream":true}`),
+		},
+		HostCallbackID: "callback-1",
+		StreamID:       "plugin-stream-ws-raw-lines-1",
+	}
+	reads := []pluginapi.HostModelStreamReadResponse{
+		{Payload: []byte(`{"type":"response.created","response":{"id":"r1"}}` + "\n" + `{"type":"response.completed","response":{"model":"deepseek-v4-flash","output":[]}}`)},
+		{Done: true},
+	}
+	emitted, _, _, _, err := runExecutorStreamTestWithHostContentType(req, reads, "application/json")
+	if err != nil {
+		t.Fatalf("handleExecutorExecuteStream error = %v", err)
+	}
+	joined := strings.Join(emitted, "")
+	if !strings.Contains(joined, `"response":{"model":"codex-ws-client"`) || strings.Contains(joined, `deepseek-v4-flash`) || strings.Contains(joined, "data: ") {
+		t.Fatalf("emitted=%q", joined)
+	}
+}
+
+func TestHandleExecutorExecuteStreamRestoresSpaceDelimitedRawJSONForWebSocket(t *testing.T) {
+	setLoadedConfigForTest(Config{Enabled: true, CodexResponsesRules: "codex-ws*=>deepseek-v4-flash"})
+	req := rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "codex-ws-client",
+			Format:          "openai-response",
+			SourceFormat:    "openai-response",
+			Stream:          true,
+			OriginalRequest: []byte(`{"model":"codex-ws-client","stream":true}`),
+		},
+		HostCallbackID: "callback-1",
+		StreamID:       "plugin-stream-ws-raw-space-1",
+	}
+	reads := []pluginapi.HostModelStreamReadResponse{
+		{Payload: []byte(`{"type":"response.created","response":{"id":"r1"}} ` + `{"type":"response.completed","response":{"model":"deepseek-v4-flash","output":[]}}`)},
+		{Done: true},
+	}
+	emitted, _, _, _, err := runExecutorStreamTestWithHostContentType(req, reads, "application/json")
+	if err != nil {
+		t.Fatalf("handleExecutorExecuteStream error = %v", err)
+	}
+	joined := strings.Join(emitted, "")
+	if !strings.Contains(joined, `"response":{"model":"codex-ws-client"`) || strings.Contains(joined, `deepseek-v4-flash`) || strings.Contains(joined, "data: ") {
+		t.Fatalf("emitted=%q", joined)
+	}
+}
+
+func TestHandleExecutorExecuteStreamFlushesUnterminatedSSEDataForWebSocket(t *testing.T) {
+	setLoadedConfigForTest(Config{Enabled: true, CodexResponsesRules: "codex-ws*=>deepseek-v4-flash"})
+	req := rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "codex-ws-client",
+			Format:          "openai-response",
+			SourceFormat:    "openai-response",
+			Stream:          true,
+			OriginalRequest: []byte(`{"model":"codex-ws-client","stream":true}`),
+		},
+		HostCallbackID: "callback-1",
+		StreamID:       "plugin-stream-ws-sse-flush-1",
+	}
+	reads := []pluginapi.HostModelStreamReadResponse{
+		{Payload: []byte(`data: {"type":"response.completed","response":{"model":"deepseek-v4-flash","output":[]}}`)},
+		{Done: true},
+	}
+	emitted, _, _, _, err := runExecutorStreamTestWithHostContentType(req, reads, "text/event-stream")
+	if err != nil {
+		t.Fatalf("handleExecutorExecuteStream error = %v", err)
+	}
+	joined := strings.Join(emitted, "")
+	if !strings.Contains(joined, `"response":{"model":"codex-ws-client"`) || strings.Contains(joined, `deepseek-v4-flash`) {
+		t.Fatalf("emitted=%q", joined)
+	}
+}
+
+func TestStreamChunkRewriterDoesNotBufferRawJSONStartingWithEvent(t *testing.T) {
+	rewriter := newStreamChunkRewriter("gpt-5.5-openai-compact")
+	chunks, err := rewriter.Write([]byte(`{"event":"response.completed","model":"gpt-5.5"}`))
+	if err != nil {
+		t.Fatalf("Write error = %v", err)
+	}
+	if len(chunks) != 1 {
+		t.Fatalf("chunks=%q, want one raw JSON chunk", chunks)
+	}
+	got := string(chunks[0])
+	if !strings.Contains(got, `"model":"gpt-5.5-openai-compact"`) || strings.Contains(got, `"model":"gpt-5.5"`) {
+		t.Fatalf("chunk=%q", got)
+	}
+}
+
+func TestHandleExecutorExecuteStreamRestoresKnownSSEModelFields(t *testing.T) {
+	setLoadedConfigForTest(Config{Enabled: true, ClaudeMessagesRules: "claude-*=>gpt-5.5"})
+	req := rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "claude-opus-4",
+			Format:          "claude",
+			SourceFormat:    "claude",
+			Stream:          true,
+			OriginalRequest: []byte(`{"model":"claude-opus-4","stream":true}`),
+		},
+		HostCallbackID: "callback-1",
+		StreamID:       "plugin-stream-known-fields-1",
+	}
+	reads := []pluginapi.HostModelStreamReadResponse{
+		{Payload: []byte(`data: {"model":"gpt-5.5","modelVersion":"gpt-5.5","message":{"model":"gpt-5.5"},"response":{"model":"gpt-5.5","modelVersion":"gpt-5.5"},"content":[{"text":"gpt-5.5 should stay in content"}]}` + "\n\n")},
+		{Done: true},
+	}
+	emitted, _, _, _, err := runExecutorStreamTest(req, reads)
+	if err != nil {
+		t.Fatalf("handleExecutorExecuteStream error = %v", err)
+	}
+	joined := strings.Join(emitted, "")
+	for _, want := range []string{`"model":"claude-opus-4"`, `"modelVersion":"claude-opus-4"`, `"message":{"model":"claude-opus-4"}`, `"response":{"model":"claude-opus-4","modelVersion":"claude-opus-4"}`} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("emitted=%q missing %s", joined, want)
+		}
+	}
+	if !strings.Contains(joined, `gpt-5.5 should stay in content`) {
+		t.Fatalf("emitted=%q, content text should not be rewritten", joined)
+	}
+}
+
+func TestHandleExecutorExecuteStreamFramesRawResponsesJSONAsSSE(t *testing.T) {
+	setLoadedConfigForTest(Config{Enabled: true, CodexResponsesRules: "gpt-*-openai-compact=>gpt-$1"})
+	req := rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "gpt-5.5-openai-compact",
+			Format:          "openai-response",
+			SourceFormat:    "openai-response",
+			Stream:          true,
+			OriginalRequest: []byte(`{"model":"gpt-5.5-openai-compact","stream":true}`),
+		},
+		HostCallbackID: "callback-1",
+		StreamID:       "plugin-stream-responses-sse-1",
+	}
+	reads := []pluginapi.HostModelStreamReadResponse{
+		{Payload: []byte(`{"type":"response.completed","model":"gpt-5.5"}`)},
+		{Done: true},
+	}
+	emitted, _, _, _, err := runExecutorStreamTest(req, reads)
+	if err != nil {
+		t.Fatalf("handleExecutorExecuteStream error = %v", err)
+	}
+	joined := strings.Join(emitted, "")
+	if !strings.Contains(joined, "data: ") || !strings.Contains(joined, `"type":"response.completed"`) || !strings.Contains(joined, `"model":"gpt-5.5-openai-compact"`) || strings.Contains(joined, `"model":"gpt-5.5"`) {
+		t.Fatalf("emitted=%q", joined)
+	}
+}
+
+func TestHandleExecutorExecuteStreamClosesWebSocketLikeRawJSONError(t *testing.T) {
+	setLoadedConfigForTest(Config{Enabled: true, CodexResponsesRules: "gpt-*-openai-compact=>gpt-$1"})
+	req := rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "gpt-none-openai-compact",
+			Format:          "openai-response",
+			SourceFormat:    "openai-response",
+			Stream:          true,
+			OriginalRequest: []byte(`{"model":"gpt-none-openai-compact","stream":true}`),
+		},
+		HostCallbackID: "callback-1",
+		StreamID:       "plugin-stream-ws-error-1",
+	}
+	reads := []pluginapi.HostModelStreamReadResponse{{Error: "model not found"}}
+	emitted, closedHost, closedPlugin, _, err := runExecutorStreamTest(req, reads)
+	if err != nil {
+		t.Fatalf("handleExecutorExecuteStream error = %v", err)
+	}
+	if !closedHost || !closedPlugin {
+		t.Fatalf("closedHost=%v closedPlugin=%v", closedHost, closedPlugin)
+	}
+	if len(emitted) != 0 {
+		t.Fatalf("emitted=%q, want no payload before websocket-like stream error", emitted)
+	}
+}
+
+func TestHandleExecutorExecuteStreamClosesPluginOnChunkErrorAfterPendingPrefix(t *testing.T) {
+	setLoadedConfigForTest(Config{Enabled: true, CodexResponsesRules: "gpt-*-openai-compact=>gpt-$1"})
+	req := rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "gpt-none-openai-compact",
+			Format:          "openai-response",
+			SourceFormat:    "openai-response",
+			Stream:          true,
+			OriginalRequest: []byte(`{"model":"gpt-none-openai-compact","stream":true}`),
+		},
+		HostCallbackID: "callback-1",
+		StreamID:       "plugin-stream-error-1",
+	}
+	reads := []pluginapi.HostModelStreamReadResponse{
+		{Payload: []byte("event")},
+		{Error: "model not found"},
+	}
+	emitted, closedHost, closedPlugin, _, err := runExecutorStreamTest(req, reads)
+	if err != nil {
+		t.Fatalf("handleExecutorExecuteStream error = %v", err)
+	}
+	if !closedHost || !closedPlugin {
+		t.Fatalf("closedHost=%v closedPlugin=%v", closedHost, closedPlugin)
+	}
+	if strings.Join(emitted, "") != "event" {
+		t.Fatalf("emitted=%q, want pending bytes flushed before error close", emitted)
+	}
+}
+
 func runExecutorStreamTest(req rpcExecutorRequest, reads []pluginapi.HostModelStreamReadResponse) ([]string, bool, bool, []byte, error) {
+	return runExecutorStreamTestWithHostContentType(req, reads, "text/event-stream")
+}
+
+func runExecutorStreamTestWithHostContentType(req rpcExecutorRequest, reads []pluginapi.HostModelStreamReadResponse, contentType string) ([]string, bool, bool, []byte, error) {
 	var emitted []string
 	closedHost := false
 	closedPlugin := false
@@ -705,7 +1060,7 @@ func runExecutorStreamTest(req rpcExecutorRequest, reads []pluginapi.HostModelSt
 	fakeHost := func(method string, payload any) (json.RawMessage, error) {
 		switch method {
 		case pluginabi.MethodHostModelExecuteStream:
-			return json.Marshal(pluginapi.HostModelStreamResponse{StatusCode: 200, Headers: http.Header{"Content-Type": []string{"text/event-stream"}}, StreamID: "host-stream-1"})
+			return json.Marshal(pluginapi.HostModelStreamResponse{StatusCode: 200, Headers: http.Header{"Content-Type": []string{contentType}}, StreamID: "host-stream-1"})
 		case pluginabi.MethodHostModelStreamRead:
 			if len(reads) == 0 {
 				return nil, fmt.Errorf("unexpected extra stream read")

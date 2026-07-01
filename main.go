@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -23,9 +24,10 @@ type sseRewriter struct {
 }
 
 type streamChunkRewriter struct {
-	originalModel string
-	sse           *sseRewriter
-	pending       []byte
+	originalModel     string
+	frameRawJSONAsSSE bool
+	sse               *sseRewriter
+	pending           []byte
 }
 
 func newSSERewriter(originalModel string) *sseRewriter {
@@ -40,6 +42,9 @@ func newStreamChunkRewriter(originalModel string) *streamChunkRewriter {
 }
 
 func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
+	if sseNeedsLineBreak(r.buf, p) {
+		r.buf = append(r.buf, '\n')
+	}
 	r.buf = append(r.buf, p...)
 	var out [][]byte
 	for {
@@ -63,9 +68,9 @@ func (r *sseRewriter) Flush() ([][]byte, error) {
 	if len(r.buf) == 0 {
 		return nil, nil
 	}
-	out := [][]byte{append([]byte(nil), r.buf...)}
+	event := append([]byte(nil), r.buf...)
 	r.buf = nil
-	return out, nil
+	return r.rewriteEvent(event)
 }
 
 func (r *sseRewriter) rewriteEvent(event []byte) ([][]byte, error) {
@@ -126,16 +131,35 @@ func (r *sseRewriter) delimiterBytes(n int) []byte {
 	return []byte("\n\n")
 }
 
+func sseNeedsLineBreak(pending, chunk []byte) bool {
+	if len(pending) == 0 || len(chunk) == 0 {
+		return false
+	}
+	if bytes.HasSuffix(pending, []byte("\n")) || bytes.HasSuffix(pending, []byte("\r")) {
+		return false
+	}
+	if chunk[0] == '\n' || chunk[0] == '\r' {
+		return false
+	}
+	trimmed := bytes.TrimLeft(chunk, " \t")
+	for _, prefix := range [][]byte{[]byte("data:"), []byte("event:"), []byte("id:"), []byte("retry:"), []byte(":")} {
+		if bytes.HasPrefix(trimmed, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 	if len(r.pending) > 0 {
 		r.pending = append(r.pending, p...)
 		p = append([]byte(nil), r.pending...)
 		r.pending = nil
 	}
-	if isMaybeSSEPrefix(p) {
-		if isSSEChunk(p) {
-			return r.sse.Write(p)
-		}
+	if isSSEChunk(p) {
+		return r.sse.Write(p)
+	}
+	if isIncompleteSSEPrefix(p) {
 		r.pending = append(r.pending, p...)
 		return nil, nil
 	}
@@ -143,10 +167,57 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	out := append([]byte(nil), p...)
 	if changed {
-		return [][]byte{restored}, nil
+		out = restored
 	}
-	return [][]byte{append([]byte(nil), p...)}, nil
+	return r.rawJSONChunks(out)
+}
+
+func (r *streamChunkRewriter) rawJSONChunks(p []byte) ([][]byte, error) {
+	values, ok := splitJSONValues(p)
+	if !ok {
+		if r.frameRawJSONAsSSE && json.Valid(p) {
+			return [][]byte{frameSSEData(p)}, nil
+		}
+		return [][]byte{append([]byte(nil), p...)}, nil
+	}
+	if len(values) == 0 {
+		return nil, nil
+	}
+	out := make([][]byte, 0, len(values))
+	for _, value := range values {
+		restored, _, err := restoreResponseModel(value, r.originalModel)
+		if err != nil {
+			return nil, err
+		}
+		if r.frameRawJSONAsSSE {
+			out = append(out, frameSSEData(restored))
+			continue
+		}
+		out = append(out, restored)
+	}
+	return out, nil
+}
+
+func splitJSONValues(p []byte) ([][]byte, bool) {
+	if len(bytes.TrimSpace(p)) == 0 {
+		return nil, true
+	}
+	dec := json.NewDecoder(bytes.NewReader(p))
+	values := make([][]byte, 0, 1)
+	for {
+		var raw json.RawMessage
+		err := dec.Decode(&raw)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, false
+		}
+		values = append(values, append([]byte(nil), raw...))
+	}
+	return values, len(values) > 0
 }
 
 func (r *streamChunkRewriter) Flush() ([][]byte, error) {
@@ -166,6 +237,17 @@ func (r *streamChunkRewriter) Flush() ([][]byte, error) {
 	return r.sse.Flush()
 }
 
+func frameSSEData(p []byte) []byte {
+	var out bytes.Buffer
+	for _, line := range bytes.Split(p, []byte("\n")) {
+		out.WriteString("data: ")
+		out.Write(line)
+		out.WriteByte('\n')
+	}
+	out.WriteByte('\n')
+	return out.Bytes()
+}
+
 func isSSEChunk(p []byte) bool {
 	trimmed := bytes.TrimLeft(p, " \t\r\n")
 	if bytes.HasPrefix(trimmed, []byte("data:")) || bytes.HasPrefix(trimmed, []byte("event:")) || bytes.HasPrefix(trimmed, []byte(":")) {
@@ -174,10 +256,13 @@ func isSSEChunk(p []byte) bool {
 	return bytes.Contains(p, []byte("\n\n")) || bytes.Contains(p, []byte("\r\n\r\n"))
 }
 
-func isMaybeSSEPrefix(p []byte) bool {
+func isIncompleteSSEPrefix(p []byte) bool {
 	trimmed := bytes.TrimLeft(p, " \t\r\n")
-	for _, prefix := range [][]byte{[]byte("d"), []byte("da"), []byte("dat"), []byte("data"), []byte("data:"), []byte("e"), []byte("ev"), []byte("eve"), []byte("even"), []byte("event"), []byte("event:"), []byte(":")} {
-		if bytes.HasPrefix(prefix, trimmed) || bytes.HasPrefix(trimmed, prefix) {
+	if len(trimmed) == 0 || strings.ContainsAny(string(trimmed), "\r\n") {
+		return false
+	}
+	for _, field := range [][]byte{[]byte("data:"), []byte("event:"), []byte(":")} {
+		if bytes.HasPrefix(field, trimmed) && len(trimmed) < len(field) {
 			return true
 		}
 	}
@@ -365,7 +450,7 @@ func rewriteRequestModel(body []byte, upstreamModel string) ([]byte, bool, error
 }
 
 func restoreResponseModel(body []byte, originalModel string) ([]byte, bool, error) {
-	return rewriteTopLevelModel(body, originalModel)
+	return rewriteResponseModelFields(body, originalModel)
 }
 
 type hostCaller func(method string, payload any) (json.RawMessage, error)
@@ -468,6 +553,7 @@ func runStreamForward(req executorRPCRequest, call hostCaller) error {
 		return err
 	}
 	rewriter := newStreamChunkRewriter(decision.OriginalModel)
+	rewriter.frameRawJSONAsSSE = strings.Contains(strings.ToLower(hostResp.Headers.Get("Content-Type")), "text/event-stream")
 	for {
 		readRaw, err := call(pluginabi.MethodHostModelStreamRead, pluginapi.HostModelStreamReadRequest{StreamID: hostStreamID})
 		if err != nil {
@@ -480,6 +566,17 @@ func runStreamForward(req executorRPCRequest, call hostCaller) error {
 			return fmt.Errorf("decode host stream chunk: %w", err)
 		}
 		if chunk.Error != "" {
+			flushed, flushErr := rewriter.Flush()
+			if flushErr != nil {
+				_ = closeHost()
+				return fmt.Errorf("flush stream rewriter before error close: %w", flushErr)
+			}
+			for _, out := range flushed {
+				if err := emit(out); err != nil {
+					_ = closeHost()
+					return fmt.Errorf("emit flushed stream chunk before error close: %w", err)
+				}
+			}
 			if err := closeHost(); err != nil {
 				return fmt.Errorf("close host stream: %w", err)
 			}
@@ -714,19 +811,57 @@ func rewriteTopLevelModel(body []byte, model string) ([]byte, bool, error) {
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return append([]byte(nil), body...), false, nil
 	}
-	current, ok := doc["model"]
-	if !ok {
+	changed := rewriteStringField(doc, "model", model)
+	if !changed {
 		return append([]byte(nil), body...), false, nil
 	}
-	if _, ok := current.(string); !ok {
-		return append([]byte(nil), body...), false, nil
-	}
-	doc["model"] = model
 	out, err := json.Marshal(doc)
 	if err != nil {
 		return nil, false, err
 	}
 	return out, true, nil
+}
+
+func rewriteResponseModelFields(body []byte, model string) ([]byte, bool, error) {
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return append([]byte(nil), body...), false, nil
+	}
+	changed := rewriteModelFields(doc, model)
+	if !changed {
+		return append([]byte(nil), body...), false, nil
+	}
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return nil, false, err
+	}
+	return out, true, nil
+}
+
+func rewriteModelFields(doc map[string]any, model string) bool {
+	changed := rewriteStringField(doc, "model", model)
+	changed = rewriteStringField(doc, "modelVersion", model) || changed
+	changed = rewriteNestedModelFields(doc, "message", model) || changed
+	changed = rewriteNestedModelFields(doc, "response", model) || changed
+	return changed
+}
+
+func rewriteNestedModelFields(doc map[string]any, key string, model string) bool {
+	nested, ok := doc[key].(map[string]any)
+	if !ok {
+		return false
+	}
+	changed := rewriteStringField(nested, "model", model)
+	changed = rewriteStringField(nested, "modelVersion", model) || changed
+	return changed
+}
+
+func rewriteStringField(doc map[string]any, key string, model string) bool {
+	if _, ok := doc[key].(string); !ok {
+		return false
+	}
+	doc[key] = model
+	return true
 }
 
 type token struct {
