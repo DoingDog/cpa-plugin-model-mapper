@@ -22,8 +22,20 @@ type sseRewriter struct {
 	buf           []byte
 }
 
+type streamChunkRewriter struct {
+	originalModel string
+	sse           *sseRewriter
+}
+
 func newSSERewriter(originalModel string) *sseRewriter {
 	return &sseRewriter{originalModel: originalModel}
+}
+
+func newStreamChunkRewriter(originalModel string) *streamChunkRewriter {
+	return &streamChunkRewriter{
+		originalModel: originalModel,
+		sse:           newSSERewriter(originalModel),
+	}
 }
 
 func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
@@ -111,6 +123,32 @@ func (r *sseRewriter) delimiterBytes(n int) []byte {
 		return []byte("\r\n\r\n")
 	}
 	return []byte("\n\n")
+}
+
+func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
+	if isSSEChunk(p) {
+		return r.sse.Write(p)
+	}
+	restored, changed, err := restoreResponseModel(p, r.originalModel)
+	if err != nil {
+		return nil, err
+	}
+	if changed {
+		return [][]byte{restored}, nil
+	}
+	return [][]byte{append([]byte(nil), p...)}, nil
+}
+
+func (r *streamChunkRewriter) Flush() ([][]byte, error) {
+	return r.sse.Flush()
+}
+
+func isSSEChunk(p []byte) bool {
+	trimmed := bytes.TrimLeft(p, " \t\r\n")
+	if bytes.HasPrefix(trimmed, []byte("data:")) || bytes.HasPrefix(trimmed, []byte("event:")) || bytes.HasPrefix(trimmed, []byte(":")) {
+		return true
+	}
+	return bytes.Contains(p, []byte("\n\n")) || bytes.Contains(p, []byte("\r\n\r\n"))
 }
 
 type Config struct {
@@ -385,7 +423,7 @@ func runStreamForward(req executorRPCRequest, call hostCaller) error {
 		}{StreamID: req.StreamID, Payload: payload})
 		return err
 	}
-	rewriter := newSSERewriter(decision.OriginalModel)
+	rewriter := newStreamChunkRewriter(decision.OriginalModel)
 	for {
 		readRaw, err := call(pluginabi.MethodHostModelStreamRead, pluginapi.HostModelStreamReadRequest{StreamID: hostStreamID})
 		if err != nil {

@@ -580,56 +580,7 @@ func TestHandleExecutorExecuteStreamStartsForwarderAndRestoresChunks(t *testing.
 		{Payload: []byte("data: [DONE]\n\n")},
 		{Done: true},
 	}
-	var emitted []string
-	closedHost := false
-	closedPlugin := false
-	done := make(chan struct{})
-	fakeHost := func(method string, payload any) (json.RawMessage, error) {
-		switch method {
-		case pluginabi.MethodHostModelExecuteStream:
-			return json.Marshal(pluginapi.HostModelStreamResponse{StatusCode: 200, Headers: http.Header{"Content-Type": []string{"text/event-stream"}}, StreamID: "host-stream-1"})
-		case pluginabi.MethodHostModelStreamRead:
-			if len(reads) == 0 {
-				t.Fatalf("unexpected extra stream read")
-			}
-			next := reads[0]
-			reads = reads[1:]
-			return json.Marshal(next)
-		case pluginabi.MethodHostStreamEmit:
-			raw, err := json.Marshal(payload)
-			if err != nil {
-				t.Fatalf("marshal emit payload: %v", err)
-			}
-			var emit struct {
-				StreamID string `json:"stream_id"`
-				Payload  []byte `json:"payload"`
-				Error    string `json:"error"`
-			}
-			if err := json.Unmarshal(raw, &emit); err != nil {
-				t.Fatalf("decode emit payload: %v", err)
-			}
-			if emit.StreamID != "plugin-stream-1" {
-				t.Fatalf("emit stream id=%q", emit.StreamID)
-			}
-			emitted = append(emitted, string(emit.Payload))
-			return json.Marshal(map[string]any{})
-		case pluginabi.MethodHostModelStreamClose:
-			closedHost = true
-			return json.Marshal(map[string]any{})
-		case pluginabi.MethodHostStreamClose:
-			closedPlugin = true
-			close(done)
-			return json.Marshal(map[string]any{})
-		default:
-			t.Fatalf("unexpected method %q", method)
-			return nil, nil
-		}
-	}
-	rawReq, err := json.Marshal(req)
-	if err != nil {
-		t.Fatalf("marshal req: %v", err)
-	}
-	respRaw, err := handleExecutorExecuteStream(rawReq, fakeHost)
+	emitted, closedHost, closedPlugin, respRaw, err := runExecutorStreamTest(req, reads)
 	if err != nil {
 		t.Fatalf("handleExecutorExecuteStream error = %v", err)
 	}
@@ -642,11 +593,6 @@ func TestHandleExecutorExecuteStreamStartsForwarderAndRestoresChunks(t *testing.
 	if resp.Headers.Get("Content-Type") != "text/event-stream" {
 		t.Fatalf("headers=%v, want text/event-stream", resp.Headers)
 	}
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("stream forwarder did not close plugin stream")
-	}
 	joined := strings.Join(emitted, "")
 	if !strings.Contains(joined, `"model":"deepseek-v4-pro"`) || strings.Contains(joined, `"model":"gpt-5.4-mini"`) || !strings.Contains(joined, "data: [DONE]") {
 		t.Fatalf("emitted=%q", joined)
@@ -654,6 +600,91 @@ func TestHandleExecutorExecuteStreamStartsForwarderAndRestoresChunks(t *testing.
 	if !closedHost || !closedPlugin {
 		t.Fatalf("closedHost=%v closedPlugin=%v", closedHost, closedPlugin)
 	}
+}
+
+func TestHandleExecutorExecuteStreamRestoresRawJSONWebSocketLikeChunks(t *testing.T) {
+	setLoadedConfigForTest(Config{Enabled: true, CodexResponsesRules: "deepseek-v4-pro=>gpt-5.4-mini"})
+	req := rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "deepseek-v4-pro",
+			Format:          "openai-response",
+			SourceFormat:    "openai-response",
+			Stream:          true,
+			OriginalRequest: []byte(`{"model":"deepseek-v4-pro","stream":true}`),
+		},
+		HostCallbackID: "callback-1",
+		StreamID:       "plugin-stream-raw-1",
+	}
+	reads := []pluginapi.HostModelStreamReadResponse{
+		{Payload: []byte(`{"type":"response.completed","model":"gpt-5.4-mini"}`)},
+		{Done: true},
+	}
+	emitted, _, _, _, err := runExecutorStreamTest(req, reads)
+	if err != nil {
+		t.Fatalf("handleExecutorExecuteStream error = %v", err)
+	}
+	joined := strings.Join(emitted, "")
+	if !strings.Contains(joined, `"model":"deepseek-v4-pro"`) || strings.Contains(joined, `"model":"gpt-5.4-mini"`) {
+		t.Fatalf("emitted=%q", joined)
+	}
+}
+
+func runExecutorStreamTest(req rpcExecutorRequest, reads []pluginapi.HostModelStreamReadResponse) ([]string, bool, bool, []byte, error) {
+	var emitted []string
+	closedHost := false
+	closedPlugin := false
+	done := make(chan struct{})
+	fakeHost := func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostModelExecuteStream:
+			return json.Marshal(pluginapi.HostModelStreamResponse{StatusCode: 200, Headers: http.Header{"Content-Type": []string{"text/event-stream"}}, StreamID: "host-stream-1"})
+		case pluginabi.MethodHostModelStreamRead:
+			if len(reads) == 0 {
+				return nil, fmt.Errorf("unexpected extra stream read")
+			}
+			next := reads[0]
+			reads = reads[1:]
+			return json.Marshal(next)
+		case pluginabi.MethodHostStreamEmit:
+			raw, err := json.Marshal(payload)
+			if err != nil {
+				return nil, err
+			}
+			var emit struct {
+				StreamID string `json:"stream_id"`
+				Payload  []byte `json:"payload"`
+				Error    string `json:"error"`
+			}
+			if err := json.Unmarshal(raw, &emit); err != nil {
+				return nil, err
+			}
+			emitted = append(emitted, string(emit.Payload))
+			return json.Marshal(map[string]any{})
+		case pluginabi.MethodHostModelStreamClose:
+			closedHost = true
+			return json.Marshal(map[string]any{})
+		case pluginabi.MethodHostStreamClose:
+			closedPlugin = true
+			close(done)
+			return json.Marshal(map[string]any{})
+		default:
+			return nil, fmt.Errorf("unexpected method %q", method)
+		}
+	}
+	rawReq, err := json.Marshal(req)
+	if err != nil {
+		return nil, false, false, nil, err
+	}
+	respRaw, err := handleExecutorExecuteStream(rawReq, fakeHost)
+	if err != nil {
+		return nil, false, false, nil, err
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		return nil, false, false, nil, fmt.Errorf("stream forwarder did not close plugin stream")
+	}
+	return emitted, closedHost, closedPlugin, respRaw, nil
 }
 
 func TestHandleMethodDispatchesRegisterReconfigureAndUnknown(t *testing.T) {
