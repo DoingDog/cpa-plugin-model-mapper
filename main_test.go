@@ -254,6 +254,47 @@ func TestRouteModelBadSelectedRulesErrors(t *testing.T) {
 	}
 }
 
+func TestHandleModelRouteUnhandledWhenNoChange(t *testing.T) {
+	setLoadedConfigForTest(Config{Enabled: true, GlobalRules: "a=>a"})
+	raw, err := json.Marshal(pluginapi.ModelRouteRequest{SourceFormat: "openai", RequestedModel: "a"})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	respRaw, err := handleModelRoute(raw)
+	if err != nil {
+		t.Fatalf("handleModelRoute error = %v", err)
+	}
+	var resp pluginapi.ModelRouteResponse
+	if err := json.Unmarshal(respRaw, &resp); err != nil {
+		t.Fatalf("decode route response: %v", err)
+	}
+	if resp.Handled {
+		t.Fatalf("route handled=true, want false")
+	}
+}
+
+func TestHandleModelRouteHandledSelfForChangedModel(t *testing.T) {
+	setLoadedConfigForTest(Config{Enabled: true, GlobalRules: "deepseek-v4-pro=>gpt-5.4-mini"})
+	raw, err := json.Marshal(pluginapi.ModelRouteRequest{SourceFormat: "openai", RequestedModel: "deepseek-v4-pro"})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	respRaw, err := handleModelRoute(raw)
+	if err != nil {
+		t.Fatalf("handleModelRoute error = %v", err)
+	}
+	var resp pluginapi.ModelRouteResponse
+	if err := json.Unmarshal(respRaw, &resp); err != nil {
+		t.Fatalf("decode route response: %v", err)
+	}
+	if !resp.Handled || resp.TargetKind != pluginapi.ModelRouteTargetSelf {
+		t.Fatalf("route response=%#v", resp)
+	}
+	if resp.TargetModel != "" {
+		t.Fatalf("self route TargetModel=%q, want empty because SDK only defines it for provider routes", resp.TargetModel)
+	}
+}
+
 func TestRewriteRequestModelTopLevelOnly(t *testing.T) {
 	got, changed, err := rewriteRequestModel([]byte(`{"model":"A","messages":[]}`), "B")
 	if err != nil {

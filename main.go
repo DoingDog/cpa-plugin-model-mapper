@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"unicode"
 
 	pluginabi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -171,6 +172,23 @@ func decodeConfig(raw json.RawMessage) (Config, error) {
 	return cfg, nil
 }
 
+var (
+	loadedConfigMu sync.RWMutex
+	loadedCfg      = defaultConfig()
+)
+
+func loadedConfig() Config {
+	loadedConfigMu.RLock()
+	defer loadedConfigMu.RUnlock()
+	return loadedCfg
+}
+
+func setLoadedConfigForTest(cfg Config) {
+	loadedConfigMu.Lock()
+	loadedCfg = cfg
+	loadedConfigMu.Unlock()
+}
+
 func handlePluginRegister(raw []byte) ([]byte, error) {
 	return json.Marshal(pluginRegistration())
 }
@@ -180,6 +198,7 @@ func handlePluginReconfigure(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	setLoadedConfigForTest(cfg)
 	return json.Marshal(map[string]any{"ok": true, "enabled": cfg.Enabled})
 }
 
@@ -208,6 +227,21 @@ func selectRules(cfg Config, format string) (string, bool) {
 		return cfg.GlobalRules, true
 	}
 	return "", false
+}
+
+func handleModelRoute(raw []byte) ([]byte, error) {
+	var req pluginapi.ModelRouteRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	decision, err := routeModel(loadedConfig(), req.SourceFormat, req.RequestedModel)
+	if err != nil {
+		return nil, err
+	}
+	if !decision.Handled {
+		return json.Marshal(pluginapi.ModelRouteResponse{Handled: false})
+	}
+	return json.Marshal(pluginapi.ModelRouteResponse{Handled: true, TargetKind: pluginapi.ModelRouteTargetSelf, Reason: "model mapped by model-mapper"})
 }
 
 func routeModel(cfg Config, format string, model string) (routeDecision, error) {
