@@ -47,8 +47,12 @@ func parseRules(raw string) ([]rule, error) {
 	}
 	out := make([]rule, 0, len(parts))
 	for _, part := range parts {
-		find, replace, ok := strings.Cut(part, "=>")
-		if !ok || find == "" || replace == "" || strings.Contains(find, "=>") {
+		sep, ok := findRuleSeparator(part)
+		if !ok {
+			return nil, fmt.Errorf("invalid rule")
+		}
+		find, replace := part[:sep], part[sep+2:]
+		if find == "" || replace == "" {
 			return nil, fmt.Errorf("invalid rule")
 		}
 		pt, captures, err := parseFind(find)
@@ -62,6 +66,29 @@ func parseRules(raw string) ([]rule, error) {
 		out = append(out, rule{patternTokens: pt, replacementTokens: rt, captureCount: captures})
 	}
 	return out, nil
+}
+
+func findRuleSeparator(s string) (int, bool) {
+	escaped := false
+	sep := -1
+	for i := 0; i+1 < len(s); i++ {
+		c := s[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if c == '\\' {
+			escaped = true
+			continue
+		}
+		if c == '=' && s[i+1] == '>' {
+			if sep >= 0 {
+				return -1, false
+			}
+			sep = i
+		}
+	}
+	return sep, sep >= 0
 }
 
 func splitEscaped(s string, sep byte) ([]string, error) {

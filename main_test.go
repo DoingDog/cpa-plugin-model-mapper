@@ -19,6 +19,7 @@ func TestParseRulesAcceptsValidRules(t *testing.T) {
 		`a*bc*=>x$2y$1`,
 		`literal\*=>star`,
 		`a\;b=>c\=>d`,
+		`a\=>b=>c`,
 	}
 	for _, raw := range tests {
 		t.Run(raw, func(t *testing.T) {
@@ -44,6 +45,7 @@ func TestParseRulesRejectsInvalidRules(t *testing.T) {
 		"a=>b;",
 		";a=>b",
 		"a=>b;;c=>d",
+		"a=>b=>c",
 		`a\=>b`,
 		`a=>b\`,
 		`a=>x$`,
