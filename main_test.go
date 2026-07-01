@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
 	"reflect"
 	"strings"
 	"testing"
@@ -458,5 +461,102 @@ func TestSSERewriterUsesEarliestDelimiter(t *testing.T) {
 	want := "data: {\"model\":\"A\"}\n\ndata: {\"model\":\"A\"}\r\n\r\n"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+type rpcExecutorRequest struct {
+	pluginapi.ExecutorRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+	StreamID       string `json:"stream_id,omitempty"`
+}
+
+type hostModelExecutionRequest struct {
+	pluginapi.HostModelExecutionRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+func TestHandleExecutorExecuteForwardsMappedRequestAndRestoresResponse(t *testing.T) {
+	setLoadedConfigForTest(Config{Enabled: true, GlobalRules: "deepseek-v4-pro=>gpt-5.4-mini"})
+	req := rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "deepseek-v4-pro",
+			Format:          "openai",
+			SourceFormat:    "openai",
+			Stream:          false,
+			Alt:             "alt-mode",
+			Headers:         http.Header{"X-Test": []string{"1"}},
+			Query:           url.Values{"q": []string{"1"}},
+			OriginalRequest: []byte(`{"model":"deepseek-v4-pro","messages":[]}`),
+		},
+		HostCallbackID: "callback-1",
+	}
+	var captured hostModelExecutionRequest
+	fakeHost := func(method string, payload any) (json.RawMessage, error) {
+		if method != pluginabi.MethodHostModelExecute {
+			t.Fatalf("method=%q, want %q", method, pluginabi.MethodHostModelExecute)
+		}
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("marshal payload: %v", err)
+		}
+		if err := json.Unmarshal(raw, &captured); err != nil {
+			t.Fatalf("decode captured payload: %v", err)
+		}
+		return json.Marshal(pluginapi.HostModelExecutionResponse{
+			StatusCode: 200,
+			Headers:    http.Header{"Content-Type": []string{"application/json"}},
+			Body:       []byte(`{"model":"gpt-5.4-mini","id":"ok"}`),
+		})
+	}
+	rawReq, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal req: %v", err)
+	}
+	respRaw, err := handleExecutorExecute(rawReq, fakeHost)
+	if err != nil {
+		t.Fatalf("handleExecutorExecute error = %v", err)
+	}
+	if captured.HostCallbackID != "callback-1" || captured.Model != "gpt-5.4-mini" || captured.EntryProtocol != "openai" || captured.ExitProtocol != "openai" || captured.Alt != "alt-mode" {
+		t.Fatalf("captured=%#v", captured)
+	}
+	if !strings.Contains(string(captured.Body), `"model":"gpt-5.4-mini"`) {
+		t.Fatalf("captured body=%s", captured.Body)
+	}
+	var resp pluginapi.ExecutorResponse
+	if err := json.Unmarshal(respRaw, &resp); err != nil {
+		t.Fatalf("decode executor response: %v", err)
+	}
+	if !strings.Contains(string(resp.Payload), `"model":"deepseek-v4-pro"`) {
+		t.Fatalf("payload=%s", resp.Payload)
+	}
+}
+
+func TestHandleExecutorExecutePreservesHostError(t *testing.T) {
+	setLoadedConfigForTest(Config{Enabled: true, GlobalRules: "a=>b"})
+	req := rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{Model: "a", Format: "openai", SourceFormat: "openai", OriginalRequest: []byte(`{"model":"a"}`)}, HostCallbackID: "callback-1"}
+	rawReq, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal req: %v", err)
+	}
+	_, err = handleExecutorExecute(rawReq, func(string, any) (json.RawMessage, error) {
+		return nil, fmt.Errorf("upstream rejected model")
+	})
+	if err == nil || !strings.Contains(err.Error(), "upstream rejected model") {
+		t.Fatalf("error=%v, want upstream error", err)
+	}
+}
+
+func TestHandleExecutorExecuteReturnsErrorForHostHTTPStatus(t *testing.T) {
+	setLoadedConfigForTest(Config{Enabled: true, GlobalRules: "a=>b"})
+	req := rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{Model: "a", Format: "openai", SourceFormat: "openai", OriginalRequest: []byte(`{"model":"a"}`)}, HostCallbackID: "callback-1"}
+	rawReq, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal req: %v", err)
+	}
+	_, err = handleExecutorExecute(rawReq, func(string, any) (json.RawMessage, error) {
+		return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: 404, Body: []byte(`{"error":"model not found"}`)})
+	})
+	if err == nil || !strings.Contains(err.Error(), "404") || !strings.Contains(err.Error(), "model not found") {
+		t.Fatalf("error=%v, want status and body in error", err)
 	}
 }

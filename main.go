@@ -274,6 +274,64 @@ func restoreResponseModel(body []byte, originalModel string) ([]byte, bool, erro
 	return rewriteTopLevelModel(body, originalModel)
 }
 
+type hostCaller func(method string, payload any) (json.RawMessage, error)
+
+type executorRPCRequest struct {
+	pluginapi.ExecutorRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+type hostModelExecutePayload struct {
+	pluginapi.HostModelExecutionRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+func handleExecutorExecute(raw []byte, call hostCaller) ([]byte, error) {
+	var req executorRPCRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	decision, err := routeModel(loadedConfig(), req.SourceFormat, req.Model)
+	if err != nil {
+		return nil, err
+	}
+	if !decision.Handled {
+		return nil, fmt.Errorf("unhandled model route for %q", req.Model)
+	}
+	body, _, err := rewriteRequestModel(req.OriginalRequest, decision.UpstreamModel)
+	if err != nil {
+		return nil, err
+	}
+	hostRaw, err := call(pluginabi.MethodHostModelExecute, hostModelExecutePayload{
+		HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
+			EntryProtocol: req.SourceFormat,
+			ExitProtocol:  req.Format,
+			Model:         decision.UpstreamModel,
+			Stream:        false,
+			Body:          body,
+			Headers:       req.Headers,
+			Query:         req.Query,
+			Alt:           req.Alt,
+		},
+		HostCallbackID: req.HostCallbackID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var hostResp pluginapi.HostModelExecutionResponse
+	if err := json.Unmarshal(hostRaw, &hostResp); err != nil {
+		return nil, err
+	}
+	if hostResp.StatusCode >= 400 {
+		return nil, fmt.Errorf("host.model.execute status %d: %s", hostResp.StatusCode, string(hostResp.Body))
+	}
+	payload, _, err := restoreResponseModel(hostResp.Body, decision.OriginalModel)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(pluginapi.ExecutorResponse{Payload: payload, Headers: hostResp.Headers})
+}
+
 func rewriteTopLevelModel(body []byte, model string) ([]byte, bool, error) {
 	var doc map[string]any
 	if err := json.Unmarshal(body, &doc); err != nil {
