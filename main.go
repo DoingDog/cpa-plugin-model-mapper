@@ -212,3 +212,64 @@ func parseReplace(s string, captures int) ([]token, error) {
 	flush()
 	return tokens, nil
 }
+
+func applyRules(model string, rules []rule) (string, bool, error) {
+	current := model
+	matchedAny := false
+	for _, r := range rules {
+		captures, ok := matchTokens(current, r.patternTokens)
+		if !ok {
+			continue
+		}
+		current = buildReplacement(r.replacementTokens, captures)
+		matchedAny = true
+		if current == "" {
+			return "", true, fmt.Errorf("empty mapped model")
+		}
+	}
+	return current, matchedAny, nil
+}
+
+func matchTokens(s string, tokens []token) ([]string, bool) {
+	captures := make([]string, 0, len(tokens))
+	pos := 0
+	for i, tok := range tokens {
+		if tok.literal != "" {
+			if !strings.HasPrefix(s[pos:], tok.literal) {
+				return nil, false
+			}
+			pos += len(tok.literal)
+			continue
+		}
+		nextLit := ""
+		for j := i + 1; j < len(tokens); j++ {
+			if tokens[j].literal != "" {
+				nextLit = tokens[j].literal
+				break
+			}
+		}
+		end := len(s)
+		if nextLit != "" {
+			idx := strings.Index(s[pos:], nextLit)
+			if idx < 0 {
+				return nil, false
+			}
+			end = pos + idx
+		}
+		captures = append(captures, s[pos:end])
+		pos = end
+	}
+	return captures, pos == len(s)
+}
+
+func buildReplacement(tokens []token, captures []string) string {
+	var b strings.Builder
+	for _, tok := range tokens {
+		if tok.literal != "" {
+			b.WriteString(tok.literal)
+			continue
+		}
+		b.WriteString(captures[tok.capture-1])
+	}
+	return b.String()
+}
