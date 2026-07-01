@@ -955,11 +955,12 @@ Expected: full test suite PASS.
 ### Task 7: CPA SDK discovery and RPC seam reconciliation
 
 **Files:**
-- Read-only: `upstream/CLIProxyAPI/sdk/pluginapi/types.go`
-- Read-only: `upstream/CLIProxyAPI/sdk/pluginabi/types.go`
-- Read-only: `upstream/CLIProxyAPI/examples/plugin/host-model-callback/go/main.go`
-- Read-only: `upstream/CLIProxyAPI/examples/plugin/claude-web-search-router/go/execute_stream.go`
-- Read-only: `upstream/CLIProxyAPI/examples/plugin/claude-web-search-router/go/stream_forward.go`
+- Read-only: `upstream/CLIProxyAPI/sdk/pluginapi/types.go` or local module cache path for `github.com/router-for-me/CLIProxyAPI/v7@v7.2.48` when `upstream/` is absent.
+- Read-only: `upstream/CLIProxyAPI/sdk/pluginabi/types.go` or local module cache path for `github.com/router-for-me/CLIProxyAPI/v7@v7.2.48` when `upstream/` is absent.
+- Read-only: `upstream/CLIProxyAPI/examples/plugin/host-model-callback/go/main.go` or the matching example/README in the local `v7.2.48` module cache.
+- Read-only: `upstream/CLIProxyAPI/examples/plugin/claude-web-search-router/go/execute_stream.go` or equivalent stream bridge implementation/tests in the local `v7.2.48` module cache.
+- Read-only: `upstream/CLIProxyAPI/examples/plugin/claude-web-search-router/go/stream_forward.go` or equivalent stream bridge implementation/tests in the local `v7.2.48` module cache.
+- Modify after discovery: `docs/superpowers/plans/2026-07-01-cpa-model-mapper-implementation.md` only if SDK seams differ from this plan.
 - Modify after discovery: `main.go`
 - Modify after discovery: `main_test.go`
 
@@ -973,9 +974,11 @@ Ask the subagent to read the listed SDK/example files and return only mismatches
 
 - [ ] **Step 2: Verify method names and stream bridge locally**
 
-Run these read-only checks:
+Run these read-only checks. If `upstream/CLIProxyAPI` is absent, first resolve the cached module root with `go env GOMODCACHE` and use `github.com/router-for-me/CLIProxyAPI/v7@v7.2.48` under that cache instead of `upstream/CLIProxyAPI`:
 
 ```powershell
+go list github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi
+go list github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi
 git grep -n "MethodModelRoute\|MethodExecutorExecuteStream\|MethodHostModelExecuteStream\|MethodHostStreamEmit\|MethodHostStreamClose" -- upstream/CLIProxyAPI/sdk/pluginabi/types.go
 git grep -n "type ModelRouteResponse\|TargetModel.*Only meaningful\|type HostModelExecutionRequest\|type HostModelStreamReadResponse\|type ExecutorRequest" -- upstream/CLIProxyAPI/sdk/pluginapi/types.go
 git grep -n "go func()\|MethodHostModelExecuteStream\|MethodHostStreamEmit\|MethodHostStreamClose" -- upstream/CLIProxyAPI/examples/plugin/claude-web-search-router/go/execute_stream.go upstream/CLIProxyAPI/examples/plugin/claude-web-search-router/go/stream_forward.go
