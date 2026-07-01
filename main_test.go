@@ -345,3 +345,29 @@ func TestSSERewriterHandlesMultipleEventsCRLFAndFlush(t *testing.T) {
 		t.Fatalf("Flush output = %q", string(bytes.Join(flushed, nil)))
 	}
 }
+
+func TestSSERewriterPreservesMultilineEventBoundaries(t *testing.T) {
+	r := newSSERewriter("A")
+	out, err := r.Write([]byte("event: message\ndata: {\"model\":\"B\"}\nid: 1\n\n"))
+	if err != nil {
+		t.Fatalf("Write error = %v", err)
+	}
+	got := flattenChunks(out)
+	want := "event: message\ndata: {\"model\":\"A\"}\nid: 1\n\n"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestSSERewriterUsesEarliestDelimiter(t *testing.T) {
+	r := newSSERewriter("A")
+	out, err := r.Write([]byte("data: {\"model\":\"B1\"}\n\ndata: {\"model\":\"B2\"}\r\n\r\n"))
+	if err != nil {
+		t.Fatalf("Write error = %v", err)
+	}
+	got := flattenChunks(out)
+	want := "data: {\"model\":\"A\"}\n\ndata: {\"model\":\"A\"}\r\n\r\n"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}

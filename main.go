@@ -49,38 +49,54 @@ func (r *sseRewriter) Flush() ([][]byte, error) {
 }
 
 func (r *sseRewriter) rewriteEvent(event []byte) ([][]byte, error) {
-	lines := strings.Split(string(event), "\n")
-	out := make([][]byte, 0, len(lines))
-	for _, raw := range lines {
-		line := strings.TrimSuffix(raw, "\r")
-		if strings.HasPrefix(line, "data:") {
-			value := strings.TrimSpace(line[len("data:"):])
-			if value == "[DONE]" || value == "" {
-				out = append(out, []byte(line))
+	var out [][]byte
+	for len(event) > 0 {
+		lineEnd := bytes.IndexByte(event, '\n')
+		line := event
+		lineBreak := []byte(nil)
+		if lineEnd >= 0 {
+			line = event[:lineEnd]
+			lineBreak = []byte("\n")
+			event = event[lineEnd+1:]
+		} else {
+			event = nil
+		}
+		if n := len(line); n > 0 && line[n-1] == '\r' {
+			line = line[:n-1]
+			if len(lineBreak) > 0 {
+				lineBreak = []byte("\r\n")
+			}
+		}
+		if bytes.HasPrefix(line, []byte("data:")) {
+			value := bytes.TrimSpace(line[len("data:"):])
+			if len(value) == 0 || bytes.Equal(value, []byte("[DONE]")) {
+				out = append(out, append(append([]byte(nil), line...), lineBreak...))
 				continue
 			}
-			restored, changed, err := restoreResponseModel([]byte(value), r.originalModel)
+			restored, changed, err := restoreResponseModel(value, r.originalModel)
 			if err != nil {
 				return nil, err
 			}
 			if changed {
-				out = append(out, append([]byte("data: "), restored...))
+				out = append(out, append(append([]byte("data: "), restored...), lineBreak...))
 				continue
 			}
 		}
-		out = append(out, []byte(line))
+		out = append(out, append(append([]byte(nil), line...), lineBreak...))
 	}
 	return out, nil
 }
 
 func sseEventDelimiter(buf []byte) (eventLen, delimLen int) {
-	if i := bytes.Index(buf, []byte("\r\n\r\n")); i >= 0 {
-		return i, 4
+	lf := bytes.Index(buf, []byte("\n\n"))
+	crlf := bytes.Index(buf, []byte("\r\n\r\n"))
+	if lf < 0 && crlf < 0 {
+		return 0, 0
 	}
-	if i := bytes.Index(buf, []byte("\n\n")); i >= 0 {
-		return i, 2
+	if lf >= 0 && (crlf < 0 || lf < crlf) {
+		return lf, 2
 	}
-	return 0, 0
+	return crlf, 4
 }
 
 func (r *sseRewriter) delimiterBytes(n int) []byte {
