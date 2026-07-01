@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"unicode"
@@ -63,6 +64,34 @@ func routeModel(cfg Config, format string, model string) (routeDecision, error) 
 		return routeDecision{}, nil
 	}
 	return routeDecision{Handled: true, OriginalModel: model, UpstreamModel: mapped}, nil
+}
+
+func rewriteRequestModel(body []byte, upstreamModel string) ([]byte, bool, error) {
+	return rewriteTopLevelModel(body, upstreamModel)
+}
+
+func restoreResponseModel(body []byte, originalModel string) ([]byte, bool, error) {
+	return rewriteTopLevelModel(body, originalModel)
+}
+
+func rewriteTopLevelModel(body []byte, model string) ([]byte, bool, error) {
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return append([]byte(nil), body...), false, nil
+	}
+	current, ok := doc["model"]
+	if !ok {
+		return append([]byte(nil), body...), false, nil
+	}
+	if _, ok := current.(string); !ok {
+		return append([]byte(nil), body...), false, nil
+	}
+	doc["model"] = model
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return nil, false, err
+	}
+	return out, true, nil
 }
 
 type token struct {

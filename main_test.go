@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
+
 
 func TestDefaultConfigEnabledTrue(t *testing.T) {
 	cfg := defaultConfig()
@@ -198,5 +202,75 @@ func TestRouteModelBadSelectedRulesErrors(t *testing.T) {
 	cfg := Config{Enabled: true, ClaudeMessagesRules: "bad rule"}
 	if _, err := routeModel(cfg, "claude", "a"); err == nil {
 		t.Fatalf("routeModel bad selected rules error = nil")
+	}
+}
+
+func TestRewriteRequestModelTopLevelOnly(t *testing.T) {
+	got, changed, err := rewriteRequestModel([]byte(`{"model":"A","messages":[]}`), "B")
+	if err != nil {
+		t.Fatalf("rewriteRequestModel error = %v", err)
+	}
+	if !changed || string(got) == `{"model":"A","messages":[]}` {
+		t.Fatalf("changed=%v body=%s", changed, got)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(got, &decoded); err != nil {
+		t.Fatalf("rewritten JSON invalid: %v", err)
+	}
+	if decoded["model"] != "B" {
+		t.Fatalf("model=%v, want B", decoded["model"])
+	}
+}
+
+func TestRewriteRequestModelLeavesUnsupportedBodiesUnchanged(t *testing.T) {
+	tests := [][]byte{
+		[]byte(`{"payload":{"model":"A"}}`),
+		[]byte(`{"messages":[]}`),
+		[]byte(`{"model":123}`),
+		[]byte(`not-json`),
+	}
+	for _, body := range tests {
+		got, changed, err := rewriteRequestModel(body, "B")
+		if err != nil {
+			t.Fatalf("rewriteRequestModel(%s) error = %v", body, err)
+		}
+		if changed || string(got) != string(body) {
+			t.Fatalf("rewriteRequestModel(%s)=(%s,%v), want unchanged false", body, got, changed)
+		}
+	}
+}
+
+func TestRestoreResponseModelTopLevelOnly(t *testing.T) {
+	got, changed, err := restoreResponseModel([]byte(`{"model":"B","id":"r1"}`), "A")
+	if err != nil {
+		t.Fatalf("restoreResponseModel error = %v", err)
+	}
+	if !changed {
+		t.Fatalf("changed=false, want true")
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(got, &decoded); err != nil {
+		t.Fatalf("restored JSON invalid: %v", err)
+	}
+	if decoded["model"] != "A" {
+		t.Fatalf("model=%v, want A", decoded["model"])
+	}
+}
+
+func TestRestoreResponseModelLeavesUnsupportedBodiesUnchanged(t *testing.T) {
+	tests := [][]byte{
+		[]byte(`{"payload":{"model":"B"}}`),
+		[]byte(`{"id":"r1"}`),
+		[]byte(`{"model":123}`),
+		[]byte(`not-json`),
+	}
+	for _, body := range tests {
+		got, changed, err := restoreResponseModel(body, "A")
+		if err != nil {
+			t.Fatalf("restoreResponseModel(%s) error = %v", body, err)
+		}
+		if changed || string(got) != string(body) {
+			t.Fatalf("restoreResponseModel(%s)=(%s,%v), want unchanged false", body, got, changed)
+		}
 	}
 }
