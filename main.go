@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"unicode"
@@ -279,11 +280,154 @@ type hostCaller func(method string, payload any) (json.RawMessage, error)
 type executorRPCRequest struct {
 	pluginapi.ExecutorRequest
 	HostCallbackID string `json:"host_callback_id,omitempty"`
+	StreamID       string `json:"stream_id,omitempty"`
 }
 
 type hostModelExecutePayload struct {
 	pluginapi.HostModelExecutionRequest
 	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+func handleExecutorExecuteStream(raw []byte, call hostCaller) ([]byte, error) {
+	var req executorRPCRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	if req.StreamID == "" {
+		return nil, fmt.Errorf("missing plugin stream id")
+	}
+	return startExecutorStream(req, call, func(streamID, errText string) error {
+		_, err := call(pluginabi.MethodHostStreamClose, struct {
+			StreamID string `json:"stream_id"`
+			Error    string `json:"error,omitempty"`
+		}{StreamID: streamID, Error: errText})
+		return err
+	})
+}
+
+func startExecutorStream(req executorRPCRequest, call hostCaller, closeStream func(string, string) error) ([]byte, error) {
+	go func() {
+		if err := runStreamForward(req, call); err != nil {
+			_ = closeStream(req.StreamID, err.Error())
+		}
+	}()
+	return json.Marshal(map[string]any{"headers": http.Header{"Content-Type": []string{"text/event-stream"}}})
+}
+
+func runStreamForward(req executorRPCRequest, call hostCaller) error {
+	decision, err := routeModel(loadedConfig(), req.SourceFormat, req.Model)
+	if err != nil {
+		return fmt.Errorf("route stream: %w", err)
+	}
+	if !decision.Handled {
+		return fmt.Errorf("route stream: unhandled model route for %q", req.Model)
+	}
+	body, _, err := rewriteRequestModel(req.OriginalRequest, decision.UpstreamModel)
+	if err != nil {
+		return fmt.Errorf("rewrite stream request: %w", err)
+	}
+	hostRaw, err := call(pluginabi.MethodHostModelExecuteStream, hostModelExecutePayload{
+		HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
+			EntryProtocol: req.SourceFormat,
+			ExitProtocol:  req.Format,
+			Model:         decision.UpstreamModel,
+			Stream:        true,
+			Body:          body,
+			Headers:       req.Headers,
+			Query:         req.Query,
+			Alt:           req.Alt,
+		},
+		HostCallbackID: req.HostCallbackID,
+	})
+	if err != nil {
+		return fmt.Errorf("execute stream: %w", err)
+	}
+	var hostResp struct {
+		pluginapi.HostModelStreamResponse
+		Body []byte `json:"body"`
+	}
+	if err := json.Unmarshal(hostRaw, &hostResp); err != nil {
+		return fmt.Errorf("decode host stream response: %w", err)
+	}
+	if hostResp.StatusCode >= 400 {
+		return fmt.Errorf("execute stream status %d: %s", hostResp.StatusCode, string(hostResp.Body))
+	}
+	if hostResp.StreamID == "" {
+		return fmt.Errorf("missing host stream id")
+	}
+	hostStreamID := hostResp.StreamID
+	closeHost := func() error {
+		_, err := call(pluginabi.MethodHostModelStreamClose, pluginapi.HostModelStreamCloseRequest{StreamID: hostStreamID})
+		return err
+	}
+	closePlugin := func(errText string) error {
+		_, err := call(pluginabi.MethodHostStreamClose, struct {
+			StreamID string `json:"stream_id"`
+			Error    string `json:"error,omitempty"`
+		}{StreamID: req.StreamID, Error: errText})
+		return err
+	}
+	emit := func(payload []byte) error {
+		_, err := call(pluginabi.MethodHostStreamEmit, struct {
+			StreamID string `json:"stream_id"`
+			Payload  []byte `json:"payload"`
+		}{StreamID: req.StreamID, Payload: payload})
+		return err
+	}
+	rewriter := newSSERewriter(decision.OriginalModel)
+	for {
+		readRaw, err := call(pluginabi.MethodHostModelStreamRead, pluginapi.HostModelStreamReadRequest{StreamID: hostStreamID})
+		if err != nil {
+			_ = closeHost()
+			return fmt.Errorf("read host stream: %w", err)
+		}
+		var chunk pluginapi.HostModelStreamReadResponse
+		if err := json.Unmarshal(readRaw, &chunk); err != nil {
+			_ = closeHost()
+			return fmt.Errorf("decode host stream chunk: %w", err)
+		}
+		if chunk.Error != "" {
+			if err := closeHost(); err != nil {
+				return fmt.Errorf("close host stream: %w", err)
+			}
+			if err := closePlugin(chunk.Error); err != nil {
+				return fmt.Errorf("close plugin stream: %w", err)
+			}
+			return nil
+		}
+		if chunk.Done {
+			break
+		}
+		chunks, err := rewriter.Write(chunk.Payload)
+		if err != nil {
+			_ = closeHost()
+			return fmt.Errorf("rewrite stream chunk: %w", err)
+		}
+		for _, out := range chunks {
+			if err := emit(out); err != nil {
+				_ = closeHost()
+				return fmt.Errorf("emit stream chunk: %w", err)
+			}
+		}
+	}
+	flushed, err := rewriter.Flush()
+	if err != nil {
+		_ = closeHost()
+		return fmt.Errorf("flush stream rewriter: %w", err)
+	}
+	for _, out := range flushed {
+		if err := emit(out); err != nil {
+			_ = closeHost()
+			return fmt.Errorf("emit flushed stream chunk: %w", err)
+		}
+	}
+	if err := closeHost(); err != nil {
+		return fmt.Errorf("close host stream: %w", err)
+	}
+	if err := closePlugin(""); err != nil {
+		return fmt.Errorf("close plugin stream: %w", err)
+	}
+	return nil
 }
 
 func handleExecutorExecute(raw []byte, call hostCaller) ([]byte, error) {

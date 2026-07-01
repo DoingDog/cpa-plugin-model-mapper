@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	pluginabi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	pluginapi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -558,5 +559,99 @@ func TestHandleExecutorExecuteReturnsErrorForHostHTTPStatus(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "404") || !strings.Contains(err.Error(), "model not found") {
 		t.Fatalf("error=%v, want status and body in error", err)
+	}
+}
+
+func TestHandleExecutorExecuteStreamStartsForwarderAndRestoresChunks(t *testing.T) {
+	setLoadedConfigForTest(Config{Enabled: true, GlobalRules: "deepseek-v4-pro=>gpt-5.4-mini"})
+	req := rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "deepseek-v4-pro",
+			Format:          "openai",
+			SourceFormat:    "openai",
+			Stream:          true,
+			OriginalRequest: []byte(`{"model":"deepseek-v4-pro","stream":true}`),
+		},
+		HostCallbackID: "callback-1",
+		StreamID:       "plugin-stream-1",
+	}
+	reads := []pluginapi.HostModelStreamReadResponse{
+		{Payload: []byte("data: {\"model\":\"gpt-5.4-mini\"}\n\n")},
+		{Payload: []byte("data: [DONE]\n\n")},
+		{Done: true},
+	}
+	var emitted []string
+	closedHost := false
+	closedPlugin := false
+	done := make(chan struct{})
+	fakeHost := func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostModelExecuteStream:
+			return json.Marshal(pluginapi.HostModelStreamResponse{StatusCode: 200, Headers: http.Header{"Content-Type": []string{"text/event-stream"}}, StreamID: "host-stream-1"})
+		case pluginabi.MethodHostModelStreamRead:
+			if len(reads) == 0 {
+				t.Fatalf("unexpected extra stream read")
+			}
+			next := reads[0]
+			reads = reads[1:]
+			return json.Marshal(next)
+		case pluginabi.MethodHostStreamEmit:
+			raw, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatalf("marshal emit payload: %v", err)
+			}
+			var emit struct {
+				StreamID string `json:"stream_id"`
+				Payload  []byte `json:"payload"`
+				Error    string `json:"error"`
+			}
+			if err := json.Unmarshal(raw, &emit); err != nil {
+				t.Fatalf("decode emit payload: %v", err)
+			}
+			if emit.StreamID != "plugin-stream-1" {
+				t.Fatalf("emit stream id=%q", emit.StreamID)
+			}
+			emitted = append(emitted, string(emit.Payload))
+			return json.Marshal(map[string]any{})
+		case pluginabi.MethodHostModelStreamClose:
+			closedHost = true
+			return json.Marshal(map[string]any{})
+		case pluginabi.MethodHostStreamClose:
+			closedPlugin = true
+			close(done)
+			return json.Marshal(map[string]any{})
+		default:
+			t.Fatalf("unexpected method %q", method)
+			return nil, nil
+		}
+	}
+	rawReq, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal req: %v", err)
+	}
+	respRaw, err := handleExecutorExecuteStream(rawReq, fakeHost)
+	if err != nil {
+		t.Fatalf("handleExecutorExecuteStream error = %v", err)
+	}
+	var resp struct {
+		Headers http.Header `json:"headers"`
+	}
+	if err := json.Unmarshal(respRaw, &resp); err != nil {
+		t.Fatalf("decode stream response: %v", err)
+	}
+	if resp.Headers.Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("headers=%v, want text/event-stream", resp.Headers)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("stream forwarder did not close plugin stream")
+	}
+	joined := strings.Join(emitted, "")
+	if !strings.Contains(joined, `"model":"deepseek-v4-pro"`) || strings.Contains(joined, `"model":"gpt-5.4-mini"`) || !strings.Contains(joined, "data: [DONE]") {
+		t.Fatalf("emitted=%q", joined)
+	}
+	if !closedHost || !closedPlugin {
+		t.Fatalf("closedHost=%v closedPlugin=%v", closedHost, closedPlugin)
 	}
 }
