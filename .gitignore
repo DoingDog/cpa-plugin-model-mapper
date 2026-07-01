@@ -15,3 +15,12 @@ dist/
 # Local config/secrets
 .env
 config.yaml
+*.log
+
+# Release archives and checksums
+*.zip
+*.sha256
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
