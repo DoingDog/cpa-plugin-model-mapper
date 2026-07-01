@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 	"unicode"
+	"unsafe"
 
 	pluginabi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	pluginapi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -176,7 +179,45 @@ func decodeConfig(raw json.RawMessage) (Config, error) {
 var (
 	loadedConfigMu sync.RWMutex
 	loadedCfg      = defaultConfig()
+
+	hostAPIMu sync.RWMutex
+	hostAPI   storedHostAPI
 )
+
+type cliproxyBuffer struct {
+	ptr unsafe.Pointer
+	len uintptr
+}
+
+type cliproxyHostCallFn func(unsafe.Pointer, string, []byte, *cliproxyBuffer) int
+
+type cliproxyHostFreeFn func(unsafe.Pointer, uintptr)
+
+type cliproxyHostAPI struct {
+	abiVersion uint32
+	hostCtx    unsafe.Pointer
+	call       cliproxyHostCallFn
+	freeBuffer cliproxyHostFreeFn
+}
+
+type cliproxyPluginCallFn func(string, []byte, *cliproxyBuffer) int
+
+type cliproxyPluginFreeFn func(unsafe.Pointer, uintptr)
+
+type cliproxyPluginShutdownFn func()
+
+type cliproxyPluginAPI struct {
+	abiVersion uint32
+	call       cliproxyPluginCallFn
+	freeBuffer cliproxyPluginFreeFn
+	shutdown   cliproxyPluginShutdownFn
+}
+
+type storedHostAPI struct {
+	hostCtx    unsafe.Pointer
+	call       cliproxyHostCallFn
+	freeBuffer cliproxyHostFreeFn
+}
 
 func loadedConfig() Config {
 	loadedConfigMu.RLock()
@@ -195,12 +236,16 @@ func handlePluginRegister(raw []byte) ([]byte, error) {
 }
 
 func handlePluginReconfigure(raw []byte) ([]byte, error) {
-	cfg, err := decodeConfig(raw)
+	cfgRaw, _, err := decodeLifecycleConfig(raw)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := decodeConfig(cfgRaw)
 	if err != nil {
 		return nil, err
 	}
 	setLoadedConfigForTest(cfg)
-	return json.Marshal(map[string]any{"ok": true, "enabled": cfg.Enabled})
+	return json.Marshal(pluginRegistration())
 }
 
 type routeDecision struct {
@@ -474,6 +519,138 @@ func handleExecutorExecute(raw []byte, call hostCaller) ([]byte, error) {
 		return nil, err
 	}
 	return json.Marshal(pluginapi.ExecutorResponse{Payload: payload, Headers: hostResp.Headers})
+}
+
+func okEnvelope(v any) ([]byte, error) {
+	if v == nil {
+		v = map[string]any{}
+	}
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(pluginabi.Envelope{OK: true, Result: raw})
+}
+
+func wrapEnvelope(payload []byte, err error) ([]byte, error) {
+	if err != nil {
+		return errorEnvelope("plugin_error", err.Error()), nil
+	}
+	return okEnvelope(json.RawMessage(payload))
+}
+
+func errorEnvelope(code, message string) []byte {
+	raw, err := json.Marshal(pluginabi.Envelope{
+		OK:    false,
+		Error: &pluginabi.Error{Code: code, Message: message},
+	})
+	if err != nil {
+		return []byte(`{"ok":false,"error":{"code":"plugin_error","message":"failed to encode error envelope"}}`)
+	}
+	return raw
+}
+
+func handleMethod(method string, request []byte) ([]byte, error) {
+	switch method {
+	case pluginabi.MethodPluginRegister:
+		return wrapEnvelope(handlePluginRegister(request))
+	case pluginabi.MethodPluginReconfigure:
+		return wrapEnvelope(handlePluginReconfigure(request))
+	case pluginabi.MethodModelRoute:
+		return wrapEnvelope(handleModelRoute(request))
+	case pluginabi.MethodExecutorExecute:
+		return wrapEnvelope(handleExecutorExecute(request, callHost))
+	case pluginabi.MethodExecutorExecuteStream:
+		return wrapEnvelope(handleExecutorExecuteStream(request, callHost))
+	case pluginabi.MethodExecutorCountTokens:
+		return errorEnvelope("unsupported", "executor.count_tokens is not supported by model-mapper"), nil
+	default:
+		return errorEnvelope("unknown_method", "unknown method: "+method), nil
+	}
+}
+
+func decodeLifecycleConfig(raw []byte) (json.RawMessage, bool, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil, false, nil
+	}
+	var lifecycle struct {
+		ConfigYAML string `json:"config_yaml"`
+	}
+	if err := json.Unmarshal(trimmed, &lifecycle); err == nil && lifecycle.ConfigYAML != "" {
+		decoded, err := base64.StdEncoding.DecodeString(lifecycle.ConfigYAML)
+		if err != nil {
+			return nil, true, err
+		}
+		cfg := defaultConfig()
+		scanner := bufio.NewScanner(bytes.NewReader(decoded))
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			key, value, ok := strings.Cut(line, ":")
+			if !ok {
+				continue
+			}
+			key = strings.TrimSpace(key)
+			value = strings.TrimSpace(value)
+			switch key {
+			case "enabled":
+				cfg.Enabled = strings.EqualFold(value, "true")
+			case "global_rules":
+				cfg.GlobalRules = value
+			case "claude_messages_rules":
+				cfg.ClaudeMessagesRules = value
+			case "codex_responses_rules":
+				cfg.CodexResponsesRules = value
+			case "openai_completions_rules":
+				cfg.OpenAICompletionsRules = value
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			return nil, true, err
+		}
+		cfgRaw, err := json.Marshal(cfg)
+		if err != nil {
+			return nil, true, err
+		}
+		return cfgRaw, true, nil
+	}
+	return append(json.RawMessage(nil), trimmed...), false, nil
+}
+
+func callHost(method string, payload any) (json.RawMessage, error) {
+	hostAPIMu.RLock()
+	stored := hostAPI
+	hostAPIMu.RUnlock()
+	if stored.call == nil || stored.freeBuffer == nil {
+		return nil, fmt.Errorf("host API not initialized")
+	}
+	rawPayload, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	var response cliproxyBuffer
+	rc := stored.call(stored.hostCtx, method, rawPayload, &response)
+	if response.ptr != nil {
+		defer stored.freeBuffer(response.ptr, response.len)
+	}
+	if rc != 0 {
+		return nil, fmt.Errorf("host callback %s failed with rc=%d", method, rc)
+	}
+	responseBytes := append([]byte(nil), (*(*[1 << 30]byte)(response.ptr))[:response.len:response.len]...)
+	var env pluginabi.Envelope
+	if err := json.Unmarshal(responseBytes, &env); err != nil {
+		return nil, fmt.Errorf("decode host envelope: %w", err)
+	}
+	if !env.OK {
+		if env.Error == nil {
+			return nil, fmt.Errorf("host callback %s failed", method)
+		}
+		return nil, fmt.Errorf("host callback %s failed: %s", method, env.Error.Message)
+	}
+	return append(json.RawMessage(nil), env.Result...), nil
 }
 
 func rewriteTopLevelModel(body []byte, model string) ([]byte, bool, error) {
@@ -752,4 +929,77 @@ func buildReplacement(tokens []token, captures []string) string {
 		b.WriteString(captures[tok.capture-1])
 	}
 	return b.String()
+}
+
+func setHostAPIForTest(api storedHostAPI) {
+	hostAPIMu.Lock()
+	hostAPI = api
+	hostAPIMu.Unlock()
+}
+
+func copyRequestBytes(request unsafe.Pointer, requestLen uintptr) []byte {
+	if request == nil || requestLen == 0 {
+		return nil
+	}
+	return append([]byte(nil), (*(*[1 << 30]byte)(request))[:requestLen:requestLen]...)
+}
+
+func setResponseBuffer(response *cliproxyBuffer, payload []byte) int {
+	if response == nil {
+		return 1
+	}
+	response.ptr = nil
+	response.len = 0
+	if len(payload) == 0 {
+		return 0
+	}
+	buf := append([]byte(nil), payload...)
+	response.ptr = unsafe.Pointer(&buf[0])
+	response.len = uintptr(len(buf))
+	return 0
+}
+
+func cliproxy_plugin_init(host *cliproxyHostAPI, plugin *cliproxyPluginAPI) int {
+	if host == nil || plugin == nil {
+		return 1
+	}
+	if host.abiVersion != pluginabi.ABIVersion {
+		return 1
+	}
+	if host.call == nil || host.freeBuffer == nil {
+		return 1
+	}
+	hostAPIMu.Lock()
+	hostAPI = storedHostAPI{hostCtx: host.hostCtx, call: host.call, freeBuffer: host.freeBuffer}
+	hostAPIMu.Unlock()
+	plugin.abiVersion = pluginabi.ABIVersion
+	plugin.call = cliproxyPluginCall
+	plugin.freeBuffer = cliproxyPluginFree
+	plugin.shutdown = cliproxyPluginShutdown
+	return 0
+}
+
+func cliproxyPluginCall(method string, request []byte, response *cliproxyBuffer) int {
+	if response == nil {
+		return 1
+	}
+	payload, err := handleMethod(method, request)
+	if err != nil {
+		payload = errorEnvelope("plugin_error", err.Error())
+	}
+	if rc := setResponseBuffer(response, payload); rc != 0 {
+		return 1
+	}
+	return 0
+}
+
+func cliproxyPluginFree(ptr unsafe.Pointer, len uintptr) {
+	_ = ptr
+	_ = len
+}
+
+func cliproxyPluginShutdown() {
+	hostAPIMu.Lock()
+	hostAPI = storedHostAPI{}
+	hostAPIMu.Unlock()
 }

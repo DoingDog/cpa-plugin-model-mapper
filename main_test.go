@@ -655,3 +655,67 @@ func TestHandleExecutorExecuteStreamStartsForwarderAndRestoresChunks(t *testing.
 		t.Fatalf("closedHost=%v closedPlugin=%v", closedHost, closedPlugin)
 	}
 }
+
+func TestHandleMethodDispatchesRegisterReconfigureAndUnknown(t *testing.T) {
+	registerRaw, err := handleMethod(pluginabi.MethodPluginRegister, nil)
+	if err != nil {
+		t.Fatalf("handle register error = %v", err)
+	}
+	var env pluginabi.Envelope
+	if err := json.Unmarshal(registerRaw, &env); err != nil {
+		t.Fatalf("decode register envelope: %v", err)
+	}
+	if !env.OK || len(env.Result) == 0 {
+		t.Fatalf("register envelope=%#v", env)
+	}
+	var reg registration
+	if err := json.Unmarshal(env.Result, &reg); err != nil {
+		t.Fatalf("decode register result: %v", err)
+	}
+	if reg.Metadata.Name != "model-mapper" {
+		t.Fatalf("registration=%#v", reg)
+	}
+
+	reconfigureRaw, err := handleMethod(pluginabi.MethodPluginReconfigure, []byte(`{"config_yaml":"ZW5hYmxlZDogdHJ1ZQpnbG9iYWxfcnVsZXM6IGE9PmIK"}`))
+	if err != nil {
+		t.Fatalf("handle reconfigure error = %v", err)
+	}
+	if err := json.Unmarshal(reconfigureRaw, &env); err != nil {
+		t.Fatalf("decode reconfigure envelope: %v", err)
+	}
+	if !env.OK || len(env.Result) == 0 {
+		t.Fatalf("reconfigure envelope=%#v", env)
+	}
+	decision, err := routeModel(loadedConfig(), "openai", "a")
+	if err != nil {
+		t.Fatalf("route after reconfigure: %v", err)
+	}
+	if !decision.Handled || decision.UpstreamModel != "b" {
+		t.Fatalf("decision after reconfigure=%#v", decision)
+	}
+
+	unknownRaw, err := handleMethod("unknown.method", nil)
+	if err != nil {
+		t.Fatalf("handle unknown returned Go error = %v", err)
+	}
+	if err := json.Unmarshal(unknownRaw, &env); err != nil {
+		t.Fatalf("decode unknown envelope: %v", err)
+	}
+	if env.OK || env.Error == nil || env.Error.Code != "unknown_method" {
+		t.Fatalf("unknown envelope=%#v", env)
+	}
+}
+
+func TestHandleMethodCountTokensUnsupportedWithoutPanic(t *testing.T) {
+	raw, err := handleMethod(pluginabi.MethodExecutorCountTokens, nil)
+	if err != nil {
+		t.Fatalf("count tokens Go error = %v", err)
+	}
+	var env pluginabi.Envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("decode count tokens envelope: %v", err)
+	}
+	if env.OK || env.Error == nil || env.Error.Code != "unsupported" {
+		t.Fatalf("count tokens envelope=%#v", env)
+	}
+}
