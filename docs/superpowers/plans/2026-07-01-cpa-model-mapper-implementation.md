@@ -187,10 +187,10 @@ module github.com/router-for-me/cpa-plugin-model-mapper
 
 go 1.26.0
 
-require github.com/router-for-me/CLIProxyAPI/v7 v7.0.0
+require github.com/router-for-me/CLIProxyAPI/v7 v7.2.48
 ```
 
-If `v7.0.0` is unavailable, run `go get github.com/router-for-me/CLIProxyAPI/v7@main` and keep the resulting pseudo-version. Do not add a `replace` pointing to `upstream/CLIProxyAPI` in the committed `go.mod`.
+`v7.0.0` does not include `sdk/pluginapi` or `sdk/pluginabi`; use `v7.2.48` instead. If `upstream/CLIProxyAPI` is absent, use the local GOMODCACHE copy at `github.com/router-for-me/CLIProxyAPI/v7@v7.2.48` to reconcile seams. Do not add a `replace` pointing to `upstream/CLIProxyAPI` in the committed `go.mod`.
 
 - [ ] **Step 3: Write the failing test**
 
