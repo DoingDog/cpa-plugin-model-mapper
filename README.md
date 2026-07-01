@@ -2,6 +2,10 @@
 
 `model-mapper` is a CLIProxyAPI (CPA) native plugin. It maps text-generation request model names before CPA selects the upstream execution path, then restores the top-level response `model` field back to the client-requested model only when a rule matched and changed the request.
 
+When CPA invokes the plugin executor callbacks, the same mapping applies across non-streaming HTTP responses, SSE streams, and WebSocket-backed CPA streams that arrive as raw JSON chunks through the existing stream bridge.
+
+The plugin does not register management/resource routes and does not use `/v0/resource/plugins/` for business logic or state-changing actions.
+
 ## Configuration
 
 ```yaml
