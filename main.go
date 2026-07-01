@@ -210,19 +210,24 @@ func pluginRegistration() registration {
 	return registration{
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
-			Name: "model-mapper",
+			Name:             "model-mapper",
+			Version:          "0.1.0",
+			Author:           "router-for-me",
+			GitHubRepository: "https://github.com/router-for-me/cpa-plugin-model-mapper",
 			ConfigFields: []pluginapi.ConfigField{
-				{Name: "enabled", Type: pluginapi.ConfigFieldTypeBoolean},
-				{Name: "global_rules", Type: pluginapi.ConfigFieldTypeString},
-				{Name: "claude_messages_rules", Type: pluginapi.ConfigFieldTypeString},
-				{Name: "codex_responses_rules", Type: pluginapi.ConfigFieldTypeString},
-				{Name: "openai_completions_rules", Type: pluginapi.ConfigFieldTypeString},
+				{Name: "enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enable model request mapping."},
+				{Name: "global_rules", Type: pluginapi.ConfigFieldTypeString, Description: "Fallback rules used when an endpoint-specific ruleset is empty."},
+				{Name: "claude_messages_rules", Type: pluginapi.ConfigFieldTypeString, Description: "Rules for Claude Messages-compatible requests."},
+				{Name: "codex_responses_rules", Type: pluginapi.ConfigFieldTypeString, Description: "Rules for OpenAI Responses/Codex-compatible requests."},
+				{Name: "openai_completions_rules", Type: pluginapi.ConfigFieldTypeString, Description: "Rules for OpenAI Completions and Chat Completions requests."},
 			},
 		},
 		Capabilities: registrationCapabilities{
-			ModelRouter:        true,
-			Executor:           true,
-			ExecutorModelScope: string(pluginapi.ExecutorModelScopeStatic),
+			ModelRouter:           true,
+			Executor:              true,
+			ExecutorModelScope:    string(pluginapi.ExecutorModelScopeStatic),
+			ExecutorInputFormats:  []string{"openai", "claude", "openai-response"},
+			ExecutorOutputFormats: []string{"openai", "claude", "openai-response"},
 		},
 	}
 }
@@ -283,6 +288,12 @@ func handlePluginReconfigure(raw []byte) ([]byte, error) {
 	}
 	setLoadedConfigForTest(cfg)
 	return json.Marshal(pluginRegistration())
+}
+
+func handleExecutorIdentifier() ([]byte, error) {
+	return json.Marshal(struct {
+		Identifier string `json:"identifier"`
+	}{Identifier: "model-mapper"})
 }
 
 type routeDecision struct {
@@ -595,6 +606,8 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return wrapEnvelope(handlePluginReconfigure(request))
 	case pluginabi.MethodModelRoute:
 		return wrapEnvelope(handleModelRoute(request))
+	case pluginabi.MethodExecutorIdentifier:
+		return wrapEnvelope(handleExecutorIdentifier())
 	case pluginabi.MethodExecutorExecute:
 		return wrapEnvelope(handleExecutorExecute(request, callHost))
 	case pluginabi.MethodExecutorExecuteStream:
@@ -631,7 +644,7 @@ func decodeLifecycleConfig(raw []byte) (json.RawMessage, bool, error) {
 				continue
 			}
 			key = strings.TrimSpace(key)
-			value = strings.TrimSpace(value)
+			value = unquoteYAMLScalar(strings.TrimSpace(value))
 			switch key {
 			case "enabled":
 				cfg.Enabled = strings.EqualFold(value, "true")
@@ -655,6 +668,17 @@ func decodeLifecycleConfig(raw []byte) (json.RawMessage, bool, error) {
 		return cfgRaw, true, nil
 	}
 	return append(json.RawMessage(nil), trimmed...), false, nil
+}
+
+func unquoteYAMLScalar(value string) string {
+	if len(value) < 2 {
+		return value
+	}
+	quote := value[0]
+	if (quote != '"' && quote != '\'') || value[len(value)-1] != quote {
+		return value
+	}
+	return value[1 : len(value)-1]
 }
 
 func callHost(method string, payload any) (json.RawMessage, error) {

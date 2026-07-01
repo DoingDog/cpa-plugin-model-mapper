@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -23,19 +24,53 @@ func TestPluginRegistrationMetadataAndConfigFields(t *testing.T) {
 	if reg.Metadata.Name != "model-mapper" {
 		t.Fatalf("plugin name=%q", reg.Metadata.Name)
 	}
+	if reg.Metadata.Version == "" || reg.Metadata.Author == "" || reg.Metadata.GitHubRepository == "" {
+		t.Fatalf("metadata missing CPA-required management fields: %#v", reg.Metadata)
+	}
 	if !reg.Capabilities.ModelRouter || !reg.Capabilities.Executor {
 		t.Fatalf("capabilities=%#v, want model router and executor", reg.Capabilities)
 	}
 	if reg.Capabilities.ExecutorModelScope != string(pluginapi.ExecutorModelScopeStatic) {
 		t.Fatalf("executor scope=%q", reg.Capabilities.ExecutorModelScope)
 	}
+	if !reflect.DeepEqual(reg.Capabilities.ExecutorInputFormats, []string{"openai", "claude", "openai-response"}) {
+		t.Fatalf("executor input formats=%v", reg.Capabilities.ExecutorInputFormats)
+	}
+	if !reflect.DeepEqual(reg.Capabilities.ExecutorOutputFormats, []string{"openai", "claude", "openai-response"}) {
+		t.Fatalf("executor output formats=%v", reg.Capabilities.ExecutorOutputFormats)
+	}
 	wantFields := []string{"enabled", "global_rules", "claude_messages_rules", "codex_responses_rules", "openai_completions_rules"}
 	got := make([]string, 0, len(reg.Metadata.ConfigFields))
 	for _, field := range reg.Metadata.ConfigFields {
 		got = append(got, field.Name)
+		if field.Description == "" {
+			t.Fatalf("config field %q has empty description", field.Name)
+		}
 	}
 	if !reflect.DeepEqual(got, wantFields) {
 		t.Fatalf("config fields=%v, want %v", got, wantFields)
+	}
+}
+
+func TestDecodeLifecycleConfigUnquotesYAMLEmptyRuleStrings(t *testing.T) {
+	rawYAML := []byte("enabled: true\nglobal_rules: \"\"\nclaude_messages_rules: 'claude*=>deepseek-v4-flash'\ncodex_responses_rules: \"\"\nopenai_completions_rules: \"\"\n")
+	rawReq, err := json.Marshal(map[string]string{"config_yaml": base64.StdEncoding.EncodeToString(rawYAML)})
+	if err != nil {
+		t.Fatalf("marshal lifecycle: %v", err)
+	}
+	cfgRaw, _, err := decodeLifecycleConfig(rawReq)
+	if err != nil {
+		t.Fatalf("decodeLifecycleConfig error = %v", err)
+	}
+	cfg, err := decodeConfig(cfgRaw)
+	if err != nil {
+		t.Fatalf("decodeConfig error = %v", err)
+	}
+	if cfg.GlobalRules != "" || cfg.CodexResponsesRules != "" || cfg.OpenAICompletionsRules != "" {
+		t.Fatalf("empty quoted YAML rules were not unquoted: %#v", cfg)
+	}
+	if cfg.ClaudeMessagesRules != "claude*=>deepseek-v4-flash" {
+		t.Fatalf("claude rules = %q", cfg.ClaudeMessagesRules)
 	}
 }
 
@@ -738,6 +773,18 @@ func TestHandleMethodDispatchesRegisterReconfigureAndUnknown(t *testing.T) {
 	}
 	if reg.Metadata.Name != "model-mapper" {
 		t.Fatalf("registration=%#v", reg)
+	}
+
+	identifierRaw, err := handleMethod(pluginabi.MethodExecutorIdentifier, nil)
+	if err != nil {
+		t.Fatalf("handle identifier error = %v", err)
+	}
+	var identifierEnv pluginabi.Envelope
+	if err := json.Unmarshal(identifierRaw, &identifierEnv); err != nil {
+		t.Fatalf("decode identifier env: %v", err)
+	}
+	if !identifierEnv.OK || !bytes.Contains(identifierEnv.Result, []byte(`"identifier":"model-mapper"`)) {
+		t.Fatalf("identifier env=%s", identifierRaw)
 	}
 
 	reconfigureRaw, err := handleMethod(pluginabi.MethodPluginReconfigure, []byte(`{"config_yaml":"ZW5hYmxlZDogdHJ1ZQpnbG9iYWxfcnVsZXM6IGE9PmIK"}`))
