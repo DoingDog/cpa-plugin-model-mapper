@@ -70,7 +70,7 @@ jobs:
           path: dist
           merge-multiple: true
       - run: go run .github/scripts/package-release.go -version "${GITHUB_REF_NAME#v}" -dist dist -out dist/release
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
           files: |
             dist/release/*.zip
