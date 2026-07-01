@@ -602,6 +602,39 @@ func TestHandleExecutorExecuteStreamStartsForwarderAndRestoresChunks(t *testing.
 	}
 }
 
+func TestHandleExecutorExecuteStreamBuffersSplitSSEPrefix(t *testing.T) {
+	setLoadedConfigForTest(Config{Enabled: true, GlobalRules: "deepseek-v4-pro=>gpt-5.4-mini"})
+	req := rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "deepseek-v4-pro",
+			Format:          "openai",
+			SourceFormat:    "openai",
+			Stream:          true,
+			OriginalRequest: []byte(`{"model":"deepseek-v4-pro","stream":true}`),
+		},
+		HostCallbackID: "callback-1",
+		StreamID:       "plugin-stream-split-1",
+	}
+	reads := []pluginapi.HostModelStreamReadResponse{
+		{Payload: []byte("da")},
+		{Payload: []byte("ta: {\"model\":\"gpt-5.4-mini\"}\n\n")},
+		{Done: true},
+	}
+	emitted, _, _, _, err := runExecutorStreamTest(req, reads)
+	if err != nil {
+		t.Fatalf("handleExecutorExecuteStream error = %v", err)
+	}
+	for _, chunk := range emitted {
+		if chunk == "da" {
+			t.Fatalf("emitted raw split prefix = %q", emitted)
+		}
+	}
+	joined := strings.Join(emitted, "")
+	if !strings.Contains(joined, `"model":"deepseek-v4-pro"`) || strings.Contains(joined, `"model":"gpt-5.4-mini"`) {
+		t.Fatalf("emitted=%q", joined)
+	}
+}
+
 func TestHandleExecutorExecuteStreamRestoresRawJSONWebSocketLikeChunks(t *testing.T) {
 	setLoadedConfigForTest(Config{Enabled: true, CodexResponsesRules: "deepseek-v4-pro=>gpt-5.4-mini"})
 	req := rpcExecutorRequest{

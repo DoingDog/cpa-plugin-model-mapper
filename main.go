@@ -25,6 +25,7 @@ type sseRewriter struct {
 type streamChunkRewriter struct {
 	originalModel string
 	sse           *sseRewriter
+	pending       []byte
 }
 
 func newSSERewriter(originalModel string) *sseRewriter {
@@ -126,8 +127,17 @@ func (r *sseRewriter) delimiterBytes(n int) []byte {
 }
 
 func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
-	if isSSEChunk(p) {
-		return r.sse.Write(p)
+	if len(r.pending) > 0 {
+		r.pending = append(r.pending, p...)
+		p = append([]byte(nil), r.pending...)
+		r.pending = nil
+	}
+	if isMaybeSSEPrefix(p) {
+		if isSSEChunk(p) {
+			return r.sse.Write(p)
+		}
+		r.pending = append(r.pending, p...)
+		return nil, nil
 	}
 	restored, changed, err := restoreResponseModel(p, r.originalModel)
 	if err != nil {
@@ -140,6 +150,19 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 }
 
 func (r *streamChunkRewriter) Flush() ([][]byte, error) {
+	if len(r.pending) > 0 {
+		pending := append([]byte(nil), r.pending...)
+		r.pending = nil
+		chunks, err := r.sse.Write(pending)
+		if err != nil {
+			return nil, err
+		}
+		flushed, err := r.sse.Flush()
+		if err != nil {
+			return nil, err
+		}
+		return append(chunks, flushed...), nil
+	}
 	return r.sse.Flush()
 }
 
@@ -149,6 +172,16 @@ func isSSEChunk(p []byte) bool {
 		return true
 	}
 	return bytes.Contains(p, []byte("\n\n")) || bytes.Contains(p, []byte("\r\n\r\n"))
+}
+
+func isMaybeSSEPrefix(p []byte) bool {
+	trimmed := bytes.TrimLeft(p, " \t\r\n")
+	for _, prefix := range [][]byte{[]byte("d"), []byte("da"), []byte("dat"), []byte("data"), []byte("data:"), []byte("e"), []byte("ev"), []byte("eve"), []byte("even"), []byte("event"), []byte("event:"), []byte(":")} {
+		if bytes.HasPrefix(prefix, trimmed) || bytes.HasPrefix(trimmed, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 type Config struct {
