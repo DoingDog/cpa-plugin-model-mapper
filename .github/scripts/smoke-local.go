@@ -114,9 +114,9 @@ func run() error {
 	}
 
 	cases := []caseConfig{
-		{name: "no-rules", requestModel: "deepseek-v4-flash", requestAPIKey: localAPIKey, wantSuccess: true},
+		{name: "no-rules", requestModel: "client-visible-no-rules", requestAPIKey: localAPIKey, wantSuccess: true, forbidModel: "client-visible-no-rules"},
 		{name: "openai-dedicated-chain", requestModel: "deepseek-v4-pro", requestAPIKey: localAPIKey, pluginRules: "deepseek-v4-pro=>deepseek-v4-flash;deepseek-v4-flash=>gpt-5.4-mini", wantSuccess: true, wantOriginalModel: "deepseek-v4-pro", forbidModel: "gpt-5.4-mini"},
-		{name: "unmatched-model", requestModel: "unmatched-model", requestAPIKey: localAPIKey, pluginRules: "deepseek-v4-pro=>gpt-5.4-mini", wantSuccess: false, forbidModel: "unmatched-model"},
+		{name: "unmatched-model", requestModel: "client-visible-unmatched", requestAPIKey: localAPIKey, pluginRules: "deepseek-v4-pro=>gpt-5.4-mini", wantSuccess: true, forbidModel: "client-visible-unmatched"},
 		{name: "bad-rules", requestModel: "deepseek-v4-pro", requestAPIKey: localAPIKey, pluginRules: "bad rule", wantSuccess: false, allowStartFailure: true, allowConfigFailure: true},
 		{name: "nonexistent-upstream-model", requestModel: "deepseek-v4-pro", requestAPIKey: localAPIKey, pluginRules: "deepseek-v4-pro=>definitely-not-a-real-upstream-model", wantSuccess: false},
 		{name: "wrong-api-key", requestModel: "deepseek-v4-flash", requestAPIKey: wrongAPIKey, wantSuccess: false},
@@ -183,6 +183,10 @@ func buildConfig(env smokeEnv, pluginRules string) string {
 	b.WriteString("    models:\n")
 	b.WriteString("      - name: deepseek-v4-flash\n")
 	b.WriteString("        alias: deepseek-v4-flash\n")
+	b.WriteString("      - name: deepseek-v4-flash\n")
+	b.WriteString("        alias: client-visible-no-rules\n")
+	b.WriteString("      - name: deepseek-v4-flash\n")
+	b.WriteString("        alias: client-visible-unmatched\n")
 	b.WriteString("      - name: gpt-5.4-mini\n")
 	b.WriteString("        alias: gpt-5.4-mini\n")
 	b.WriteString("plugins:\n")
