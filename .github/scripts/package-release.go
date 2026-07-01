@@ -31,10 +31,6 @@ func run() error {
 		return err
 	}
 
-	if err := os.MkdirAll(*outDir, 0o755); err != nil {
-		return fmt.Errorf("create output dir %s: %w", *outDir, err)
-	}
-
 	artifacts := []struct {
 		osName     string
 		arch       string
@@ -45,13 +41,16 @@ func run() error {
 	}
 
 	for _, artifact := range artifacts {
-		if _, err := os.Stat(artifact.binaryPath); err != nil {
-			if os.IsNotExist(err) {
-				return fmt.Errorf("required artifact missing: %s", filepath.ToSlash(artifact.binaryPath))
-			}
-			return fmt.Errorf("stat required artifact %s: %w", filepath.ToSlash(artifact.binaryPath), err)
+		if err := ensureReadableFile(artifact.binaryPath, "required artifact"); err != nil {
+			return err
 		}
+	}
 
+	if err := os.MkdirAll(*outDir, 0o755); err != nil {
+		return fmt.Errorf("create output dir %s: %w", *outDir, err)
+	}
+
+	for _, artifact := range artifacts {
 		zipName := fmt.Sprintf("model-mapper_%s_%s_%s.zip", version, artifact.osName, artifact.arch)
 		zipPath := filepath.Join(*outDir, zipName)
 		if err := writeZip(zipPath, artifact.binaryPath); err != nil {
@@ -126,6 +125,17 @@ func addFile(zipWriter *zip.Writer, srcPath, zipName string) error {
 		return fmt.Errorf("write zip entry %s: %w", zipName, err)
 	}
 	return nil
+}
+
+func ensureReadableFile(path, label string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("%s missing: %s", label, filepath.ToSlash(path))
+		}
+		return fmt.Errorf("open %s %s: %w", label, filepath.ToSlash(path), err)
+	}
+	return file.Close()
 }
 
 func writeSHA256(zipPath, shaPath string) error {
