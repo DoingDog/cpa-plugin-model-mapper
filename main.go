@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync"
 	"unicode"
-	"unsafe"
 
 	pluginabi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	pluginapi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -180,44 +179,11 @@ var (
 	loadedConfigMu sync.RWMutex
 	loadedCfg      = defaultConfig()
 
-	hostAPIMu sync.RWMutex
-	hostAPI   storedHostAPI
+	hostAPIMu      sync.RWMutex
+	hostCallbackFn hostCallback
 )
 
-type cliproxyBuffer struct {
-	ptr unsafe.Pointer
-	len uintptr
-}
-
-type cliproxyHostCallFn func(unsafe.Pointer, string, []byte, *cliproxyBuffer) int
-
-type cliproxyHostFreeFn func(unsafe.Pointer, uintptr)
-
-type cliproxyHostAPI struct {
-	abiVersion uint32
-	hostCtx    unsafe.Pointer
-	call       cliproxyHostCallFn
-	freeBuffer cliproxyHostFreeFn
-}
-
-type cliproxyPluginCallFn func(string, []byte, *cliproxyBuffer) int
-
-type cliproxyPluginFreeFn func(unsafe.Pointer, uintptr)
-
-type cliproxyPluginShutdownFn func()
-
-type cliproxyPluginAPI struct {
-	abiVersion uint32
-	call       cliproxyPluginCallFn
-	freeBuffer cliproxyPluginFreeFn
-	shutdown   cliproxyPluginShutdownFn
-}
-
-type storedHostAPI struct {
-	hostCtx    unsafe.Pointer
-	call       cliproxyHostCallFn
-	freeBuffer cliproxyHostFreeFn
-}
+type hostCallback func(method string, request []byte) ([]byte, error)
 
 func loadedConfig() Config {
 	loadedConfigMu.RLock()
@@ -622,24 +588,19 @@ func decodeLifecycleConfig(raw []byte) (json.RawMessage, bool, error) {
 
 func callHost(method string, payload any) (json.RawMessage, error) {
 	hostAPIMu.RLock()
-	stored := hostAPI
+	cb := hostCallbackFn
 	hostAPIMu.RUnlock()
-	if stored.call == nil || stored.freeBuffer == nil {
+	if cb == nil {
 		return nil, fmt.Errorf("host API not initialized")
 	}
 	rawPayload, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
-	var response cliproxyBuffer
-	rc := stored.call(stored.hostCtx, method, rawPayload, &response)
-	if response.ptr != nil {
-		defer stored.freeBuffer(response.ptr, response.len)
+	responseBytes, err := cb(method, rawPayload)
+	if err != nil {
+		return nil, err
 	}
-	if rc != 0 {
-		return nil, fmt.Errorf("host callback %s failed with rc=%d", method, rc)
-	}
-	responseBytes := append([]byte(nil), (*(*[1 << 30]byte)(response.ptr))[:response.len:response.len]...)
 	var env pluginabi.Envelope
 	if err := json.Unmarshal(responseBytes, &env); err != nil {
 		return nil, fmt.Errorf("decode host envelope: %w", err)
@@ -931,75 +892,12 @@ func buildReplacement(tokens []token, captures []string) string {
 	return b.String()
 }
 
-func setHostAPIForTest(api storedHostAPI) {
+func setHostCallbackForTest(cb hostCallback) {
 	hostAPIMu.Lock()
-	hostAPI = api
+	hostCallbackFn = cb
 	hostAPIMu.Unlock()
 }
 
-func copyRequestBytes(request unsafe.Pointer, requestLen uintptr) []byte {
-	if request == nil || requestLen == 0 {
-		return nil
-	}
-	return append([]byte(nil), (*(*[1 << 30]byte)(request))[:requestLen:requestLen]...)
-}
-
-func setResponseBuffer(response *cliproxyBuffer, payload []byte) int {
-	if response == nil {
-		return 1
-	}
-	response.ptr = nil
-	response.len = 0
-	if len(payload) == 0 {
-		return 0
-	}
-	buf := append([]byte(nil), payload...)
-	response.ptr = unsafe.Pointer(&buf[0])
-	response.len = uintptr(len(buf))
-	return 0
-}
-
-func cliproxy_plugin_init(host *cliproxyHostAPI, plugin *cliproxyPluginAPI) int {
-	if host == nil || plugin == nil {
-		return 1
-	}
-	if host.abiVersion != pluginabi.ABIVersion {
-		return 1
-	}
-	if host.call == nil || host.freeBuffer == nil {
-		return 1
-	}
-	hostAPIMu.Lock()
-	hostAPI = storedHostAPI{hostCtx: host.hostCtx, call: host.call, freeBuffer: host.freeBuffer}
-	hostAPIMu.Unlock()
-	plugin.abiVersion = pluginabi.ABIVersion
-	plugin.call = cliproxyPluginCall
-	plugin.freeBuffer = cliproxyPluginFree
-	plugin.shutdown = cliproxyPluginShutdown
-	return 0
-}
-
-func cliproxyPluginCall(method string, request []byte, response *cliproxyBuffer) int {
-	if response == nil {
-		return 1
-	}
-	payload, err := handleMethod(method, request)
-	if err != nil {
-		payload = errorEnvelope("plugin_error", err.Error())
-	}
-	if rc := setResponseBuffer(response, payload); rc != 0 {
-		return 1
-	}
-	return 0
-}
-
-func cliproxyPluginFree(ptr unsafe.Pointer, len uintptr) {
-	_ = ptr
-	_ = len
-}
-
-func cliproxyPluginShutdown() {
-	hostAPIMu.Lock()
-	hostAPI = storedHostAPI{}
-	hostAPIMu.Unlock()
+func setHostCallback(cb hostCallback) {
+	setHostCallbackForTest(cb)
 }
