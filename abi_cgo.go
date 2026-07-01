@@ -32,13 +32,13 @@ typedef struct {
 	cliproxy_plugin_shutdown_fn shutdown;
 } cliproxy_plugin_api;
 
-int cliproxyPluginCall(const char*, const uint8_t*, size_t, cliproxy_buffer*);
+int cliproxyPluginCall(char*, uint8_t*, size_t, cliproxy_buffer*);
 void cliproxyPluginFree(void*, size_t);
 void cliproxyPluginShutdown(void);
 
 static void cliproxy_set_plugin_api(cliproxy_plugin_api* plugin, uint32_t abi_version) {
 	plugin->abi_version = abi_version;
-	plugin->call = cliproxyPluginCall;
+	plugin->call = (cliproxy_plugin_call_fn)cliproxyPluginCall;
 	plugin->free_buffer = cliproxyPluginFree;
 	plugin->shutdown = cliproxyPluginShutdown;
 }
