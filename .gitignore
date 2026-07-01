@@ -9,6 +9,9 @@ dist/
 *.dylib
 *.h
 
+# Local test CPA and secrets
+.test-cpa/
+
 # Local config/secrets
 .env
 config.yaml

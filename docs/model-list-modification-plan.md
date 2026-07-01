@@ -2,6 +2,8 @@
 
 **Status:** Deferred. This module is not part of the first implementation.
 
+This deferred module must not block the request-mapping plugin release. The first release remains responsible for request mapping, response model restoration, Windows/Linux amd64 artifacts, deployment docs, and real CPA smoke tests only.
+
 ## Goal
 
 Add a CPA plugin module that can modify model-list endpoint responses by deleting and adding model IDs from left to right using a comma-separated rule string.
@@ -96,3 +98,4 @@ Expected behavior:
 - It can delete all models with `-*`.
 - It can add `gpt-5` after deleting Claude-prefixed models with `-claude*,gpt-5`.
 - It treats `--opus-4` as `-opus-4`.
+- It follows the same implementation discipline as the request-mapping plugin: TDD first, workflow/subagent-gated implementation steps where available, and verification across every model-list surface listed above.

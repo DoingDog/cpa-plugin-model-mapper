@@ -27,7 +27,7 @@
 - 最终交付两个可部署插件文件：当前 Windows `amd64` 版本和服务器用 Linux `amd64` 版本，并提供部署方法。
 - 如果本机缺少 Linux `amd64` cgo 交叉编译工具链，先通知用户；不在本机全局安装编译器。
 - 提供配置字段：
-  - `enabled`：布尔值，插件自身启用开关，默认 `false`。
+  - `enabled`：布尔值，请求映射/替换模块启用开关，默认 `true`。
   - `global_rules`：字符串，全局规则。
   - `claude_messages_rules`：字符串，Claude messages 专用规则。
   - `codex_responses_rules`：字符串，Codex responses 专用规则。
@@ -75,23 +75,26 @@ CPA 的模型路由发生在 request interceptor 之前。如果只在 `request.
 
 ## 端点规则选择
 
-插件最多对每个请求应用一套规则。
+插件最多对每个请求应用一套规则。保留最初约定：端点专用规则非空时只使用专用规则，不叠加全局规则；专用规则为空时才回落到全局规则。
 
 规则选择按 CPA 传入的协议/格式字段判断：
 
-| CPA 格式 | 对应配置 | 说明 |
+| CPA 格式 | 专用配置 | 说明 |
 |---|---|---|
 | `claude` | `claude_messages_rules` | Claude messages 请求 |
 | `openai-response` | `codex_responses_rules` | Codex responses / OpenAI Responses 风格请求 |
 | `openai` | `openai_completions_rules` | OpenAI chat/completions 请求 |
-| 其他 | `global_rules` | Gemini 等其他文本生成格式 |
+| 其他 | 无 | 只使用 `global_rules` |
 
 选择逻辑：
 
-1. 如果当前格式有专用规则且专用规则非空，只使用该专用规则。
-2. 如果当前格式没有专用规则，或专用规则为空，使用全局规则。
-3. 如果最终选中的规则为空，则不改写模型，返回未处理。
-4. 不叠加专用规则和全局规则。
+1. 如果 `enabled=false`，完全跳过，返回 `Handled: false`。
+2. 如果当前格式有专用规则且专用规则非空，只使用该专用规则。
+3. 如果当前格式没有专用规则，或专用规则为空，使用全局规则。
+4. 如果全局规则和当前格式专用规则都为空，完全跳过该端点：不解析规则、不改写请求、不记录原始模型、不改写响应。
+5. 所选规则从前到后完整遍历：单条规则不匹配时继续下一条；匹配时用替换结果继续执行后续规则。
+6. 只有至少一条规则成功匹配并且最终模型名变化时，ModelRouter 返回 `Handled: true` 并进入插件 Executor。
+7. 没有任何规则匹配，或匹配后最终模型名等于原模型名时，返回 `Handled: false`，不触碰响应，让 CPA 原逻辑处理。
 
 ## 规则格式
 
@@ -117,7 +120,7 @@ CPA 的模型路由发生在 request interceptor 之前。如果只在 `request.
 - `=>`：查找/替换分隔符。
 - `\`：转义特殊符号。
 
-匹配规则从前到后执行，上一条替换后的结果继续进入下一条。
+所选规则从前到后全部执行：每条规则都用当前模型名尝试匹配；不匹配则跳过并继续；匹配则替换当前模型名并继续后续规则，直到规则耗尽或出现解析/应用错误。示例：`deepseek-v4-pro=>deepseek-v4-flash;deepseek-v4-flash=>claude-v4-flash` 会把 `deepseek-v4-pro` 先改成 `deepseek-v4-flash`，再改成 `claude-v4-flash`。这是单次有限规则遍历，不是 repeat-until-stable，因此不存在规则自身导致的死循环。
 
 ### 合法性
 
@@ -157,6 +160,10 @@ CPA 的模型路由发生在 request interceptor 之前。如果只在 `request.
 - 最终输出模型名为空。
 
 插件错误以 CPA 插件调用错误返回，由 CPA 按当前执行路径转为请求失败。
+
+### 未匹配
+
+如果规则合法但没有任何规则匹配当前模型，或匹配后最终模型名没有变化，插件必须返回 `Handled: false`，不得记录原始请求模型，不得进入响应模型恢复逻辑，不得修改 CPA 原响应。
 
 ## 数据流
 
@@ -232,26 +239,34 @@ client stream request(model=A)
 
 职责：
 
-- 测试规则解析合法/非法输入。
+- 所有生产代码先写失败测试，再实现最小代码通过；每个行为都记录 RED/GREEN 命令输出。
+- 测试规则解析合法/非法输入，非法规则在运行时生效前被拒绝。
 - 测试 `*` 捕获与 `$N` 替换。
-- 测试多规则顺序执行。
-- 测试专用规则优先于全局规则。
+- 测试规则链单次从前到后完整遍历：`deepseek-v4-pro=>deepseek-v4-flash;deepseek-v4-flash=>claude-v4-flash` 必须把 `deepseek-v4-pro` 改成 `claude-v4-flash`。
+- 测试专用规则优先于全局规则；专用规则非空时全局规则不参与该端点。
 - 测试空专用规则回落全局规则。
-- 测试 disabled 默认不处理。
+- 测试全局规则和当前端点专用规则都为空时完全跳过端点。
+- 测试 `enabled=false` 时完全跳过。
+- 测试没有规则匹配时返回未处理，不记录原始模型，不恢复响应模型。
+- 测试匹配但最终模型名未变化时返回未处理。
+- 测试匹配且改写后才记录原始模型，并在非流式/流式响应中恢复顶层 `model`。
 - 测试请求 JSON 顶层 `model` 改写。
 - 测试非流式响应 JSON 顶层 `model` 恢复。
-- 测试 SSE chunk：
-  - `data: {"model":"B"}` 改为 `A`。
-  - `data: [DONE]` 原样返回。
-  - 非 JSON 原样返回。
+- 测试 SSE：完整 JSON `data:` 改写、拆包 JSON 事件缓存到完整后改写、`data: [DONE]` 原样返回、非 JSON 完整事件原样返回。
+- 测试有限规则列表只遍历一次，证明不存在规则自身导致的死循环。
 
 ### `Makefile`
 
 职责：
 
 - `make test`：运行 `go test ./...`。
-- `make build`：运行 `go build -trimpath -buildmode=c-shared` 输出当前平台动态库到 `dist/model-mapper.<ext>`。
-- `make install-local CPA_PLUGINS_DIR=<path>`：复制构建产物到 CPA 插件目录，例如 `plugins/windows/amd64/model-mapper.dll`。
+- `make build-windows-amd64`：输出 `dist/windows_amd64/model-mapper.dll`。
+- `make build-linux-amd64`：输出 `dist/linux_amd64/model-mapper.so`。
+- `make build`：构建 Windows `amd64` 和 Linux `amd64` 两个发布目标。
+- `make package`：生成版本化 release zip 和 sha256，结构参考 `cpa-plugin-codex-invite`。
+- `make install-local CPA_PLUGINS_DIR=<path>`：复制 Windows 构建产物到 CPA 插件目录，例如 `plugins/windows/amd64/model-mapper.dll`。
+- `make install-linux-amd64 CPA_PLUGINS_DIR=<path>`：复制 Linux 构建产物到服务器插件目录，例如 `plugins/linux/amd64/model-mapper.so`。
+- `make smoke-local`：在当前目录内的测试 CPA 环境运行端到端 smoke 测试。
 - `make clean`：删除构建产物。
 
 ### `README.md`
@@ -264,6 +279,22 @@ client stream request(model=A)
 - 构建命令。
 - 部署方法：复制动态库到 CPA 插件目录、启用插件、填写规则、重启或热加载 CPA 配置。
 - 当前不支持模型列表修改的说明。
+
+### GitHub 仓库规范
+
+最终仓库必须是可发布的 CPA 插件仓库形式，至少包含：
+
+- `go.mod` / `go.sum`
+- `main.go`
+- `main_test.go`
+- `Makefile`
+- `README.md`
+- `.gitignore`
+- `.github/workflows/build.yml`
+- `.github/scripts/package-release.go`
+- `docs/model-list-modification-plan.md`
+
+自动化流程参考 `cpa-plugin-codex-invite`：push/PR 运行测试和构建，tag release 时构建 Windows `amd64` 与 Linux `amd64` 包并输出校验和。
 
 ### `docs/model-list-modification-plan.md`
 
@@ -300,7 +331,7 @@ ConfigFields：
 插件内部默认配置：
 
 ```yaml
-enabled: false
+enabled: true
 global_rules: ""
 claude_messages_rules: ""
 codex_responses_rules: ""
@@ -318,19 +349,23 @@ plugins:
       priority: 1
 ```
 
-插件自身的 `enabled: false` 默认表示：即使 host 启用插件，未显式打开功能时也不改写请求。
+插件自身的 `enabled: true` 默认表示：host 启用插件后，请求映射模块默认开启；如果全局规则和当前端点专用规则都为空，则完全跳过该端点，CPA 行为保持不变。
 
 ## 错误处理
 
 - 配置解析失败：`plugin.register`/`plugin.reconfigure` 返回错误 envelope。
-- 规则解析失败：匹配请求时返回 executor/model route 错误，使当前请求失败。
-- 改写后模型为空：当前请求失败。
+- 已配置的规则解析失败：`plugin.register`/`plugin.reconfigure` 返回错误，坏规则不能静默生效。
+- 规则应用错误或改写后模型为空：当前请求失败。
 - 请求体不是 JSON 或没有字符串 `model`：不处理，返回 `Handled: false`。
-- host model callback 返回错误：透传为当前请求失败。
+- host model callback 返回 CPA/upstream 错误：尽量保留 CPA 原始 status、headers、body/error 信息；插件只做 ABI 必需包装。
+- 替换成不存在模型导致的 upstream/CPA 报错：不吞错、不伪造成功响应，按 CPA 原错误透传。
+- API key 错误：CPA 必须正常拒绝请求；插件不得绕过 CPA 鉴权。
 - 流式非 JSON 完整事件：原样传递，不失败，避免破坏流式传输。
 - 流式拆包 JSON 事件：最多缓存当前未完成事件/行；完整后再改写并发出，不直接透传可能包含上游模型名的半截 JSON。
 
 ## 响应模型恢复范围
+
+只对本插件成功匹配规则、确实改写模型名、并进入插件 Executor 的请求恢复响应模型。未匹配、未改写、或返回 `Handled: false` 的请求不得进入恢复逻辑，响应保持 CPA 原行为。
 
 本轮只恢复顶层 `model` 字段。
 
@@ -380,7 +415,7 @@ plugins:
       openai_completions_rules: ""
 ```
 
-4. 按需把插件自身 `enabled` 改为 `true` 并填写规则。
+4. 填写规则；插件自身 `enabled` 默认就是 `true`，只有需要临时关闭请求映射时才改为 `false`。
 5. 重启 CPA，或使用 CPA 当前支持的配置热加载方式让插件重新注册。
 
 如果用户指定了 CPA 插件目录，实现阶段可以运行：
@@ -392,7 +427,11 @@ make install-linux-amd64 CPA_PLUGINS_DIR="/path/to/CLIProxyAPI/plugins/linux/amd
 
 ## 测试策略
 
-最小可运行检查：
+实现阶段必须使用 `superpowers:test-driven-development`。生产代码的每个行为都按 RED/GREEN/REFACTOR 推进：先写失败测试，运行并确认按预期失败，再写最小实现，通过后再清理。
+
+实现和验证的每一个步骤都必须由 workflow 编排推进，且每步至少经过一个子代理执行或审查检查点；主会话负责审查 workflow/子代理输出并决定下一步。
+
+单元测试最小检查：
 
 ```powershell
 go test ./...
@@ -404,7 +443,37 @@ go test ./...
 make build
 ```
 
-若当前 Windows 环境缺少 CGO 编译器，停止并通知用户安装外部工具，不在本机全局安装。
+发布产物检查：
+
+```powershell
+make package
+```
+
+真实端到端测试必须在当前文件夹内部署一个测试 CPA：
+
+1. 在当前仓库下创建隔离测试目录，例如 `.test-cpa/`。
+2. 在 `.test-cpa/` 内放置或构建 CPA 可执行文件、测试配置和插件目录；不得污染本机全局环境。
+3. 将本插件安装到 `.test-cpa/plugins/windows/amd64/`，服务器部署验证另行检查 Linux `amd64` 产物存在。
+4. 使用测试配置接入用户提供的兼容端点；真实 API key 只写入未跟踪的本地 `.test-cpa/.env` 或临时配置，不能提交到仓库：
+
+```text
+base_url: https://a3.awsl.app/v1
+api_key: 从本地环境变量 CPA_SMOKE_API_KEY 读取
+models: deepseek-v4-flash, gpt-5.4-mini
+```
+
+5. 发起真实请求验证：
+   - 无规则：请求完全跳过，响应不被插件改写。
+   - 专用规则：例如 `deepseek-v4-pro=>deepseek-v4-flash;deepseek-v4-flash=>gpt-5.4-mini` 按顺序链式执行。
+   - 成功匹配并改写：CPA 实际请求修改后模型，客户端响应模型恢复为原请求模型。
+   - 未匹配：响应模型不被插件覆盖。
+   - 错误配置：坏规则字符串不能生效，插件注册/重配置失败或请求失败，不能静默忽略。
+   - 不存在模型：CPA/upstream 原错误信息正常透传。
+   - 错误 API key：CPA 正常拒绝请求，插件不能绕过鉴权。
+   - 流式：不整体缓存，完整 SSE JSON 事件恢复模型名，`[DONE]` 正常结束。
+   - 死循环安全：规则只单次遍历有限列表，不 repeat-until-stable。
+
+若当前 Windows 环境缺少 CGO 或 Linux `amd64` cgo 交叉编译工具链，停止并通知用户安装外部工具，不在本机全局安装。
 
 ## 模型列表修改后续开发计划
 
