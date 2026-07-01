@@ -16,6 +16,55 @@ type Config struct {
 	OpenAICompletionsRules string `json:"openai_completions_rules"`
 }
 
+type routeDecision struct {
+	Handled       bool
+	OriginalModel string
+	UpstreamModel string
+}
+
+func selectRules(cfg Config, format string) (string, bool) {
+	switch format {
+	case "claude":
+		if cfg.ClaudeMessagesRules != "" {
+			return cfg.ClaudeMessagesRules, true
+		}
+	case "openai-response":
+		if cfg.CodexResponsesRules != "" {
+			return cfg.CodexResponsesRules, true
+		}
+	case "openai":
+		if cfg.OpenAICompletionsRules != "" {
+			return cfg.OpenAICompletionsRules, true
+		}
+	}
+	if cfg.GlobalRules != "" {
+		return cfg.GlobalRules, true
+	}
+	return "", false
+}
+
+func routeModel(cfg Config, format string, model string) (routeDecision, error) {
+	if !cfg.Enabled {
+		return routeDecision{}, nil
+	}
+	raw, ok := selectRules(cfg, format)
+	if !ok {
+		return routeDecision{}, nil
+	}
+	rules, err := parseRules(raw)
+	if err != nil {
+		return routeDecision{}, err
+	}
+	mapped, matched, err := applyRules(model, rules)
+	if err != nil {
+		return routeDecision{}, err
+	}
+	if !matched || mapped == model {
+		return routeDecision{}, nil
+	}
+	return routeDecision{Handled: true, OriginalModel: model, UpstreamModel: mapped}, nil
+}
+
 type token struct {
 	literal string
 	capture int

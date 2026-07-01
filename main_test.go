@@ -126,3 +126,77 @@ func TestApplyRulesSinglePassNoLoop(t *testing.T) {
 		t.Fatalf("mapped=%q matched=%v, want a true after one finite pass", mapped, matched)
 	}
 }
+
+func TestSelectRulesEndpointSpecificOverridesGlobal(t *testing.T) {
+	cfg := Config{Enabled: true, GlobalRules: "global=>x", ClaudeMessagesRules: "claude=>x", CodexResponsesRules: "codex=>x", OpenAICompletionsRules: "openai=>x"}
+	tests := map[string]string{
+		"claude":          "claude=>x",
+		"openai-response": "codex=>x",
+		"openai":          "openai=>x",
+	}
+	for format, want := range tests {
+		raw, ok := selectRules(cfg, format)
+		if !ok || raw != want {
+			t.Fatalf("selectRules(%q)=(%q,%v), want %q true", format, raw, ok, want)
+		}
+	}
+}
+
+func TestSelectRulesFallsBackToGlobal(t *testing.T) {
+	cfg := Config{Enabled: true, GlobalRules: "global=>x"}
+	for _, format := range []string{"claude", "openai-response", "openai", "gemini"} {
+		raw, ok := selectRules(cfg, format)
+		if !ok || raw != "global=>x" {
+			t.Fatalf("selectRules(%q)=(%q,%v), want global=>x true", format, raw, ok)
+		}
+	}
+}
+
+func TestSelectRulesBothEmptySkips(t *testing.T) {
+	if raw, ok := selectRules(defaultConfig(), "claude"); ok || raw != "" {
+		t.Fatalf("selectRules empty=(%q,%v), want empty false", raw, ok)
+	}
+}
+
+func TestRouteModelSkipsDisabledNoRulesUnmatchedAndUnchanged(t *testing.T) {
+	tests := []struct {
+		name   string
+		cfg    Config
+		format string
+		model  string
+	}{
+		{name: "disabled", cfg: Config{Enabled: false, GlobalRules: "a=>b"}, format: "openai", model: "a"},
+		{name: "no rules", cfg: defaultConfig(), format: "openai", model: "a"},
+		{name: "unmatched", cfg: Config{Enabled: true, GlobalRules: "x=>y"}, format: "openai", model: "a"},
+		{name: "unchanged", cfg: Config{Enabled: true, GlobalRules: "a=>a"}, format: "openai", model: "a"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			decision, err := routeModel(tt.cfg, tt.format, tt.model)
+			if err != nil {
+				t.Fatalf("routeModel error = %v", err)
+			}
+			if decision.Handled || decision.OriginalModel != "" || decision.UpstreamModel != "" {
+				t.Fatalf("decision=%#v, want unhandled with empty models", decision)
+			}
+		})
+	}
+}
+
+func TestRouteModelHandlesOnlyMatchedChanged(t *testing.T) {
+	cfg := Config{Enabled: true, OpenAICompletionsRules: "deepseek-v4-pro=>deepseek-v4-flash;deepseek-v4-flash=>gpt-5.4-mini", GlobalRules: "deepseek-v4-pro=>wrong"}
+	decision, err := routeModel(cfg, "openai", "deepseek-v4-pro")
+	if err != nil {
+		t.Fatalf("routeModel error = %v", err)
+	}
+	if !decision.Handled || decision.OriginalModel != "deepseek-v4-pro" || decision.UpstreamModel != "gpt-5.4-mini" {
+		t.Fatalf("decision=%#v", decision)
+	}
+}
+
+func TestRouteModelBadSelectedRulesErrors(t *testing.T) {
+	cfg := Config{Enabled: true, ClaudeMessagesRules: "bad rule"}
+	if _, err := routeModel(cfg, "claude", "a"); err == nil {
+		t.Fatalf("routeModel bad selected rules error = nil")
+	}
+}
