@@ -6,6 +6,7 @@ GOARCH ?=
 BUILD_CC ?=
 VERSION ?=
 LDFLAGS ?= -s -w
+VERSION_LDFLAGS := $(if $(VERSION),-X main.pluginVersion=$(VERSION),)
 WINDOWS_AMD64_OUT := $(DIST_DIR)/windows_amd64/$(PLUGIN_NAME).dll
 LINUX_AMD64_OUT := $(DIST_DIR)/linux_amd64/$(PLUGIN_NAME).so
 LINUX_AMD64_CC ?=
@@ -25,7 +26,7 @@ build-platform:
 	out="$(DIST_DIR)/$(GOOS)_$(GOARCH)/$(PLUGIN_NAME)$$ext"; \
 	mkdir -p "$$(dirname "$$out")"; \
 	if [ -n "$(BUILD_CC)" ]; then export CC="$(BUILD_CC)"; fi; \
-	CGO_ENABLED=1 GOOS="$(GOOS)" GOARCH="$(GOARCH)" $(GO) build -trimpath -buildmode=c-shared -ldflags='$(LDFLAGS)' -o "$$out" .
+	CGO_ENABLED=1 GOOS="$(GOOS)" GOARCH="$(GOARCH)" $(GO) build -trimpath -buildmode=c-shared -ldflags='$(LDFLAGS) $(VERSION_LDFLAGS)' -o "$$out" .
 
 build-windows-amd64:
 	$(MAKE) --no-print-directory build-platform GOOS=windows GOARCH=amd64 GO="$(GO)" DIST_DIR="$(DIST_DIR)" PLUGIN_NAME="$(PLUGIN_NAME)"
@@ -46,7 +47,7 @@ package-platform: build-platform
 
 package:
 	@if [ -n "$(GOOS)" ] || [ -n "$(GOARCH)" ]; then \
-		$(MAKE) --no-print-directory package-platform VERSION="$(VERSION)" GOOS="$(GOOS)" GOARCH="$(GOARCH)" GO="$(GO)" DIST_DIR="$(DIST_DIR)" PLUGIN_NAME="$(PLUGIN_NAME)" BUILD_CC="$(BUILD_CC)"; \
+		$(MAKE) --no-print-directory package-platform VERSION="$(VERSION)" GOOS="$(GOOS)" GOARCH="$(GOARCH)" GO="$(GO)" DIST_DIR="$(DIST_DIR)" PLUGIN_NAME="$(PLUGIN_NAME)" BUILD_CC="$(BUILD_CC)" LDFLAGS="$(LDFLAGS)" VERSION_LDFLAGS="$(VERSION_LDFLAGS)"; \
 	else \
 		$(GO) run .github/scripts/package-release.go -version "$(VERSION)" -dist "$(DIST_DIR)" -out "$(DIST_DIR)/release"; \
 	fi

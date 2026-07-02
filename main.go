@@ -18,6 +18,8 @@ import (
 
 func main() {}
 
+var pluginVersion = "0.0.0-dev"
+
 type sseRewriter struct {
 	originalModel string
 	buf           []byte
@@ -296,7 +298,7 @@ func pluginRegistration() registration {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             "model-mapper",
-			Version:          "0.1.1",
+			Version:          pluginVersion,
 			Author:           "DoingDog",
 			GitHubRepository: "https://github.com/DoingDog/cpa-plugin-model-mapper",
 			ConfigFields: []pluginapi.ConfigField{

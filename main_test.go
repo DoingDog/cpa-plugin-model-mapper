@@ -24,7 +24,7 @@ func TestPluginRegistrationMetadataAndConfigFields(t *testing.T) {
 	if reg.Metadata.Name != "model-mapper" {
 		t.Fatalf("plugin name=%q", reg.Metadata.Name)
 	}
-	if reg.Metadata.Version == "" || reg.Metadata.Author == "" || reg.Metadata.GitHubRepository == "" {
+	if reg.Metadata.Version != pluginVersion || reg.Metadata.Author == "" || reg.Metadata.GitHubRepository == "" {
 		t.Fatalf("metadata missing CPA-required management fields: %#v", reg.Metadata)
 	}
 	if !reg.Capabilities.ModelRouter || !reg.Capabilities.Executor {

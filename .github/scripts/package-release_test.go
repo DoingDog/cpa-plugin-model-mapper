@@ -50,6 +50,10 @@ func TestPackageLibraryWritesRootLibraryEntryAndChecksum(t *testing.T) {
 	if err := os.WriteFile(libraryPath, []byte("plugin-binary"), 0o644); err != nil {
 		t.Fatalf("write library: %v", err)
 	}
+	if err := os.WriteFile(filepath.Join(dir, "LICENSE"), []byte("license"), 0o644); err != nil {
+		t.Fatalf("write license: %v", err)
+	}
+	t.Chdir(dir)
 
 	if err := packageLibrary(libraryPath, archivePath); err != nil {
 		t.Fatalf("packageLibrary error = %v", err)
@@ -66,12 +70,19 @@ func TestPackageLibraryWritesRootLibraryEntryAndChecksum(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open archive: %v", err)
 	}
-	if len(reader.File) != 1 {
-		t.Fatalf("zip entry count = %d, want 1", len(reader.File))
+	if len(reader.File) != 2 {
+		t.Fatalf("zip entry count = %d, want library and LICENSE", len(reader.File))
 	}
-	entry := reader.File[0]
-	if entry.Name != "model-mapper.so" {
-		t.Fatalf("zip entry name = %q, want model-mapper.so", entry.Name)
+	entries := map[string]*zip.File{}
+	for _, entry := range reader.File {
+		entries[entry.Name] = entry
+	}
+	entry := entries["model-mapper.so"]
+	if entry == nil {
+		t.Fatalf("zip entries = %v, missing model-mapper.so", entries)
+	}
+	if entries["LICENSE"] == nil {
+		t.Fatalf("zip entries = %v, missing LICENSE", entries)
 	}
 	if entry.FileInfo().Mode().Perm() != 0o755 {
 		t.Fatalf("zip entry mode = %v, want 0755", entry.FileInfo().Mode().Perm())

@@ -169,6 +169,9 @@ func packageLibrary(libraryPath, archivePath string) error {
 	if _, err := io.Copy(entry, library); err != nil {
 		return fmt.Errorf("write zip entry %s: %w", header.Name, err)
 	}
+	if err := addOptionalFile(writer, "LICENSE"); err != nil {
+		return err
+	}
 	if err := writer.Close(); err != nil {
 		return fmt.Errorf("close zip writer: %w", err)
 	}
@@ -176,6 +179,36 @@ func packageLibrary(libraryPath, archivePath string) error {
 		return fmt.Errorf("close archive %s: %w", filepath.ToSlash(archivePath), err)
 	}
 	archiveClosed = true
+	return nil
+}
+
+func addOptionalFile(writer *zip.Writer, path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("open optional file %s: %w", filepath.ToSlash(path), err)
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("stat optional file %s: %w", filepath.ToSlash(path), err)
+	}
+	header, err := zip.FileInfoHeader(info)
+	if err != nil {
+		return fmt.Errorf("create optional zip header %s: %w", path, err)
+	}
+	header.Name = filepath.Base(path)
+	header.Method = zip.Deflate
+	entry, err := writer.CreateHeader(header)
+	if err != nil {
+		return fmt.Errorf("create optional zip entry %s: %w", header.Name, err)
+	}
+	if _, err := io.Copy(entry, file); err != nil {
+		return fmt.Errorf("write optional zip entry %s: %w", header.Name, err)
+	}
 	return nil
 }
 
