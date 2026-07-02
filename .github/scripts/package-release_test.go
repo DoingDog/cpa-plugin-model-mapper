@@ -1,6 +1,8 @@
 package main
 
 import (
+	"archive/zip"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
@@ -19,34 +21,111 @@ func TestResolveVersionStripsLeadingV(t *testing.T) {
 	}
 }
 
-func TestWriteChecksumsUsesSha256sumFormat(t *testing.T) {
+func TestArtifactSpecsCoverFullPlatformMatrix(t *testing.T) {
+	got := map[string]bool{}
+	for _, spec := range artifactSpecs() {
+		got[spec.osName+"/"+spec.arch] = true
+	}
+	for _, want := range []string{
+		"linux/amd64",
+		"linux/arm64",
+		"darwin/amd64",
+		"darwin/arm64",
+		"windows/amd64",
+		"windows/arm64",
+		"freebsd/amd64",
+	} {
+		if !got[want] {
+			t.Fatalf("artifactSpecs missing %s", want)
+		}
+	}
+}
+
+func TestPackageLibraryWritesRootLibraryEntryAndChecksum(t *testing.T) {
 	dir := t.TempDir()
-	zipA := filepath.Join(dir, "model-mapper_0.1.0_windows_amd64.zip")
-	zipB := filepath.Join(dir, "model-mapper_0.1.0_linux_amd64.zip")
-	if err := os.WriteFile(zipA, []byte("windows"), 0o644); err != nil {
+	libraryPath := filepath.Join(dir, "model-mapper.so")
+	archivePath := filepath.Join(dir, "model-mapper_0.1.0_linux_amd64.zip")
+	checksumPath := archivePath + ".sha256"
+
+	if err := os.WriteFile(libraryPath, []byte("plugin-binary"), 0o644); err != nil {
+		t.Fatalf("write library: %v", err)
+	}
+
+	archiveData, err := packageLibrary(libraryPath, archivePath)
+	if err != nil {
+		t.Fatalf("packageLibrary error = %v", err)
+	}
+	if err := writeChecksum(checksumPath, archivePath, archiveData); err != nil {
+		t.Fatalf("writeChecksum error = %v", err)
+	}
+
+	reader, err := zip.NewReader(bytes.NewReader(archiveData), int64(len(archiveData)))
+	if err != nil {
+		t.Fatalf("open archive: %v", err)
+	}
+	if len(reader.File) != 1 {
+		t.Fatalf("zip entry count = %d, want 1", len(reader.File))
+	}
+	entry := reader.File[0]
+	if entry.Name != "model-mapper.so" {
+		t.Fatalf("zip entry name = %q, want model-mapper.so", entry.Name)
+	}
+	if entry.FileInfo().Mode().Perm() != 0o755 {
+		t.Fatalf("zip entry mode = %v, want 0755", entry.FileInfo().Mode().Perm())
+	}
+
+	checksumRaw, err := os.ReadFile(checksumPath)
+	if err != nil {
+		t.Fatalf("read checksum: %v", err)
+	}
+	sum := sha256.Sum256(archiveData)
+	wantLine := hex.EncodeToString(sum[:]) + "  model-mapper_0.1.0_linux_amd64.zip\n"
+	if string(checksumRaw) != wantLine {
+		t.Fatalf("checksum line = %q, want %q", string(checksumRaw), wantLine)
+	}
+	if strings.Contains(string(checksumRaw), string(filepath.Separator)+"model-mapper_0.1.0_linux_amd64.zip") {
+		t.Fatalf("checksum line includes a path: %q", string(checksumRaw))
+	}
+}
+
+func TestPackageExistingArtifactsUsesSha256sumFormat(t *testing.T) {
+	dir := t.TempDir()
+	dist := filepath.Join(dir, "dist")
+	out := filepath.Join(dir, "release")
+	linuxDir := filepath.Join(dist, "linux_amd64")
+	windowsDir := filepath.Join(dist, "windows_amd64")
+	if err := os.MkdirAll(linuxDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(zipB, []byte("linux"), 0o644); err != nil {
+	if err := os.MkdirAll(windowsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	checksumsPath := filepath.Join(dir, "checksums.txt")
-	if err := writeChecksums(checksumsPath, []string{zipA, zipB}); err != nil {
-		t.Fatalf("writeChecksums error = %v", err)
+	if err := os.WriteFile(filepath.Join(linuxDir, "model-mapper.so"), []byte("linux"), 0o644); err != nil {
+		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(windowsDir, "model-mapper.dll"), []byte("windows"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := packageExistingArtifacts("0.1.0", dist, out); err != nil {
+		t.Fatalf("packageExistingArtifacts error = %v", err)
+	}
+	checksumsPath := filepath.Join(out, "checksums.txt")
 	gotBytes, err := os.ReadFile(checksumsPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := string(gotBytes)
-	for _, tc := range []struct {
-		path string
-		body string
-	}{
-		{zipA, "windows"},
-		{zipB, "linux"},
+	for _, name := range []string{
+		"model-mapper_0.1.0_linux_amd64.zip",
+		"model-mapper_0.1.0_windows_amd64.zip",
 	} {
-		sum := sha256.Sum256([]byte(tc.body))
-		wantLine := hex.EncodeToString(sum[:]) + "  " + filepath.Base(tc.path)
+		zipBytes, err := os.ReadFile(filepath.Join(out, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256(zipBytes)
+		wantLine := hex.EncodeToString(sum[:]) + "  " + name
 		if !strings.Contains(got, wantLine+"\n") {
 			t.Fatalf("checksums.txt = %q, missing %q", got, wantLine)
 		}

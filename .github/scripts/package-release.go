@@ -13,6 +13,13 @@ import (
 	"strings"
 )
 
+const pluginName = "model-mapper"
+
+type artifactSpec struct {
+	osName string
+	arch   string
+}
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -24,46 +31,81 @@ func run() error {
 	versionFlag := flag.String("version", "", "release version")
 	distDir := flag.String("dist", "dist", "artifact directory")
 	outDir := flag.String("out", filepath.Join("dist", "release"), "output directory")
+	libraryPath := flag.String("library", "", "path to one compiled plugin library")
+	archivePath := flag.String("archive", "", "path to one output zip archive")
+	checksumPath := flag.String("checksum", "", "path to one output checksum file")
 	flag.Parse()
+
+	if *libraryPath != "" || *archivePath != "" || *checksumPath != "" {
+		if *libraryPath == "" || *archivePath == "" || *checksumPath == "" {
+			return fmt.Errorf("library, archive, and checksum are required together")
+		}
+		archiveData, err := packageLibrary(*libraryPath, *archivePath)
+		if err != nil {
+			return err
+		}
+		return writeChecksum(*checksumPath, *archivePath, archiveData)
+	}
 
 	version, err := resolveVersion(*versionFlag)
 	if err != nil {
 		return err
 	}
+	return packageExistingArtifacts(version, *distDir, *outDir)
+}
 
-	artifacts := []struct {
-		osName     string
-		arch       string
-		binaryPath string
-	}{
-		{osName: "windows", arch: "amd64", binaryPath: filepath.Join(*distDir, "windows_amd64", "model-mapper.dll")},
-		{osName: "linux", arch: "amd64", binaryPath: filepath.Join(*distDir, "linux_amd64", "model-mapper.so")},
+func packageExistingArtifacts(version, distDir, outDir string) error {
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return fmt.Errorf("create output dir %s: %w", outDir, err)
 	}
 
-	for _, artifact := range artifacts {
-		if err := ensureReadableFile(artifact.binaryPath, "required artifact"); err != nil {
-			return err
+	zipPaths := make([]string, 0, len(artifactSpecs()))
+	for _, artifact := range artifactSpecs() {
+		binaryPath := artifact.binaryPath(distDir)
+		if _, err := os.Stat(binaryPath); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("stat artifact %s: %w", filepath.ToSlash(binaryPath), err)
 		}
-	}
-
-	if err := os.MkdirAll(*outDir, 0o755); err != nil {
-		return fmt.Errorf("create output dir %s: %w", *outDir, err)
-	}
-
-	zipPaths := make([]string, 0, len(artifacts))
-	for _, artifact := range artifacts {
-		zipName := fmt.Sprintf("model-mapper_%s_%s_%s.zip", version, artifact.osName, artifact.arch)
-		zipPath := filepath.Join(*outDir, zipName)
-		if err := writeZip(zipPath, artifact.binaryPath); err != nil {
+		zipName := fmt.Sprintf("%s_%s_%s_%s.zip", pluginName, version, artifact.osName, artifact.arch)
+		zipPath := filepath.Join(outDir, zipName)
+		if _, err := packageLibrary(binaryPath, zipPath); err != nil {
 			return err
 		}
 		zipPaths = append(zipPaths, zipPath)
 	}
-	if err := writeChecksums(filepath.Join(*outDir, "checksums.txt"), zipPaths); err != nil {
-		return err
+	if len(zipPaths) == 0 {
+		return fmt.Errorf("no supported artifacts found under %s", filepath.ToSlash(distDir))
 	}
+	return writeChecksums(filepath.Join(outDir, "checksums.txt"), zipPaths)
+}
 
-	return nil
+func artifactSpecs() []artifactSpec {
+	return []artifactSpec{
+		{osName: "linux", arch: "amd64"},
+		{osName: "linux", arch: "arm64"},
+		{osName: "darwin", arch: "amd64"},
+		{osName: "darwin", arch: "arm64"},
+		{osName: "windows", arch: "amd64"},
+		{osName: "windows", arch: "arm64"},
+		{osName: "freebsd", arch: "amd64"},
+	}
+}
+
+func (a artifactSpec) binaryPath(distDir string) string {
+	return filepath.Join(distDir, a.osName+"_"+a.arch, pluginName+libraryExtension(a.osName))
+}
+
+func libraryExtension(osName string) string {
+	switch osName {
+	case "windows":
+		return ".dll"
+	case "darwin":
+		return ".dylib"
+	default:
+		return ".so"
+	}
 }
 
 func resolveVersion(versionFlag string) (string, error) {
@@ -88,61 +130,71 @@ func normalizeReleaseVersion(version string) string {
 	return strings.TrimPrefix(version, "v")
 }
 
-func writeZip(zipPath, binaryPath string) error {
-	file, err := os.Create(zipPath)
+func packageLibrary(libraryPath, archivePath string) ([]byte, error) {
+	library, err := os.Open(libraryPath)
 	if err != nil {
-		return fmt.Errorf("create zip %s: %w", zipPath, err)
+		return nil, fmt.Errorf("open library %s: %w", filepath.ToSlash(libraryPath), err)
 	}
-	defer file.Close()
+	defer library.Close()
 
-	zipWriter := zip.NewWriter(file)
-
-	if err := addFile(zipWriter, binaryPath, filepath.Base(binaryPath)); err != nil {
-		return err
+	info, err := library.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat library %s: %w", filepath.ToSlash(libraryPath), err)
 	}
-	if _, err := os.Stat("README.md"); err == nil {
-		if err := addFile(zipWriter, "README.md", "README.md"); err != nil {
-			return err
+	if err := os.MkdirAll(filepath.Dir(archivePath), 0o755); err != nil {
+		return nil, fmt.Errorf("create archive directory: %w", err)
+	}
+	archive, err := os.Create(archivePath)
+	if err != nil {
+		return nil, fmt.Errorf("create archive %s: %w", filepath.ToSlash(archivePath), err)
+	}
+	archiveClosed := false
+	defer func() {
+		if !archiveClosed {
+			_ = archive.Close()
 		}
-	}
-	if _, err := os.Stat("LICENSE"); err == nil {
-		if err := addFile(zipWriter, "LICENSE", "LICENSE"); err != nil {
-			return err
-		}
-	}
+	}()
 
-	if err := zipWriter.Close(); err != nil {
-		return fmt.Errorf("close zip %s: %w", zipPath, err)
+	writer := zip.NewWriter(archive)
+	header, err := zip.FileInfoHeader(info)
+	if err != nil {
+		return nil, fmt.Errorf("create zip header: %w", err)
 	}
-	return nil
+	header.Name = filepath.Base(libraryPath)
+	header.Method = zip.Deflate
+	header.SetMode(0o755)
+	entry, err := writer.CreateHeader(header)
+	if err != nil {
+		return nil, fmt.Errorf("create zip entry %s: %w", header.Name, err)
+	}
+	if _, err := io.Copy(entry, library); err != nil {
+		return nil, fmt.Errorf("write zip entry %s: %w", header.Name, err)
+	}
+	if err := writer.Close(); err != nil {
+		return nil, fmt.Errorf("close zip writer: %w", err)
+	}
+	if err := archive.Close(); err != nil {
+		return nil, fmt.Errorf("close archive %s: %w", filepath.ToSlash(archivePath), err)
+	}
+	archiveClosed = true
+
+	data, err := os.ReadFile(archivePath)
+	if err != nil {
+		return nil, fmt.Errorf("read archive %s: %w", filepath.ToSlash(archivePath), err)
+	}
+	return data, nil
 }
 
-func addFile(zipWriter *zip.Writer, srcPath, zipName string) error {
-	src, err := os.Open(srcPath)
-	if err != nil {
-		return fmt.Errorf("open %s: %w", srcPath, err)
+func writeChecksum(checksumPath, archivePath string, archiveData []byte) error {
+	if err := os.MkdirAll(filepath.Dir(checksumPath), 0o755); err != nil {
+		return fmt.Errorf("create checksum directory: %w", err)
 	}
-	defer src.Close()
-
-	entry, err := zipWriter.Create(zipName)
-	if err != nil {
-		return fmt.Errorf("create zip entry %s: %w", zipName, err)
-	}
-	if _, err := io.Copy(entry, src); err != nil {
-		return fmt.Errorf("write zip entry %s: %w", zipName, err)
+	checksum := sha256.Sum256(archiveData)
+	line := fmt.Sprintf("%s  %s\n", hex.EncodeToString(checksum[:]), filepath.Base(archivePath))
+	if err := os.WriteFile(checksumPath, []byte(line), 0o644); err != nil {
+		return fmt.Errorf("write checksum %s: %w", filepath.ToSlash(checksumPath), err)
 	}
 	return nil
-}
-
-func ensureReadableFile(path, label string) error {
-	file, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("%s missing: %s", label, filepath.ToSlash(path))
-		}
-		return fmt.Errorf("open %s %s: %w", label, filepath.ToSlash(path), err)
-	}
-	return file.Close()
 }
 
 func writeChecksums(path string, zipPaths []string) error {

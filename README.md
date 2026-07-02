@@ -49,12 +49,23 @@ Endpoint-specific rules override `global_rules` and do not stack with it:
 
 ```powershell
 make test
+make vet
 make build-windows-amd64
 make build-linux-amd64 LINUX_AMD64_CC=<cross-compiler>
 make package VERSION=0.1.0
 ```
 
-Artifacts:
+Full-platform release builds run in GitHub Actions for:
+
+- `linux/amd64`
+- `linux/arm64`
+- `darwin/amd64`
+- `darwin/arm64`
+- `windows/amd64`
+- `windows/arm64`
+- `freebsd/amd64`
+
+Local artifacts commonly used for smoke checks:
 
 - `dist/windows_amd64/model-mapper.dll`
 - `dist/linux_amd64/model-mapper.so`
