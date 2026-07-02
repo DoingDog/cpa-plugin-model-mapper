@@ -296,9 +296,9 @@ func pluginRegistration() registration {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             "model-mapper",
-			Version:          "0.1.0",
-			Author:           "router-for-me",
-			GitHubRepository: "https://github.com/router-for-me/cpa-plugin-model-mapper",
+			Version:          "0.1.1",
+			Author:           "DoingDog",
+			GitHubRepository: "https://github.com/DoingDog/cpa-plugin-model-mapper",
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enable model request mapping."},
 				{Name: "global_rules", Type: pluginapi.ConfigFieldTypeString, Description: "Fallback rules used when an endpoint-specific ruleset is empty."},

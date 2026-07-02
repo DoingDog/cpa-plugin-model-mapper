@@ -51,12 +51,15 @@ func TestPackageLibraryWritesRootLibraryEntryAndChecksum(t *testing.T) {
 		t.Fatalf("write library: %v", err)
 	}
 
-	archiveData, err := packageLibrary(libraryPath, archivePath)
-	if err != nil {
+	if err := packageLibrary(libraryPath, archivePath); err != nil {
 		t.Fatalf("packageLibrary error = %v", err)
 	}
-	if err := writeChecksum(checksumPath, archivePath, archiveData); err != nil {
+	if err := writeChecksum(checksumPath, archivePath); err != nil {
 		t.Fatalf("writeChecksum error = %v", err)
+	}
+	archiveData, err := os.ReadFile(archivePath)
+	if err != nil {
+		t.Fatalf("read archive: %v", err)
 	}
 
 	reader, err := zip.NewReader(bytes.NewReader(archiveData), int64(len(archiveData)))

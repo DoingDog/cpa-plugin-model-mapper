@@ -40,11 +40,10 @@ func run() error {
 		if *libraryPath == "" || *archivePath == "" || *checksumPath == "" {
 			return fmt.Errorf("library, archive, and checksum are required together")
 		}
-		archiveData, err := packageLibrary(*libraryPath, *archivePath)
-		if err != nil {
+		if err := packageLibrary(*libraryPath, *archivePath); err != nil {
 			return err
 		}
-		return writeChecksum(*checksumPath, *archivePath, archiveData)
+		return writeChecksum(*checksumPath, *archivePath)
 	}
 
 	version, err := resolveVersion(*versionFlag)
@@ -70,7 +69,7 @@ func packageExistingArtifacts(version, distDir, outDir string) error {
 		}
 		zipName := fmt.Sprintf("%s_%s_%s_%s.zip", pluginName, version, artifact.osName, artifact.arch)
 		zipPath := filepath.Join(outDir, zipName)
-		if _, err := packageLibrary(binaryPath, zipPath); err != nil {
+		if err := packageLibrary(binaryPath, zipPath); err != nil {
 			return err
 		}
 		zipPaths = append(zipPaths, zipPath)
@@ -130,23 +129,23 @@ func normalizeReleaseVersion(version string) string {
 	return strings.TrimPrefix(version, "v")
 }
 
-func packageLibrary(libraryPath, archivePath string) ([]byte, error) {
+func packageLibrary(libraryPath, archivePath string) error {
 	library, err := os.Open(libraryPath)
 	if err != nil {
-		return nil, fmt.Errorf("open library %s: %w", filepath.ToSlash(libraryPath), err)
+		return fmt.Errorf("open library %s: %w", filepath.ToSlash(libraryPath), err)
 	}
 	defer library.Close()
 
 	info, err := library.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("stat library %s: %w", filepath.ToSlash(libraryPath), err)
+		return fmt.Errorf("stat library %s: %w", filepath.ToSlash(libraryPath), err)
 	}
 	if err := os.MkdirAll(filepath.Dir(archivePath), 0o755); err != nil {
-		return nil, fmt.Errorf("create archive directory: %w", err)
+		return fmt.Errorf("create archive directory: %w", err)
 	}
 	archive, err := os.Create(archivePath)
 	if err != nil {
-		return nil, fmt.Errorf("create archive %s: %w", filepath.ToSlash(archivePath), err)
+		return fmt.Errorf("create archive %s: %w", filepath.ToSlash(archivePath), err)
 	}
 	archiveClosed := false
 	defer func() {
@@ -158,39 +157,37 @@ func packageLibrary(libraryPath, archivePath string) ([]byte, error) {
 	writer := zip.NewWriter(archive)
 	header, err := zip.FileInfoHeader(info)
 	if err != nil {
-		return nil, fmt.Errorf("create zip header: %w", err)
+		return fmt.Errorf("create zip header: %w", err)
 	}
 	header.Name = filepath.Base(libraryPath)
 	header.Method = zip.Deflate
 	header.SetMode(0o755)
 	entry, err := writer.CreateHeader(header)
 	if err != nil {
-		return nil, fmt.Errorf("create zip entry %s: %w", header.Name, err)
+		return fmt.Errorf("create zip entry %s: %w", header.Name, err)
 	}
 	if _, err := io.Copy(entry, library); err != nil {
-		return nil, fmt.Errorf("write zip entry %s: %w", header.Name, err)
+		return fmt.Errorf("write zip entry %s: %w", header.Name, err)
 	}
 	if err := writer.Close(); err != nil {
-		return nil, fmt.Errorf("close zip writer: %w", err)
+		return fmt.Errorf("close zip writer: %w", err)
 	}
 	if err := archive.Close(); err != nil {
-		return nil, fmt.Errorf("close archive %s: %w", filepath.ToSlash(archivePath), err)
+		return fmt.Errorf("close archive %s: %w", filepath.ToSlash(archivePath), err)
 	}
 	archiveClosed = true
-
-	data, err := os.ReadFile(archivePath)
-	if err != nil {
-		return nil, fmt.Errorf("read archive %s: %w", filepath.ToSlash(archivePath), err)
-	}
-	return data, nil
+	return nil
 }
 
-func writeChecksum(checksumPath, archivePath string, archiveData []byte) error {
+func writeChecksum(checksumPath, archivePath string) error {
 	if err := os.MkdirAll(filepath.Dir(checksumPath), 0o755); err != nil {
 		return fmt.Errorf("create checksum directory: %w", err)
 	}
-	checksum := sha256.Sum256(archiveData)
-	line := fmt.Sprintf("%s  %s\n", hex.EncodeToString(checksum[:]), filepath.Base(archivePath))
+	checksum, err := sha256File(archivePath)
+	if err != nil {
+		return err
+	}
+	line := fmt.Sprintf("%s  %s\n", checksum, filepath.Base(archivePath))
 	if err := os.WriteFile(checksumPath, []byte(line), 0o644); err != nil {
 		return fmt.Errorf("write checksum %s: %w", filepath.ToSlash(checksumPath), err)
 	}

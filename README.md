@@ -106,6 +106,10 @@ make smoke-local
 
 Do not commit `.test-cpa/`, `.env`, generated config, logs, or `dist/` artifacts.
 
+## License
+
+The Unlicense.
+
 ## Model list modification
 
 Model-list modification is not implemented in this release. See `docs/model-list-modification-plan.md` for the required future CPA host hook.

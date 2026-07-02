@@ -40,10 +40,11 @@ jobs:
 
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     needs: test
     runs-on: ${{ matrix.runner }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
           - goos: linux
@@ -110,6 +111,7 @@ jobs:
 
   build-windows-arm64:
     name: Build windows/arm64
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     needs: test
     runs-on: ubuntu-24.04
     defaults:
@@ -169,6 +171,7 @@ jobs:
 
   build-freebsd:
     name: Build freebsd/amd64
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     needs: test
     runs-on: ubuntu-24.04
     defaults:
