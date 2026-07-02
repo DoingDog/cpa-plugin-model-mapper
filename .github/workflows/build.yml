@@ -26,6 +26,7 @@ jobs:
         with:
           go-version: 1.26.x
       - run: go test ./...
+      - run: go test .github/scripts/package-release.go .github/scripts/package-release_test.go
       - run: go vet ./...
 
   build-package:
@@ -84,4 +85,4 @@ jobs:
         with:
           files: |
             dist/release/*.zip
-            dist/release/*.sha256
+            dist/release/checksums.txt

@@ -50,35 +50,42 @@ func run() error {
 		return fmt.Errorf("create output dir %s: %w", *outDir, err)
 	}
 
+	zipPaths := make([]string, 0, len(artifacts))
 	for _, artifact := range artifacts {
 		zipName := fmt.Sprintf("model-mapper_%s_%s_%s.zip", version, artifact.osName, artifact.arch)
 		zipPath := filepath.Join(*outDir, zipName)
 		if err := writeZip(zipPath, artifact.binaryPath); err != nil {
 			return err
 		}
-		if err := writeSHA256(zipPath, filepath.Join(*outDir, zipName+".sha256")); err != nil {
-			return err
-		}
+		zipPaths = append(zipPaths, zipPath)
+	}
+	if err := writeChecksums(filepath.Join(*outDir, "checksums.txt"), zipPaths); err != nil {
+		return err
 	}
 
 	return nil
 }
 
 func resolveVersion(versionFlag string) (string, error) {
-	if strings.TrimSpace(versionFlag) != "" {
-		return versionFlag, nil
+	if version := normalizeReleaseVersion(versionFlag); version != "" {
+		return version, nil
 	}
-	if version := strings.TrimSpace(os.Getenv("VERSION")); version != "" {
+	if version := normalizeReleaseVersion(os.Getenv("VERSION")); version != "" {
 		return version, nil
 	}
 	cmd := exec.Command("git", "describe", "--tags", "--exact-match")
 	output, err := cmd.Output()
 	if err == nil {
-		if version := strings.TrimSpace(string(output)); version != "" {
+		if version := normalizeReleaseVersion(string(output)); version != "" {
 			return version, nil
 		}
 	}
 	return "", fmt.Errorf("version is required: use -version, set VERSION, or run from an exact git tag")
+}
+
+func normalizeReleaseVersion(version string) string {
+	version = strings.TrimSpace(version)
+	return strings.TrimPrefix(version, "v")
 }
 
 func writeZip(zipPath, binaryPath string) error {
@@ -138,21 +145,34 @@ func ensureReadableFile(path, label string) error {
 	return file.Close()
 }
 
-func writeSHA256(zipPath, shaPath string) error {
-	file, err := os.Open(zipPath)
+func writeChecksums(path string, zipPaths []string) error {
+	var builder strings.Builder
+	for _, zipPath := range zipPaths {
+		checksum, err := sha256File(zipPath)
+		if err != nil {
+			return err
+		}
+		builder.WriteString(checksum)
+		builder.WriteString("  ")
+		builder.WriteString(filepath.Base(zipPath))
+		builder.WriteByte('\n')
+	}
+	if err := os.WriteFile(path, []byte(builder.String()), 0o644); err != nil {
+		return fmt.Errorf("write checksums %s: %w", path, err)
+	}
+	return nil
+}
+
+func sha256File(path string) (string, error) {
+	file, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("open zip for checksum %s: %w", zipPath, err)
+		return "", fmt.Errorf("open zip for checksum %s: %w", path, err)
 	}
 	defer file.Close()
 
 	hasher := sha256.New()
 	if _, err := io.Copy(hasher, file); err != nil {
-		return fmt.Errorf("hash zip %s: %w", zipPath, err)
+		return "", fmt.Errorf("hash zip %s: %w", path, err)
 	}
-	checksum := hex.EncodeToString(hasher.Sum(nil))
-	content := checksum + "  " + filepath.Base(zipPath) + "\n"
-	if err := os.WriteFile(shaPath, []byte(content), 0o644); err != nil {
-		return fmt.Errorf("write checksum %s: %w", shaPath, err)
-	}
-	return nil
+	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
