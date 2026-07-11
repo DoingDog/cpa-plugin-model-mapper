@@ -25,13 +25,21 @@ The plugin's own `enabled` field defaults to `true`. Empty rule fields mean the 
 
 ## Rule syntax
 
-Each ruleset is a `;`-separated list of `find=>replace` rules. Spaces and quotes are invalid.
+Each ruleset is a `;`-separated list of `find=>replace` rules. Whitespace and quotes are invalid inside the decoded rule value.
 
-- `*` in `find` captures any text.
-- `$1`, `$2`, and later numbers in `replace` reuse captures.
+- Matching is case-sensitive and applies to the complete model name; it is not substring or regular-expression matching.
+- In `find`, `*` captures zero or more characters, including `/`, and captures are numbered from left to right. Wildcard matching does not backtrack: each capture stops at the first occurrence of the next literal. `$` is literal.
+- In `replace`, `$1`, `$2`, and later numbers reuse captures. `*` is literal.
+- Characters such as `@`, `/`, `[`, `]`, parentheses, dots, hyphens, and underscores are literal and need no escaping.
 - Rules are order-sensitive: the selected ruleset runs left to right exactly once, and later rules see the model produced by earlier rules.
 - Put more specific wildcard rules before broader fallback rules.
-- In `find`, `\` escapes literal `*`, `;`, `$`, `\`, or `=>`. In `replace`, use `\=>` for a literal `=>`.
+- In `find`, `\` escapes `*`, `;`, `$`, `\`, or `=>`; escaping `$` is accepted but unnecessary. In `replace`, `\=>` is the only backslash escape. Literal `\`, `;`, and `$` cannot be written directly in a replacement, but captures can carry them into the output.
+
+YAML may single-quote the whole rule value. The outer quotes are removed before rule parsing and preserve backslashes; quote characters inside the decoded value remain invalid:
+
+```yaml
+global_rules: '@cf/zai-org/glm-4.7-flash=>glm-4.7-flash;deepseek-v4-pro[1m]=>deepseek-v4-pro'
+```
 
 Endpoint-specific rules override `global_rules` and do not stack with it:
 

@@ -53,7 +53,7 @@ func TestPluginRegistrationMetadataAndConfigFields(t *testing.T) {
 }
 
 func TestDecodeLifecycleConfigUnquotesYAMLEmptyRuleStrings(t *testing.T) {
-	rawYAML := []byte("enabled: true\nglobal_rules: \"\"\nclaude_messages_rules: 'claude*=>deepseek-v4-flash'\ncodex_responses_rules: \"\"\nopenai_completions_rules: \"\"\n")
+	rawYAML := []byte("enabled: true\nglobal_rules: \"\"\nclaude_messages_rules: 'literal\\*=>star'\ncodex_responses_rules: \"\"\nopenai_completions_rules: \"\"\n")
 	rawReq, err := json.Marshal(map[string]string{"config_yaml": base64.StdEncoding.EncodeToString(rawYAML)})
 	if err != nil {
 		t.Fatalf("marshal lifecycle: %v", err)
@@ -69,7 +69,7 @@ func TestDecodeLifecycleConfigUnquotesYAMLEmptyRuleStrings(t *testing.T) {
 	if cfg.GlobalRules != "" || cfg.CodexResponsesRules != "" || cfg.OpenAICompletionsRules != "" {
 		t.Fatalf("empty quoted YAML rules were not unquoted: %#v", cfg)
 	}
-	if cfg.ClaudeMessagesRules != "claude*=>deepseek-v4-flash" {
+	if cfg.ClaudeMessagesRules != "literal\\*=>star" {
 		t.Fatalf("claude rules = %q", cfg.ClaudeMessagesRules)
 	}
 }
@@ -145,6 +145,10 @@ func TestParseRulesRejectsInvalidRules(t *testing.T) {
 		`a=>x$x`,
 		`a=>x$1`,
 		`a*=>x$2`,
+		`a\/b=>x`,
+		`a=>\\`,
+		`a=>\;`,
+		`a=>\$`,
 	}
 	for _, raw := range tests {
 		t.Run(raw, func(t *testing.T) {
@@ -183,6 +187,45 @@ func TestApplyRulesWildcardCapture(t *testing.T) {
 	}
 	if !matched || mapped != "upstream-sonnet" {
 		t.Fatalf("mapped=%q matched=%v", mapped, matched)
+	}
+}
+
+func TestApplyRulesCharacterSemantics(t *testing.T) {
+	tests := []struct {
+		name        string
+		raw         string
+		model       string
+		want        string
+		wantMatched bool
+	}{
+		{name: "ordinary punctuation", raw: `@cf/zai-org/gpt-5.4(medium)[1M]=>mapped`, model: `@cf/zai-org/gpt-5.4(medium)[1M]`, want: "mapped", wantMatched: true},
+		{name: "case sensitive", raw: `@cf/zai-org/gpt-5.4(medium)[1M]=>mapped`, model: `@cf/zai-org/gpt-5.4(medium)[1m]`, want: `@cf/zai-org/gpt-5.4(medium)[1m]`},
+		{name: "requires matching prefix", raw: `gpt-5.5=>mapped`, model: `openai/gpt-5.5`, want: `openai/gpt-5.5`},
+		{name: "requires matching suffix", raw: `gpt-5.5=>mapped`, model: `gpt-5.5(high)`, want: `gpt-5.5(high)`},
+		{name: "wildcard crosses slash", raw: `@cf/*=>mapped-$1`, model: `@cf/zai-org/glm-4.7-flash`, want: `mapped-zai-org/glm-4.7-flash`, wantMatched: true},
+		{name: "wildcard captures empty text", raw: `@cf/*=>mapped-$1`, model: `@cf/`, want: `mapped-`, wantMatched: true},
+		{name: "wildcard does not backtrack", raw: `*-pro=>mapped`, model: `vendor-pro-pro`, want: `vendor-pro-pro`},
+		{name: "multiple captures are numbered left to right", raw: `a*bc*=>x$2y$1`, model: `aONEbcTWO`, want: `xTWOyONE`, wantMatched: true},
+		{name: "find dollar and replacement star are literal", raw: `price$=>literal*`, model: `price$`, want: `literal*`, wantMatched: true},
+		{name: "escaped find dollar is literal", raw: `price\$=>mapped`, model: `price$`, want: `mapped`, wantMatched: true},
+		{name: "escaped find star is literal", raw: `literal\*=>mapped`, model: `literal*`, want: `mapped`, wantMatched: true},
+		{name: "escaped find star is not wildcard", raw: `literal\*=>mapped`, model: `literalX`, want: `literalX`},
+		{name: "escaped find semicolon is literal", raw: `a\;b=>mapped`, model: `a;b`, want: `mapped`, wantMatched: true},
+		{name: "escaped find separator is literal", raw: `a\=>b=>mapped`, model: `a=>b`, want: `mapped`, wantMatched: true},
+		{name: "find literal backslash", raw: `vendor\\model=>mapped`, model: `vendor\model`, want: `mapped`, wantMatched: true},
+		{name: "replace literal separator", raw: `source=>target\=>alias`, model: `source`, want: `target=>alias`, wantMatched: true},
+		{name: "capture carries replacement punctuation", raw: `*=>copy-$1`, model: `price$;vendor\model`, want: `copy-price$;vendor\model`, wantMatched: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mapped, matched, err := applyRules(tt.model, mustParseRules(t, tt.raw))
+			if err != nil {
+				t.Fatalf("applyRules error = %v", err)
+			}
+			if mapped != tt.want || matched != tt.wantMatched {
+				t.Fatalf("mapped=%q matched=%v, want %q %v", mapped, matched, tt.want, tt.wantMatched)
+			}
+		})
 	}
 }
 
