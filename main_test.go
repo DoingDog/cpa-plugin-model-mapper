@@ -74,6 +74,25 @@ func TestDecodeLifecycleConfigUnquotesYAMLEmptyRuleStrings(t *testing.T) {
 	}
 }
 
+func TestDecodeLifecycleConfigPreservesCaseOperations(t *testing.T) {
+	rawYAML := []byte("enabled: true\nglobal_rules: '\\a;gpt-*=>deepseek-V3;\\A'\nclaude_messages_rules: \"\"\ncodex_responses_rules: \"\"\nopenai_completions_rules: \"\"\n")
+	rawReq, err := json.Marshal(map[string]string{"config_yaml": base64.StdEncoding.EncodeToString(rawYAML)})
+	if err != nil {
+		t.Fatalf("marshal lifecycle: %v", err)
+	}
+	cfgRaw, _, err := decodeLifecycleConfig(rawReq)
+	if err != nil {
+		t.Fatalf("decodeLifecycleConfig error = %v", err)
+	}
+	cfg, err := decodeConfig(cfgRaw)
+	if err != nil {
+		t.Fatalf("decodeConfig error = %v", err)
+	}
+	if cfg.GlobalRules != `\a;gpt-*=>deepseek-V3;\A` {
+		t.Fatalf("global rules = %q", cfg.GlobalRules)
+	}
+}
+
 func TestDecodeConfigDefaultAndBadRules(t *testing.T) {
 	cfg, err := decodeConfig(nil)
 	if err != nil {
@@ -84,6 +103,16 @@ func TestDecodeConfigDefaultAndBadRules(t *testing.T) {
 	}
 	if _, err := decodeConfig(json.RawMessage(`{"enabled":true,"global_rules":"bad rule"}`)); err == nil {
 		t.Fatalf("decodeConfig bad rules error = nil")
+	}
+	badOperation, err := json.Marshal(map[string]any{
+		"enabled":      true,
+		"global_rules": `\x`,
+	})
+	if err != nil {
+		t.Fatalf("marshal bad operation config: %v", err)
+	}
+	if _, err := decodeConfig(badOperation); err == nil {
+		t.Fatalf("decodeConfig unknown operation error = nil")
 	}
 	cfg, err = decodeConfig(json.RawMessage(`{"enabled":false,"global_rules":"a=>b"}`))
 	if err != nil {
