@@ -871,10 +871,19 @@ type token struct {
 	capture int
 }
 
+type caseOperation uint8
+
+const (
+	caseOperationNone caseOperation = iota
+	caseOperationLower
+	caseOperationUpper
+)
+
 type rule struct {
 	patternTokens     []token
 	replacementTokens []token
 	captureCount      int
+	caseOperation     caseOperation
 }
 
 func defaultConfig() Config {
@@ -897,6 +906,14 @@ func parseRules(raw string) ([]rule, error) {
 	}
 	out := make([]rule, 0, len(parts))
 	for _, part := range parts {
+		switch part {
+		case `\a`:
+			out = append(out, rule{caseOperation: caseOperationLower})
+			continue
+		case `\A`:
+			out = append(out, rule{caseOperation: caseOperationUpper})
+			continue
+		}
 		sep, ok := findRuleSeparator(part)
 		if !ok {
 			return nil, fmt.Errorf("invalid rule")

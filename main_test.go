@@ -126,6 +126,27 @@ func TestParseRulesAcceptsValidRules(t *testing.T) {
 	}
 }
 
+func TestParseRulesAcceptsCaseOperations(t *testing.T) {
+	rules, err := parseRules(`a=>b;\a;\A;c=>d`)
+	if err != nil {
+		t.Fatalf("parseRules error = %v", err)
+	}
+	if len(rules) != 4 {
+		t.Fatalf("len(rules) = %d, want 4", len(rules))
+	}
+	want := []caseOperation{
+		caseOperationNone,
+		caseOperationLower,
+		caseOperationUpper,
+		caseOperationNone,
+	}
+	for i, operation := range want {
+		if rules[i].caseOperation != operation {
+			t.Fatalf("rules[%d].caseOperation = %v, want %v", i, rules[i].caseOperation, operation)
+		}
+	}
+}
+
 func TestParseRulesRejectsInvalidRules(t *testing.T) {
 	tests := []string{
 		"",
@@ -149,6 +170,11 @@ func TestParseRulesRejectsInvalidRules(t *testing.T) {
 		`a=>\\`,
 		`a=>\;`,
 		`a=>\$`,
+		`\x`,
+		`\a=>x`,
+		`\A=>x`,
+		`x=>\a`,
+		`x=>\A`,
 	}
 	for _, raw := range tests {
 		t.Run(raw, func(t *testing.T) {
