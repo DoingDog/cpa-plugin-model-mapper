@@ -871,10 +871,19 @@ type token struct {
 	capture int
 }
 
+type caseOperation uint8
+
+const (
+	caseOperationNone caseOperation = iota
+	caseOperationLower
+	caseOperationUpper
+)
+
 type rule struct {
 	patternTokens     []token
 	replacementTokens []token
 	captureCount      int
+	caseOperation     caseOperation
 }
 
 func defaultConfig() Config {
@@ -897,6 +906,14 @@ func parseRules(raw string) ([]rule, error) {
 	}
 	out := make([]rule, 0, len(parts))
 	for _, part := range parts {
+		switch part {
+		case `\a`:
+			out = append(out, rule{caseOperation: caseOperationLower})
+			continue
+		case `\A`:
+			out = append(out, rule{caseOperation: caseOperationUpper})
+			continue
+		}
 		sep, ok := findRuleSeparator(part)
 		if !ok {
 			return nil, fmt.Errorf("invalid rule")
@@ -1063,16 +1080,38 @@ func parseReplace(s string, captures int) ([]token, error) {
 	return tokens, nil
 }
 
+func applyASCIIModelCase(model string, operation caseOperation) string {
+	converted := []byte(model)
+	for i, c := range converted {
+		switch operation {
+		case caseOperationLower:
+			if c >= 'A' && c <= 'Z' {
+				converted[i] = c + ('a' - 'A')
+			}
+		case caseOperationUpper:
+			if c >= 'a' && c <= 'z' {
+				converted[i] = c - ('a' - 'A')
+			}
+		}
+	}
+	return string(converted)
+}
+
 func applyRules(model string, rules []rule) (string, bool, error) {
 	current := model
 	matchedAny := false
 	for _, r := range rules {
-		captures, ok := matchTokens(current, r.patternTokens)
-		if !ok {
-			continue
+		if r.caseOperation != caseOperationNone {
+			current = applyASCIIModelCase(current, r.caseOperation)
+			matchedAny = true
+		} else {
+			captures, ok := matchTokens(current, r.patternTokens)
+			if !ok {
+				continue
+			}
+			current = buildReplacement(r.replacementTokens, captures)
+			matchedAny = true
 		}
-		current = buildReplacement(r.replacementTokens, captures)
-		matchedAny = true
 		if current == "" {
 			return "", true, fmt.Errorf("empty mapped model")
 		}

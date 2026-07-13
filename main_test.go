@@ -74,6 +74,25 @@ func TestDecodeLifecycleConfigUnquotesYAMLEmptyRuleStrings(t *testing.T) {
 	}
 }
 
+func TestDecodeLifecycleConfigPreservesCaseOperations(t *testing.T) {
+	rawYAML := []byte("enabled: true\nglobal_rules: '\\a;gpt-*=>deepseek-V3;\\A'\nclaude_messages_rules: \"\"\ncodex_responses_rules: \"\"\nopenai_completions_rules: \"\"\n")
+	rawReq, err := json.Marshal(map[string]string{"config_yaml": base64.StdEncoding.EncodeToString(rawYAML)})
+	if err != nil {
+		t.Fatalf("marshal lifecycle: %v", err)
+	}
+	cfgRaw, _, err := decodeLifecycleConfig(rawReq)
+	if err != nil {
+		t.Fatalf("decodeLifecycleConfig error = %v", err)
+	}
+	cfg, err := decodeConfig(cfgRaw)
+	if err != nil {
+		t.Fatalf("decodeConfig error = %v", err)
+	}
+	if cfg.GlobalRules != `\a;gpt-*=>deepseek-V3;\A` {
+		t.Fatalf("global rules = %q", cfg.GlobalRules)
+	}
+}
+
 func TestDecodeConfigDefaultAndBadRules(t *testing.T) {
 	cfg, err := decodeConfig(nil)
 	if err != nil {
@@ -84,6 +103,16 @@ func TestDecodeConfigDefaultAndBadRules(t *testing.T) {
 	}
 	if _, err := decodeConfig(json.RawMessage(`{"enabled":true,"global_rules":"bad rule"}`)); err == nil {
 		t.Fatalf("decodeConfig bad rules error = nil")
+	}
+	badOperation, err := json.Marshal(map[string]any{
+		"enabled":      true,
+		"global_rules": `\x`,
+	})
+	if err != nil {
+		t.Fatalf("marshal bad operation config: %v", err)
+	}
+	if _, err := decodeConfig(badOperation); err == nil {
+		t.Fatalf("decodeConfig unknown operation error = nil")
 	}
 	cfg, err = decodeConfig(json.RawMessage(`{"enabled":false,"global_rules":"a=>b"}`))
 	if err != nil {
@@ -126,6 +155,27 @@ func TestParseRulesAcceptsValidRules(t *testing.T) {
 	}
 }
 
+func TestParseRulesAcceptsCaseOperations(t *testing.T) {
+	rules, err := parseRules(`a=>b;\a;\A;c=>d`)
+	if err != nil {
+		t.Fatalf("parseRules error = %v", err)
+	}
+	if len(rules) != 4 {
+		t.Fatalf("len(rules) = %d, want 4", len(rules))
+	}
+	want := []caseOperation{
+		caseOperationNone,
+		caseOperationLower,
+		caseOperationUpper,
+		caseOperationNone,
+	}
+	for i, operation := range want {
+		if rules[i].caseOperation != operation {
+			t.Fatalf("rules[%d].caseOperation = %v, want %v", i, rules[i].caseOperation, operation)
+		}
+	}
+}
+
 func TestParseRulesRejectsInvalidRules(t *testing.T) {
 	tests := []string{
 		"",
@@ -149,6 +199,11 @@ func TestParseRulesRejectsInvalidRules(t *testing.T) {
 		`a=>\\`,
 		`a=>\;`,
 		`a=>\$`,
+		`\x`,
+		`\a=>x`,
+		`\A=>x`,
+		`x=>\a`,
+		`x=>\A`,
 	}
 	for _, raw := range tests {
 		t.Run(raw, func(t *testing.T) {
@@ -215,6 +270,18 @@ func TestApplyRulesCharacterSemantics(t *testing.T) {
 		{name: "find literal backslash", raw: `vendor\\model=>mapped`, model: `vendor\model`, want: `mapped`, wantMatched: true},
 		{name: "replace literal separator", raw: `source=>target\=>alias`, model: `source`, want: `target=>alias`, wantMatched: true},
 		{name: "capture carries replacement punctuation", raw: `*=>copy-$1`, model: `price$;vendor\model`, want: `copy-price$;vendor\model`, wantMatched: true},
+		{name: "lowercase ASCII letters only", raw: `\a`, model: `AbC-Z_19/éΩ中`, want: `abc-z_19/éΩ中`, wantMatched: true},
+		{name: "uppercase ASCII letters only", raw: `\A`, model: `aBc-z_19/éω中`, want: `ABC-Z_19/éω中`, wantMatched: true},
+		{name: "operation before case-sensitive mapping", raw: `\a;gpt-x=>mapped`, model: `GPT-X`, want: `mapped`, wantMatched: true},
+		{name: "mapping before operation", raw: `foo=>bar-v2;\A`, model: `foo`, want: `BAR-V2`, wantMatched: true},
+		{name: "later mapping remains case-sensitive", raw: `\a;GPT-X=>wrong`, model: `GPT-X`, want: `gpt-x`, wantMatched: true},
+		{name: "full ordered case-operation chain", raw: `\a;gpt-*=>deepseek-V3;\A;DEEPSEEK-*=>gpt-5.5;\A`, model: `GPT-X`, want: `GPT-5.5`, wantMatched: true},
+		{name: "literal backslash lowercase text remains mappable", raw: `\\a=>mapped`, model: `\a`, want: `mapped`, wantMatched: true},
+		{name: "literal backslash uppercase text remains mappable", raw: `\\A=>mapped`, model: `\A`, want: `mapped`, wantMatched: true},
+		{name: "repeated lowercase operations stay ordered", raw: `\a;\a`, model: `ABC`, want: `abc`, wantMatched: true},
+		{name: "lowercase no-op still executes", raw: `\a`, model: `already-lower/é`, want: `already-lower/é`, wantMatched: true},
+		{name: "uppercase no-op still executes", raw: `\A`, model: `ALREADY-UPPER/Ω`, want: `ALREADY-UPPER/Ω`, wantMatched: true},
+		{name: "case operations can return to original", raw: `\a;\A`, model: `ABC`, want: `ABC`, wantMatched: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -224,6 +291,20 @@ func TestApplyRulesCharacterSemantics(t *testing.T) {
 			}
 			if mapped != tt.want || matched != tt.wantMatched {
 				t.Fatalf("mapped=%q matched=%v, want %q %v", mapped, matched, tt.want, tt.wantMatched)
+			}
+		})
+	}
+}
+
+func TestApplyRulesCaseOperationRejectsEmptyModel(t *testing.T) {
+	for _, raw := range []string{`\a`, `\A`} {
+		t.Run(raw, func(t *testing.T) {
+			mapped, matched, err := applyRules("", mustParseRules(t, raw))
+			if err == nil || err.Error() != "empty mapped model" {
+				t.Fatalf("mapped=%q matched=%v err=%v, want empty mapped model", mapped, matched, err)
+			}
+			if !matched {
+				t.Fatalf("matched=false, want true for executed operation")
 			}
 		})
 	}
@@ -326,6 +407,40 @@ func TestRouteModelHandlesOnlyMatchedChanged(t *testing.T) {
 	}
 	if !decision.Handled || decision.OriginalModel != "deepseek-v4-pro" || decision.UpstreamModel != "gpt-5.4-mini" {
 		t.Fatalf("decision=%#v", decision)
+	}
+}
+
+func TestRouteModelCaseOperationChanged(t *testing.T) {
+	cfg := Config{Enabled: true, GlobalRules: `\A`}
+	decision, err := routeModel(cfg, "openai", "model-v2")
+	if err != nil {
+		t.Fatalf("routeModel error = %v", err)
+	}
+	if !decision.Handled || decision.OriginalModel != "model-v2" || decision.UpstreamModel != "MODEL-V2" {
+		t.Fatalf("decision=%#v", decision)
+	}
+}
+
+func TestRouteModelCaseOperationNoChangeIsUnhandled(t *testing.T) {
+	tests := []struct {
+		name  string
+		rules string
+		model string
+	}{
+		{name: "lowercase no-op", rules: `\a`, model: "model-v2"},
+		{name: "uppercase no-op", rules: `\A`, model: "MODEL-V2"},
+		{name: "net identity", rules: `\a;\A`, model: "ABC"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			decision, err := routeModel(Config{Enabled: true, GlobalRules: tt.rules}, "openai", tt.model)
+			if err != nil {
+				t.Fatalf("routeModel error = %v", err)
+			}
+			if decision.Handled || decision.OriginalModel != "" || decision.UpstreamModel != "" {
+				t.Fatalf("decision=%#v, want unhandled with empty models", decision)
+			}
+		})
 	}
 }
 
