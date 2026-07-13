@@ -1080,16 +1080,38 @@ func parseReplace(s string, captures int) ([]token, error) {
 	return tokens, nil
 }
 
+func applyASCIIModelCase(model string, operation caseOperation) string {
+	converted := []byte(model)
+	for i, c := range converted {
+		switch operation {
+		case caseOperationLower:
+			if c >= 'A' && c <= 'Z' {
+				converted[i] = c + ('a' - 'A')
+			}
+		case caseOperationUpper:
+			if c >= 'a' && c <= 'z' {
+				converted[i] = c - ('a' - 'A')
+			}
+		}
+	}
+	return string(converted)
+}
+
 func applyRules(model string, rules []rule) (string, bool, error) {
 	current := model
 	matchedAny := false
 	for _, r := range rules {
-		captures, ok := matchTokens(current, r.patternTokens)
-		if !ok {
-			continue
+		if r.caseOperation != caseOperationNone {
+			current = applyASCIIModelCase(current, r.caseOperation)
+			matchedAny = true
+		} else {
+			captures, ok := matchTokens(current, r.patternTokens)
+			if !ok {
+				continue
+			}
+			current = buildReplacement(r.replacementTokens, captures)
+			matchedAny = true
 		}
-		current = buildReplacement(r.replacementTokens, captures)
-		matchedAny = true
 		if current == "" {
 			return "", true, fmt.Errorf("empty mapped model")
 		}
