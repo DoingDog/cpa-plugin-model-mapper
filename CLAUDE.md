@@ -26,14 +26,15 @@ This is a single-package Go `c-shared` CLIProxyAPI native plugin. `abi_cgo.go` i
 - `pluginRegistration` advertises `model_router`, `executor`, and `executor.execute_stream` support for `openai`, `claude`, and `openai-response` formats.
 - `decodeLifecycleConfig` and `decodeConfig` load plugin config from CPA lifecycle payloads. Config fields are `enabled`, `global_rules`, `claude_messages_rules`, `codex_responses_rules`, and `openai_completions_rules`.
 - `selectRules` chooses an endpoint-specific ruleset when non-empty; otherwise it falls back to `global_rules`. Endpoint-specific rules do not stack with global rules.
-- `parseRules` / `applyRules` implement rule syntax: `find=>replace` rules separated by `;`, `*` captures, `$1` references captures, and rules run left-to-right exactly once.
-- `handleModelRoute` routes only when a selected rule both matches and changes the requested model; changed requests are routed back to this plugin executor.
+- `parseRules` / `applyRules` implement an ordered entry DSL: entries are `find=>replace` mappings or exact standalone `\a` / `\A` ASCII case operations; `*` captures, `$1` references captures, and entries run left-to-right exactly once.
+- `handleModelRoute` routes only when a mapping matched or case operation executed and the final requested model differs from the original; changed requests are routed back to this plugin executor.
 - `handleExecutorExecute` and `runStreamForward` rewrite the outbound request body to the upstream model, call CPA host execution callbacks, then restore selected response model fields to the client-requested model.
 
 Important model-rewrite invariants:
 
 - Request rewriting intentionally changes only the top-level JSON `model` field.
 - Response restoration is deliberately whitelisted to `model`, `modelVersion`, `response.model`, `response.modelVersion`, and `message.model`. Do not replace recursively through arbitrary content/tool text.
+- Case operations change ASCII English letters only and do not make later mappings case-insensitive.
 - Streaming responses pass through `streamChunkRewriter`, which handles complete SSE events, split SSE prefixes, unterminated SSE data at flush time, raw JSON chunks, line/space-delimited JSON values, and raw JSON that must be framed as SSE for Responses SSE clients.
 - On host stream errors, pending rewritten bytes are flushed before closing the plugin stream so clients do not hang waiting for buffered output.
 

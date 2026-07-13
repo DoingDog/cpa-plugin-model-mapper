@@ -1,6 +1,6 @@
 # CPA Model Mapper Plugin
 
-`model-mapper` is a CLIProxyAPI (CPA) native plugin. It maps text-generation request model names before CPA selects the upstream execution path, then restores supported response model fields back to the client-requested model only when a rule matched and changed the request.
+`model-mapper` is a CLIProxyAPI (CPA) native plugin. It maps text-generation request model names before CPA selects the upstream execution path, then restores supported response model fields back to the client-requested model only when a mapping matched or a case operation executed and the final model differs from the original.
 
 When CPA invokes the plugin executor callbacks, the same mapping applies across non-streaming HTTP responses, SSE streams, and WebSocket-backed CPA streams that arrive as raw JSON chunks through the existing stream bridge.
 
@@ -25,13 +25,15 @@ The plugin's own `enabled` field defaults to `true`. Empty rule fields mean the 
 
 ## Rule syntax
 
-Each ruleset is a `;`-separated list of `find=>replace` rules. Whitespace and quotes are invalid inside the decoded rule value.
+Each ruleset is a `;`-separated ordered list of entries. An entry is either a `find=>replace` mapping or an exact standalone case operation: `\a` lowercases ASCII English letters and `\A` uppercases them. Whitespace and quotes are invalid inside the decoded rule value.
 
-- Matching is case-sensitive and applies to the complete model name; it is not substring or regular-expression matching.
+- Mappings remain case-sensitive and apply to the complete current model name; later mappings see the value produced by every earlier entry.
+- `\a` changes only `A` through `Z` to `a` through `z`; `\A` changes only `a` through `z` to `A` through `Z`. Non-ASCII bytes, digits, punctuation, and separators are unchanged.
+- Case operations must be complete standalone entries. They are not additional backslash escapes for `find` or `replace`.
 - In `find`, `*` captures zero or more characters, including `/`, and captures are numbered from left to right. Wildcard matching does not backtrack: each capture stops at the first occurrence of the next literal. `$` is literal.
 - In `replace`, `$1`, `$2`, and later numbers reuse captures. `*` is literal.
 - Characters such as `@`, `/`, `[`, `]`, parentheses, dots, hyphens, and underscores are literal and need no escaping.
-- Rules are order-sensitive: the selected ruleset runs left to right exactly once, and later rules see the model produced by earlier rules.
+- Entries are order-sensitive: the selected ruleset runs left to right exactly once, and later entries see the model produced by earlier entries.
 - Put more specific wildcard rules before broader fallback rules.
 - In `find`, `\` escapes `*`, `;`, `$`, `\`, or `=>`; escaping `$` is accepted but unnecessary. In `replace`, `\=>` is the only backslash escape. Literal `\`, `;`, and `$` cannot be written directly in a replacement, but captures can carry them into the output.
 
@@ -94,6 +96,24 @@ Effects:
 
 - `deepseek-v4-pro` -> `deepseek-v4-flash`
 - `deepseek-v4-flash` -> `gpt-5.4-mini`
+
+Ordered ASCII case operations can normalize an incoming alias, feed a case-sensitive mapping, transform its output, and continue mapping:
+
+```text
+\a;gpt-*=>deepseek-V3;\A;DEEPSEEK-*=>gpt-5.5;\A
+```
+
+For `GPT-X`, the values are processed as:
+
+```text
+GPT-X -> gpt-x -> deepseek-V3 -> DEEPSEEK-V3 -> gpt-5.5 -> GPT-5.5
+```
+
+Use YAML single quotes so the DSL backslashes are preserved:
+
+```yaml
+global_rules: '\a;gpt-*=>deepseek-V3;\A;DEEPSEEK-*=>gpt-5.5;\A'
+```
 
 ## Common use cases
 
