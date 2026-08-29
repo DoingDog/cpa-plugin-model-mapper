@@ -26,8 +26,8 @@ This is a single-package Go `c-shared` CLIProxyAPI native plugin. `abi_cgo.go` i
 - `pluginRegistration` advertises `model_router`, `executor`, and `executor.execute_stream` support for `openai`, `claude`, and `openai-response` formats.
 - `decodeLifecycleConfig` and `decodeConfig` load plugin config from CPA lifecycle payloads. Config fields are `enabled`, `global_rules`, `claude_messages_rules`, `codex_responses_rules`, and `openai_completions_rules`.
 - `selectRules` chooses an endpoint-specific ruleset when non-empty; otherwise it falls back to `global_rules`. Endpoint-specific rules do not stack with global rules.
-- `parseRules` / `applyRules` implement an ordered entry DSL: entries are `find=>replace` mappings or exact standalone `\a` / `\A` ASCII case operations; `*` captures, `$1` references captures, and entries run left-to-right exactly once.
-- `handleModelRoute` routes only when a mapping matched or case operation executed and the final requested model differs from the original; changed requests are routed back to this plugin executor.
+- `parseRules` / `applyRules` implement an ordered entry DSL: entries have an optional authenticated inbound API-key scope (`api-key#`) matched against metadata-derived `caller_scope`, then a `find=>replace` mapping or exact standalone `\a` / `\A` ASCII case operation; `\#` writes a literal model-name `#`, `*` captures, `$1` references captures, and entries run left-to-right exactly once.
+- `handleModelRoute` uses the same metadata-derived `caller_scope` as non-streaming `handleExecutorExecute` and streaming `runStreamForward` when applying scoped rules. It routes only when a mapping matched or case operation executed and the final requested model differs from the original; changed requests are routed back to this plugin executor.
 - `handleExecutorExecute` and `runStreamForward` rewrite the outbound request body to the upstream model, call CPA host execution callbacks, then restore selected response model fields to the client-requested model.
 
 Important model-rewrite invariants:

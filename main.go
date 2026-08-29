@@ -3,7 +3,9 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -415,7 +417,7 @@ func handleModelRoute(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
-	decision, err := routeModel(loadedConfig(), req.SourceFormat, req.RequestedModel)
+	decision, err := routeModel(loadedConfig(), req.SourceFormat, req.RequestedModel, callerScopeFromMetadata(req.Metadata))
 	if err != nil {
 		return nil, err
 	}
@@ -425,7 +427,7 @@ func handleModelRoute(raw []byte) ([]byte, error) {
 	return json.Marshal(pluginapi.ModelRouteResponse{Handled: true, TargetKind: pluginapi.ModelRouteTargetSelf, Reason: "model mapped by model-mapper"})
 }
 
-func routeModel(cfg Config, format string, model string) (routeDecision, error) {
+func routeModel(cfg Config, format, model, scope string) (routeDecision, error) {
 	if !cfg.Enabled {
 		return routeDecision{}, nil
 	}
@@ -437,7 +439,7 @@ func routeModel(cfg Config, format string, model string) (routeDecision, error) 
 	if err != nil {
 		return routeDecision{}, err
 	}
-	mapped, matched, err := applyRules(model, rules)
+	mapped, matched, err := applyRules(model, scope, rules)
 	if err != nil {
 		return routeDecision{}, err
 	}
@@ -495,7 +497,7 @@ func startExecutorStream(req executorRPCRequest, call hostCaller, closeStream fu
 }
 
 func runStreamForward(req executorRPCRequest, call hostCaller) error {
-	decision, err := routeModel(loadedConfig(), req.SourceFormat, req.Model)
+	decision, err := routeModel(loadedConfig(), req.SourceFormat, req.Model, callerScopeFromMetadata(req.Metadata))
 	if err != nil {
 		return fmt.Errorf("route stream: %w", err)
 	}
@@ -627,7 +629,7 @@ func handleExecutorExecute(raw []byte, call hostCaller) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
-	decision, err := routeModel(loadedConfig(), req.SourceFormat, req.Model)
+	decision, err := routeModel(loadedConfig(), req.SourceFormat, req.Model, callerScopeFromMetadata(req.Metadata))
 	if err != nil {
 		return nil, err
 	}
@@ -880,10 +882,30 @@ const (
 )
 
 type rule struct {
+	callerScope       string
 	patternTokens     []token
 	replacementTokens []token
 	captureCount      int
 	caseOperation     caseOperation
+}
+
+const (
+	callerScopeMetadataKey = "caller_scope"
+	callerScopeDomain      = "cli-proxy-api:caller-scope:v1\x00"
+)
+
+func callerScope(apiKey string) string {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(callerScopeDomain + apiKey))
+	return hex.EncodeToString(sum[:])
+}
+
+func callerScopeFromMetadata(metadata map[string]any) string {
+	scope, _ := metadata[callerScopeMetadataKey].(string)
+	return scope
 }
 
 func defaultConfig() Config {
@@ -906,19 +928,33 @@ func parseRules(raw string) ([]rule, error) {
 	}
 	out := make([]rule, 0, len(parts))
 	for _, part := range parts {
-		switch part {
+		scopeParts, err := splitEscaped(part, '#')
+		if err != nil || len(scopeParts) > 2 {
+			return nil, fmt.Errorf("invalid rule")
+		}
+		body := scopeParts[0]
+		scope := ""
+		if len(scopeParts) == 2 {
+			if scopeParts[0] == "" || strings.ContainsRune(scopeParts[0], '\\') {
+				return nil, fmt.Errorf("invalid API key scope")
+			}
+			scope = callerScope(scopeParts[0])
+			body = scopeParts[1]
+		}
+
+		switch body {
 		case `\a`:
-			out = append(out, rule{caseOperation: caseOperationLower})
+			out = append(out, rule{callerScope: scope, caseOperation: caseOperationLower})
 			continue
 		case `\A`:
-			out = append(out, rule{caseOperation: caseOperationUpper})
+			out = append(out, rule{callerScope: scope, caseOperation: caseOperationUpper})
 			continue
 		}
-		sep, ok := findRuleSeparator(part)
+		sep, ok := findRuleSeparator(body)
 		if !ok {
 			return nil, fmt.Errorf("invalid rule")
 		}
-		find, replace := part[:sep], part[sep+2:]
+		find, replace := body[:sep], body[sep+2:]
 		if find == "" || replace == "" {
 			return nil, fmt.Errorf("invalid rule")
 		}
@@ -930,7 +966,7 @@ func parseRules(raw string) ([]rule, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, rule{patternTokens: pt, replacementTokens: rt, captureCount: captures})
+		out = append(out, rule{callerScope: scope, patternTokens: pt, replacementTokens: rt, captureCount: captures})
 	}
 	return out, nil
 }
@@ -1008,7 +1044,7 @@ func parseFind(s string) ([]token, int, error) {
 			}
 			n := s[i+1]
 			switch n {
-			case '*', ';', '$', '\\':
+			case '*', ';', '$', '#', '\\':
 				lit.WriteByte(n)
 				i++
 			case '=':
@@ -1047,6 +1083,11 @@ func parseReplace(s string, captures int) ([]token, error) {
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if c == '\\' {
+			if i+1 < len(s) && s[i+1] == '#' {
+				lit.WriteByte('#')
+				i++
+				continue
+			}
 			if i+2 < len(s) && s[i+1] == '=' && s[i+2] == '>' {
 				lit.WriteString("=>")
 				i += 2
@@ -1097,10 +1138,13 @@ func applyASCIIModelCase(model string, operation caseOperation) string {
 	return string(converted)
 }
 
-func applyRules(model string, rules []rule) (string, bool, error) {
+func applyRules(model, scope string, rules []rule) (string, bool, error) {
 	current := model
 	matchedAny := false
 	for _, r := range rules {
+		if r.callerScope != "" && r.callerScope != scope {
+			continue
+		}
 		if r.caseOperation != caseOperationNone {
 			current = applyASCIIModelCase(current, r.caseOperation)
 			matchedAny = true

@@ -25,7 +25,9 @@ The plugin's own `enabled` field defaults to `true`. Empty rule fields mean the 
 
 ## Rule syntax
 
-Each ruleset is a `;`-separated ordered list of entries. An entry is either a `find=>replace` mapping or an exact standalone case operation: `\a` lowercases ASCII English letters and `\A` uppercases them. Whitespace and quotes are invalid inside the decoded rule value.
+Each ruleset is a `;`-separated ordered list of entries. Its grammar is `entry := [api-key#](\a|\A|find=>replace)`: an optional `api-key#` prefix scopes an entry to the authenticated inbound CPA client API key, not an upstream provider credential. Configured keys remain plaintext, so protect the plugin configuration. CPA exposes the authenticated `caller_scope` digest to the plugin; the plugin hashes configured plaintext keys using CPA's algorithm and compares digests. A mismatch skips only that entry and later entries continue. An unscoped entry is either a `find=>replace` mapping or an exact standalone case operation: `\a` lowercases ASCII English letters and `\A` uppercases them. Whitespace and quotes are invalid inside the decoded rule value.
+
+Scoped rules require CPA v7.2.145 or a later compatible runtime that publishes authenticated `caller_scope`; when metadata is missing, scoped entries skip and unscoped fallback can continue.
 
 - Mappings remain case-sensitive and apply to the complete current model name; later mappings see the value produced by every earlier entry.
 - `\a` changes only `A` through `Z` to `a` through `z`; `\A` changes only `a` through `z` to `A` through `Z`. Non-ASCII bytes, digits, punctuation, and separators are unchanged.
@@ -35,7 +37,7 @@ Each ruleset is a `;`-separated ordered list of entries. An entry is either a `f
 - Characters such as `@`, `/`, `[`, `]`, parentheses, dots, hyphens, and underscores are literal and need no escaping.
 - Entries are order-sensitive: the selected ruleset runs left to right exactly once, and later entries see the model produced by earlier entries.
 - Put more specific wildcard rules before broader fallback rules.
-- In `find`, `\` escapes `*`, `;`, `$`, `\`, or `=>`; escaping `$` is accepted but unnecessary. In `replace`, `\=>` is the only backslash escape. Literal `\`, `;`, and `$` cannot be written directly in a replacement, but captures can carry them into the output.
+- In `find`, `\` escapes `*`, `;`, `$`, `\`, `#`, or `=>`; escaping `$` is accepted but unnecessary. In `replace`, `\=>` and `\#` are backslash escapes. A literal model-name `#` in `find` or `replace` must be written as `\#`. Literal `\`, `;`, and `$` cannot be written directly in a replacement, but captures can carry them into the output.
 
 YAML may single-quote the whole rule value. The outer quotes are removed before rule parsing and preserve backslashes; quote characters inside the decoded value remain invalid:
 
@@ -115,12 +117,27 @@ Use YAML single quotes so the DSL backslashes are preserved:
 global_rules: '\a;gpt-*=>deepseek-V3;\A;DEEPSEEK-*=>gpt-5.5;\A'
 ```
 
+Authenticated API-key scope with an unscoped fallback, useful in `claude_messages_rules`:
+
+```yaml
+claude_messages_rules: 'sk-test#\a;sk-test#claude-haiku-*=>gpt-5.6-luna;claude-haiku-*=>gpt-5.6-sol'
+```
+
+Only the exact inbound client API key `sk-test` matches the scoped entries: `\a` lowercases the requested model and the scoped mapping selects `gpt-5.6-luna`. A different key or missing authenticated metadata skips the scoped entries; a lowercase `claude-haiku-*` then matches the unscoped fallback to `gpt-5.6-sol`. With a different key and an uppercase requested model, the scoped lowercase operation is skipped, so the case-sensitive fallback does not match.
+
 ## Common use cases
 
-- Use GPT or other upstream models from Claude-compatible clients, such as Claude Code, without changing the client-requested Claude model names.
-- Keep client configuration stable while moving execution to newer, cheaper, or provider-specific model names.
-- Expose compact or local aliases to clients, then strip the alias suffix before upstream execution.
-- Chain temporary migrations, for example routing an old provider model name through an intermediate alias before its final upstream model.
+### 1. Use another Upstream Model from Claude Code and similar clients without changing the Client-Requested Model
+
+Map a Client-Requested Model to an Upstream Model while keeping the client configuration unchanged.
+
+### 2. Use wildcard, e.g. `claude-*=>gpt-5.4-mini`, to map several requested models to one Upstream Model
+
+Use wildcard mappings when several Client-Requested Models should execute as one Upstream Model.
+
+### 3. Route one authenticated inbound client API key to an administrator-selected lower-cost model, with an unscoped fallback for other keys
+
+Add a scoped mapping for that inbound client API key before an unscoped mapping. The rewrite happens inside CPA and supported response model fields are restored to the Client-Requested Model. Other response fields, logs, and errors can still contain upstream model information. Actual cost depends on provider and model pricing.
 
 ## Build
 

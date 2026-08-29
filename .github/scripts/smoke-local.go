@@ -22,6 +22,7 @@ const (
 	defaultBaseURL = "https://a3.awsl.app/v1"
 	defaultPort    = 18080
 	localAPIKey    = "local-smoke-key"
+	fallbackAPIKey = "fallback-local-smoke-key"
 	wrongAPIKey    = "wrong-local-smoke-key"
 )
 
@@ -39,16 +40,19 @@ type smokeEnv struct {
 }
 
 type caseConfig struct {
-	name               string
-	pluginRules        string
-	requestModel       string
-	requestAPIKey      string
-	stream             bool
-	wantSuccess        bool
-	wantOriginalModel  string
-	forbidModel        string
-	allowStartFailure  bool
-	allowConfigFailure bool
+	name                string
+	pluginRules         string
+	requestFormat       string
+	rulesField          string
+	requestModel        string
+	requestAPIKey       string
+	stream              bool
+	wantSuccess         bool
+	wantFailureContains string
+	wantOriginalModel   string
+	forbidModel         string
+	allowStartFailure   bool
+	allowConfigFailure  bool
 }
 
 type openAIResponse struct {
@@ -115,12 +119,21 @@ func run() error {
 
 	cases := []caseConfig{
 		{name: "no-rules", requestModel: "client-visible-no-rules", requestAPIKey: localAPIKey, wantSuccess: true, forbidModel: "client-visible-no-rules"},
-		{name: "openai-dedicated-chain", requestModel: "deepseek-v4-pro", requestAPIKey: localAPIKey, pluginRules: "deepseek-v4-pro=>deepseek-v4-flash;deepseek-v4-flash=>gpt-5.4-mini", wantSuccess: true, wantOriginalModel: "deepseek-v4-pro", forbidModel: "gpt-5.4-mini"},
-		{name: "unmatched-model", requestModel: "client-visible-unmatched", requestAPIKey: localAPIKey, pluginRules: "deepseek-v4-pro=>gpt-5.4-mini", wantSuccess: true, forbidModel: "client-visible-unmatched"},
+		{name: "openai-dedicated-chain", requestModel: "deepseek-v4-pro", requestAPIKey: localAPIKey, pluginRules: "deepseek-v4-pro=>deepseek-v4-flash;deepseek-v4-flash=>gpt-5.6-luna", wantSuccess: true, wantOriginalModel: "deepseek-v4-pro", forbidModel: "gpt-5.6-luna"},
+		{name: "unmatched-model", requestModel: "client-visible-unmatched", requestAPIKey: localAPIKey, pluginRules: "deepseek-v4-pro=>gpt-5.6-luna", wantSuccess: true, forbidModel: "client-visible-unmatched"},
 		{name: "bad-rules", requestModel: "deepseek-v4-pro", requestAPIKey: localAPIKey, pluginRules: "bad rule", wantSuccess: false, allowStartFailure: true, allowConfigFailure: true},
-		{name: "nonexistent-upstream-model", requestModel: "deepseek-v4-pro", requestAPIKey: localAPIKey, pluginRules: "deepseek-v4-pro=>definitely-not-a-real-upstream-model", wantSuccess: false},
+		{name: "nonexistent-upstream-model", requestModel: "deepseek-v4-pro", requestAPIKey: localAPIKey, pluginRules: "deepseek-v4-pro=>definitely-not-a-real-upstream-model", wantSuccess: false, wantFailureContains: "definitely-not-a-real-upstream-model"},
 		{name: "wrong-api-key", requestModel: "deepseek-v4-flash", requestAPIKey: wrongAPIKey, wantSuccess: false},
-		{name: "streaming", requestModel: "deepseek-v4-pro", requestAPIKey: localAPIKey, pluginRules: "deepseek-v4-pro=>deepseek-v4-flash;deepseek-v4-flash=>gpt-5.4-mini", stream: true, wantSuccess: true, wantOriginalModel: "deepseek-v4-pro", forbidModel: "gpt-5.4-mini"},
+		{name: "global-rules-scoped-hit", requestFormat: "openai", rulesField: "global_rules", requestModel: "client-global-rules", requestAPIKey: localAPIKey, pluginRules: "local-smoke-key#client-global-rules=>definitely-not-a-real-upstream-model;client-global-rules=>deepseek-v4-flash", wantSuccess: false, wantFailureContains: "definitely-not-a-real-upstream-model"},
+		{name: "global-rules-fallback", requestFormat: "openai", rulesField: "global_rules", requestModel: "client-global-rules", requestAPIKey: fallbackAPIKey, pluginRules: "local-smoke-key#client-global-rules=>definitely-not-a-real-upstream-model;client-global-rules=>deepseek-v4-flash", wantSuccess: true, wantOriginalModel: "client-global-rules"},
+		{name: "openai-completions-rules-scoped-hit", requestFormat: "openai", rulesField: "openai_completions_rules", requestModel: "client-openai-completions-rules", requestAPIKey: localAPIKey, pluginRules: "local-smoke-key#client-openai-completions-rules=>definitely-not-a-real-upstream-model;client-openai-completions-rules=>deepseek-v4-flash", wantSuccess: false, wantFailureContains: "definitely-not-a-real-upstream-model"},
+		{name: "openai-completions-rules-fallback", requestFormat: "openai", rulesField: "openai_completions_rules", requestModel: "client-openai-completions-rules", requestAPIKey: fallbackAPIKey, pluginRules: "local-smoke-key#client-openai-completions-rules=>definitely-not-a-real-upstream-model;client-openai-completions-rules=>deepseek-v4-flash", wantSuccess: true, wantOriginalModel: "client-openai-completions-rules"},
+		{name: "claude-messages-rules-scoped-hit", requestFormat: "claude", rulesField: "claude_messages_rules", requestModel: "client-claude-messages-rules", requestAPIKey: localAPIKey, pluginRules: "local-smoke-key#client-claude-messages-rules=>definitely-not-a-real-upstream-model;client-claude-messages-rules=>deepseek-v4-flash", wantSuccess: false, wantFailureContains: "definitely-not-a-real-upstream-model"},
+		{name: "claude-messages-rules-fallback", requestFormat: "claude", rulesField: "claude_messages_rules", requestModel: "client-claude-messages-rules", requestAPIKey: fallbackAPIKey, pluginRules: "local-smoke-key#client-claude-messages-rules=>definitely-not-a-real-upstream-model;client-claude-messages-rules=>deepseek-v4-flash", wantSuccess: true, wantOriginalModel: "client-claude-messages-rules"},
+		{name: "codex-responses-rules-scoped-hit", requestFormat: "openai-response", rulesField: "codex_responses_rules", requestModel: "client-codex-responses-rules", requestAPIKey: localAPIKey, pluginRules: "local-smoke-key#client-codex-responses-rules=>definitely-not-a-real-upstream-model;client-codex-responses-rules=>deepseek-v4-flash", wantSuccess: false, wantFailureContains: "definitely-not-a-real-upstream-model"},
+		{name: "codex-responses-rules-fallback", requestFormat: "openai-response", rulesField: "codex_responses_rules", requestModel: "client-codex-responses-rules", requestAPIKey: fallbackAPIKey, pluginRules: "local-smoke-key#client-codex-responses-rules=>definitely-not-a-real-upstream-model;client-codex-responses-rules=>deepseek-v4-flash", wantSuccess: true, wantOriginalModel: "client-codex-responses-rules"},
+		{name: "literal-hash", requestModel: "client#hash", requestAPIKey: localAPIKey, pluginRules: "client\\#hash=>deepseek-v4-flash", wantSuccess: true, wantOriginalModel: "client#hash"},
+		{name: "streaming", requestModel: "deepseek-v4-pro", requestAPIKey: localAPIKey, pluginRules: "local-smoke-key#deepseek-v4-pro=>deepseek-v4-flash;local-smoke-key#deepseek-v4-flash=>gpt-5.6-luna", stream: true, wantSuccess: true, wantOriginalModel: "deepseek-v4-pro", forbidModel: "gpt-5.6-luna"},
 	}
 	for _, tc := range cases {
 		if err := runCase(env, tc); err != nil {
@@ -145,7 +158,7 @@ func prepareDirs(env smokeEnv) error {
 }
 
 func runCase(env smokeEnv, tc caseConfig) error {
-	if err := os.WriteFile(env.config, []byte(buildConfig(env, tc.pluginRules)), 0o600); err != nil {
+	if err := os.WriteFile(env.config, []byte(buildConfig(env, tc)), 0o600); err != nil {
 		return fmt.Errorf("write config: %w", err)
 	}
 	proc, err := startCPA(env)
@@ -165,7 +178,7 @@ func runCase(env smokeEnv, tc caseConfig) error {
 	return runJSONCase(env.port, tc)
 }
 
-func buildConfig(env smokeEnv, pluginRules string) string {
+func buildConfig(env smokeEnv, tc caseConfig) string {
 	var b strings.Builder
 	// ponytail: upstream/CLIProxyAPI config.example.yaml is read from the module cache, so keep this generator to the fields this smoke needs.
 	fmt.Fprintf(&b, "host: 127.0.0.1\n")
@@ -173,6 +186,7 @@ func buildConfig(env smokeEnv, pluginRules string) string {
 	b.WriteString("auth-dir: ./tmp/auth\n")
 	b.WriteString("api-keys:\n")
 	fmt.Fprintf(&b, "  - %q\n", localAPIKey)
+	fmt.Fprintf(&b, "  - %q\n", fallbackAPIKey)
 	b.WriteString("debug: false\n")
 	b.WriteString("usage-statistics-enabled: false\n")
 	b.WriteString("openai-compatibility:\n")
@@ -187,8 +201,8 @@ func buildConfig(env smokeEnv, pluginRules string) string {
 	b.WriteString("        alias: client-visible-no-rules\n")
 	b.WriteString("      - name: deepseek-v4-flash\n")
 	b.WriteString("        alias: client-visible-unmatched\n")
-	b.WriteString("      - name: gpt-5.4-mini\n")
-	b.WriteString("        alias: gpt-5.4-mini\n")
+	b.WriteString("      - name: gpt-5.6-luna\n")
+	b.WriteString("        alias: gpt-5.6-luna\n")
 	b.WriteString("plugins:\n")
 	b.WriteString("  enabled: true\n")
 	b.WriteString("  dir: ./plugins\n")
@@ -196,10 +210,17 @@ func buildConfig(env smokeEnv, pluginRules string) string {
 	b.WriteString("    model-mapper:\n")
 	b.WriteString("      enabled: true\n")
 	b.WriteString("      priority: 1\n")
-	fmt.Fprintf(&b, "      global_rules: %q\n", "")
-	fmt.Fprintf(&b, "      claude_messages_rules: %q\n", "")
-	fmt.Fprintf(&b, "      codex_responses_rules: %q\n", "")
-	fmt.Fprintf(&b, "      openai_completions_rules: %q\n", pluginRules)
+	rulesField := tc.rulesField
+	if rulesField == "" {
+		rulesField = "openai_completions_rules"
+	}
+	for _, field := range []string{"global_rules", "claude_messages_rules", "codex_responses_rules", "openai_completions_rules"} {
+		rules := ""
+		if field == rulesField {
+			rules = tc.pluginRules
+		}
+		fmt.Fprintf(&b, "      %s: '%s'\n", field, rules)
+	}
 	return b.String()
 }
 
@@ -300,9 +321,15 @@ func getModels(port int, apiKey string) (int, []byte, error) {
 }
 
 func runJSONCase(port int, tc caseConfig) error {
-	status, body, err := sendChatRequest(port, tc.requestModel, tc.requestAPIKey, false)
+	status, body, err := sendRequest(port, tc.requestFormat, tc.requestModel, tc.requestAPIKey, false)
 	if err != nil {
 		return err
+	}
+	if tc.wantFailureContains != "" {
+		if status/100 == 2 || !bytes.Contains(body, []byte(tc.wantFailureContains)) {
+			return fmt.Errorf("want non-2xx response containing %q, got status=%d body=%s", tc.wantFailureContains, status, body)
+		}
+		return nil
 	}
 	var parsed openAIResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
@@ -311,8 +338,9 @@ func runJSONCase(port int, tc caseConfig) error {
 		}
 		return fmt.Errorf("decode response: %w", err)
 	}
+	hasError := len(parsed.Error) != 0 && !bytes.Equal(bytes.TrimSpace(parsed.Error), []byte("null"))
 	if tc.wantSuccess {
-		if status/100 != 2 || len(parsed.Error) != 0 {
+		if status/100 != 2 || hasError {
 			return fmt.Errorf("want success, got status=%d body=%s", status, body)
 		}
 		if tc.wantOriginalModel != "" && parsed.Model != tc.wantOriginalModel {
@@ -323,7 +351,7 @@ func runJSONCase(port int, tc caseConfig) error {
 		}
 		return nil
 	}
-	if status/100 != 2 || len(parsed.Error) != 0 {
+	if status/100 != 2 || hasError {
 		if tc.forbidModel != "" && parsed.Model == tc.forbidModel {
 			return fmt.Errorf("forbid top-level model %q in failure body=%s", tc.forbidModel, body)
 		}
@@ -336,7 +364,7 @@ func runJSONCase(port int, tc caseConfig) error {
 }
 
 func runStreamCase(port int, tc caseConfig) error {
-	status, body, err := sendChatRequest(port, tc.requestModel, tc.requestAPIKey, true)
+	status, body, err := sendRequest(port, tc.requestFormat, tc.requestModel, tc.requestAPIKey, true)
 	if err != nil {
 		return err
 	}
@@ -379,11 +407,36 @@ func runStreamCase(port int, tc caseConfig) error {
 	return nil
 }
 
-func sendChatRequest(port int, model string, apiKey string, stream bool) (int, []byte, error) {
-	payload := map[string]any{
-		"model":    model,
-		"messages": []map[string]string{{"role": "user", "content": "say ok"}},
-		"stream":   stream,
+func sendRequest(port int, requestFormat string, model string, apiKey string, stream bool) (int, []byte, error) {
+	var endpoint string
+	var payload any
+	useAnthropicAPIKey := false
+	switch requestFormat {
+	case "", "openai":
+		endpoint = "/v1/chat/completions"
+		payload = map[string]any{
+			"model":    model,
+			"messages": []map[string]string{{"role": "user", "content": "say ok"}},
+			"stream":   stream,
+		}
+	case "claude":
+		endpoint = "/v1/messages"
+		payload = map[string]any{
+			"model":      model,
+			"max_tokens": 16,
+			"messages":   []map[string]string{{"role": "user", "content": "say ok"}},
+			"stream":     false,
+		}
+		useAnthropicAPIKey = true
+	case "openai-response":
+		endpoint = "/v1/responses"
+		payload = map[string]any{
+			"model":  model,
+			"input":  "say ok",
+			"stream": false,
+		}
+	default:
+		return 0, nil, fmt.Errorf("unsupported request format %q", requestFormat)
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -391,13 +444,18 @@ func sendChatRequest(port int, model string, apiKey string, stream bool) (int, [
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	url := fmt.Sprintf("http://127.0.0.1:%d/v1/chat/completions", port)
+	url := fmt.Sprintf("http://127.0.0.1:%d%s", port, endpoint)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		return 0, nil, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
+	if useAnthropicAPIKey {
+		req.Header.Set("X-Api-Key", apiKey)
+		req.Header.Set("Anthropic-Version", "2023-06-01")
+	} else {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return 0, nil, fmt.Errorf("send request: %w", err)

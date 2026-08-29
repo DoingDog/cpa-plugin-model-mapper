@@ -133,6 +133,19 @@ func TestDefaultConfigEnabledTrue(t *testing.T) {
 	}
 }
 
+func TestCallerScopeMatchesCPA(t *testing.T) {
+	const want = "c512aa71887f77cd6b915a60aed04e1d0de0ed0721f041e51d1002402b3901db"
+	if got := callerScope("sk-test"); got != want {
+		t.Fatalf("callerScope(sk-test)=%q, want %q", got, want)
+	}
+	if got := callerScope("  sk-test  "); got != want {
+		t.Fatalf("trimmed caller scope=%q, want %q", got, want)
+	}
+	if got := callerScope("   "); got != "" {
+		t.Fatalf("blank caller scope=%q, want empty", got)
+	}
+}
+
 func TestParseRulesAcceptsValidRules(t *testing.T) {
 	tests := []string{
 		"a=>b",
@@ -176,6 +189,29 @@ func TestParseRulesAcceptsCaseOperations(t *testing.T) {
 	}
 }
 
+func TestParseRulesAcceptsAPIKeyScopesAndEscapedHash(t *testing.T) {
+	rules := mustParseRules(t, `sk-test#\a;sk-test#vendor\#model=>mapped\#name;plain\#model=>plain`)
+	if len(rules) != 3 {
+		t.Fatalf("len(rules)=%d, want 3", len(rules))
+	}
+	if rules[0].callerScope != callerScope("sk-test") || rules[0].caseOperation != caseOperationLower {
+		t.Fatalf("scoped operation=%#v", rules[0])
+	}
+	if rules[1].callerScope != callerScope("sk-test") || rules[2].callerScope != "" {
+		t.Fatalf("scopes=%q %q", rules[1].callerScope, rules[2].callerScope)
+	}
+	mapped, matched, err := applyRules("vendor#model", callerScope("sk-test"), rules[1:2])
+	if err != nil {
+		t.Fatalf("apply scoped escaped-hash rule: %v", err)
+	}
+	if !matched {
+		t.Fatal("scoped escaped-hash rule did not match")
+	}
+	if mapped != "mapped#name" {
+		t.Fatalf("mapped=%q, want mapped#name", mapped)
+	}
+}
+
 func TestParseRulesRejectsInvalidRules(t *testing.T) {
 	tests := []string{
 		"",
@@ -204,6 +240,10 @@ func TestParseRulesRejectsInvalidRules(t *testing.T) {
 		`\A=>x`,
 		`x=>\a`,
 		`x=>\A`,
+		`#a=>b`,
+		`sk-test#`,
+		`sk-test#a=>b#c`,
+		`sk\-test#a=>b`,
 	}
 	for _, raw := range tests {
 		t.Run(raw, func(t *testing.T) {
@@ -223,9 +263,30 @@ func mustParseRules(t *testing.T, raw string) []rule {
 	return rules
 }
 
+func TestApplyRulesAPIKeyScopeExactAndFallsThrough(t *testing.T) {
+	rules := mustParseRules(t, `sk-test#\a;sk-test#claude-haiku-*=>gpt-5.6-luna;claude-haiku-*=>gpt-5.6-sol`)
+	tests := []struct {
+		name, key, model, want string
+		matched                bool
+	}{
+		{name: "exact key runs scoped operation and mapping", key: "sk-test", model: "CLAUDE-HAIKU-X", want: "gpt-5.6-luna", matched: true},
+		{name: "different key skips scoped entries and uses fallback", key: "sk-other", model: "claude-haiku-X", want: "gpt-5.6-sol", matched: true},
+		{name: "missing key skips scoped entries and uses fallback", model: "claude-haiku-X", want: "gpt-5.6-sol", matched: true},
+		{name: "key comparison is case sensitive", key: "SK-TEST", model: "CLAUDE-HAIKU-X", want: "CLAUDE-HAIKU-X", matched: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, matched, err := applyRules(tt.model, callerScope(tt.key), rules)
+			if err != nil || got != tt.want || matched != tt.matched {
+				t.Fatalf("applyRules=(%q,%v,%v), want (%q,%v,nil)", got, matched, err, tt.want, tt.matched)
+			}
+		})
+	}
+}
+
 func TestApplyRulesFullChain(t *testing.T) {
 	rules := mustParseRules(t, "deepseek-v4-pro=>deepseek-v4-flash;deepseek-v4-flash=>claude-v4-flash")
-	mapped, matched, err := applyRules("deepseek-v4-pro", rules)
+	mapped, matched, err := applyRules("deepseek-v4-pro", "", rules)
 	if err != nil {
 		t.Fatalf("applyRules error = %v", err)
 	}
@@ -236,7 +297,7 @@ func TestApplyRulesFullChain(t *testing.T) {
 
 func TestApplyRulesWildcardCapture(t *testing.T) {
 	rules := mustParseRules(t, "claude-*=>upstream-$1")
-	mapped, matched, err := applyRules("claude-sonnet", rules)
+	mapped, matched, err := applyRules("claude-sonnet", "", rules)
 	if err != nil {
 		t.Fatalf("applyRules error = %v", err)
 	}
@@ -254,6 +315,8 @@ func TestApplyRulesCharacterSemantics(t *testing.T) {
 		wantMatched bool
 	}{
 		{name: "ordinary punctuation", raw: `@cf/zai-org/gpt-5.4(medium)[1M]=>mapped`, model: `@cf/zai-org/gpt-5.4(medium)[1M]`, want: "mapped", wantMatched: true},
+		{name: "escaped find hash is literal", raw: `vendor\#model=>mapped`, model: `vendor#model`, want: "mapped", wantMatched: true},
+		{name: "escaped replacement hash is literal", raw: `source=>mapped\#name`, model: "source", want: "mapped#name", wantMatched: true},
 		{name: "case sensitive", raw: `@cf/zai-org/gpt-5.4(medium)[1M]=>mapped`, model: `@cf/zai-org/gpt-5.4(medium)[1m]`, want: `@cf/zai-org/gpt-5.4(medium)[1m]`},
 		{name: "requires matching prefix", raw: `gpt-5.5=>mapped`, model: `openai/gpt-5.5`, want: `openai/gpt-5.5`},
 		{name: "requires matching suffix", raw: `gpt-5.5=>mapped`, model: `gpt-5.5(high)`, want: `gpt-5.5(high)`},
@@ -285,7 +348,7 @@ func TestApplyRulesCharacterSemantics(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mapped, matched, err := applyRules(tt.model, mustParseRules(t, tt.raw))
+			mapped, matched, err := applyRules(tt.model, "", mustParseRules(t, tt.raw))
 			if err != nil {
 				t.Fatalf("applyRules error = %v", err)
 			}
@@ -299,7 +362,7 @@ func TestApplyRulesCharacterSemantics(t *testing.T) {
 func TestApplyRulesCaseOperationRejectsEmptyModel(t *testing.T) {
 	for _, raw := range []string{`\a`, `\A`} {
 		t.Run(raw, func(t *testing.T) {
-			mapped, matched, err := applyRules("", mustParseRules(t, raw))
+			mapped, matched, err := applyRules("", "", mustParseRules(t, raw))
 			if err == nil || err.Error() != "empty mapped model" {
 				t.Fatalf("mapped=%q matched=%v err=%v, want empty mapped model", mapped, matched, err)
 			}
@@ -312,7 +375,7 @@ func TestApplyRulesCaseOperationRejectsEmptyModel(t *testing.T) {
 
 func TestApplyRulesUnmatched(t *testing.T) {
 	rules := mustParseRules(t, "a=>b")
-	mapped, matched, err := applyRules("z", rules)
+	mapped, matched, err := applyRules("z", "", rules)
 	if err != nil {
 		t.Fatalf("applyRules error = %v", err)
 	}
@@ -323,7 +386,7 @@ func TestApplyRulesUnmatched(t *testing.T) {
 
 func TestApplyRulesUnchangedStillMatched(t *testing.T) {
 	rules := mustParseRules(t, "a=>a")
-	mapped, matched, err := applyRules("a", rules)
+	mapped, matched, err := applyRules("a", "", rules)
 	if err != nil {
 		t.Fatalf("applyRules error = %v", err)
 	}
@@ -334,7 +397,7 @@ func TestApplyRulesUnchangedStillMatched(t *testing.T) {
 
 func TestApplyRulesSinglePassNoLoop(t *testing.T) {
 	rules := mustParseRules(t, "a=>b;b=>a")
-	mapped, matched, err := applyRules("a", rules)
+	mapped, matched, err := applyRules("a", "", rules)
 	if err != nil {
 		t.Fatalf("applyRules error = %v", err)
 	}
@@ -374,6 +437,41 @@ func TestSelectRulesBothEmptySkips(t *testing.T) {
 	}
 }
 
+func TestRouteModelAPIKeyScopeAcrossRuleSets(t *testing.T) {
+	const rules = "sk-test#client-model=>scoped-target;client-model=>fallback-target"
+	tests := []struct {
+		name   string
+		cfg    Config
+		format string
+	}{
+		{name: "global rules plus openai", cfg: Config{Enabled: true, GlobalRules: rules}, format: "openai"},
+		{name: "claude messages rules plus claude", cfg: Config{Enabled: true, ClaudeMessagesRules: rules}, format: "claude"},
+		{name: "codex responses rules plus openai response", cfg: Config{Enabled: true, CodexResponsesRules: rules}, format: "openai-response"},
+		{name: "openai completions rules plus openai", cfg: Config{Enabled: true, OpenAICompletionsRules: rules}, format: "openai"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, scopeTest := range []struct {
+				name, scope, want string
+			}{
+				{name: "exact scope", scope: callerScope("sk-test"), want: "scoped-target"},
+				{name: "wrong scope", scope: callerScope("sk-other"), want: "fallback-target"},
+				{name: "missing scope", want: "fallback-target"},
+			} {
+				t.Run(scopeTest.name, func(t *testing.T) {
+					decision, err := routeModel(tt.cfg, tt.format, "client-model", scopeTest.scope)
+					if err != nil {
+						t.Fatalf("routeModel error = %v", err)
+					}
+					if !decision.Handled || decision.OriginalModel != "client-model" || decision.UpstreamModel != scopeTest.want {
+						t.Fatalf("decision=%#v, want client-model=>%q", decision, scopeTest.want)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestRouteModelSkipsDisabledNoRulesUnmatchedAndUnchanged(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -388,7 +486,7 @@ func TestRouteModelSkipsDisabledNoRulesUnmatchedAndUnchanged(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			decision, err := routeModel(tt.cfg, tt.format, tt.model)
+			decision, err := routeModel(tt.cfg, tt.format, tt.model, "")
 			if err != nil {
 				t.Fatalf("routeModel error = %v", err)
 			}
@@ -401,7 +499,7 @@ func TestRouteModelSkipsDisabledNoRulesUnmatchedAndUnchanged(t *testing.T) {
 
 func TestRouteModelHandlesOnlyMatchedChanged(t *testing.T) {
 	cfg := Config{Enabled: true, OpenAICompletionsRules: "deepseek-v4-pro=>deepseek-v4-flash;deepseek-v4-flash=>gpt-5.4-mini", GlobalRules: "deepseek-v4-pro=>wrong"}
-	decision, err := routeModel(cfg, "openai", "deepseek-v4-pro")
+	decision, err := routeModel(cfg, "openai", "deepseek-v4-pro", "")
 	if err != nil {
 		t.Fatalf("routeModel error = %v", err)
 	}
@@ -412,7 +510,7 @@ func TestRouteModelHandlesOnlyMatchedChanged(t *testing.T) {
 
 func TestRouteModelCaseOperationChanged(t *testing.T) {
 	cfg := Config{Enabled: true, GlobalRules: `\A`}
-	decision, err := routeModel(cfg, "openai", "model-v2")
+	decision, err := routeModel(cfg, "openai", "model-v2", "")
 	if err != nil {
 		t.Fatalf("routeModel error = %v", err)
 	}
@@ -433,7 +531,7 @@ func TestRouteModelCaseOperationNoChangeIsUnhandled(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			decision, err := routeModel(Config{Enabled: true, GlobalRules: tt.rules}, "openai", tt.model)
+			decision, err := routeModel(Config{Enabled: true, GlobalRules: tt.rules}, "openai", tt.model, "")
 			if err != nil {
 				t.Fatalf("routeModel error = %v", err)
 			}
@@ -446,7 +544,7 @@ func TestRouteModelCaseOperationNoChangeIsUnhandled(t *testing.T) {
 
 func TestRouteModelBadSelectedRulesErrors(t *testing.T) {
 	cfg := Config{Enabled: true, ClaudeMessagesRules: "bad rule"}
-	if _, err := routeModel(cfg, "claude", "a"); err == nil {
+	if _, err := routeModel(cfg, "claude", "a", ""); err == nil {
 		t.Fatalf("routeModel bad selected rules error = nil")
 	}
 }
@@ -489,6 +587,43 @@ func TestHandleModelRouteHandledSelfForChangedModel(t *testing.T) {
 	}
 	if resp.TargetModel != "" {
 		t.Fatalf("self route TargetModel=%q, want empty because SDK only defines it for provider routes", resp.TargetModel)
+	}
+}
+
+func TestHandleModelRouteUsesCallerScope(t *testing.T) {
+	scopedRules := "sk-test#a=>b"
+	tests := []struct {
+		name     string
+		rules    string
+		metadata map[string]any
+		handled  bool
+	}{
+		{name: "matching scope", rules: scopedRules, metadata: map[string]any{"caller_scope": callerScope("sk-test")}, handled: true},
+		{name: "missing metadata", rules: scopedRules, handled: false},
+		{name: "wrong scope", rules: scopedRules, metadata: map[string]any{"caller_scope": callerScope("sk-other")}, handled: false},
+		{name: "non-string scope", rules: scopedRules, metadata: map[string]any{"caller_scope": 1}, handled: false},
+		{name: "fallback for missing metadata", rules: scopedRules + ";a=>c", handled: true},
+		{name: "fallback for wrong scope", rules: scopedRules + ";a=>c", metadata: map[string]any{"caller_scope": callerScope("sk-other")}, handled: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setLoadedConfigForTest(Config{Enabled: true, GlobalRules: tt.rules})
+			raw, err := json.Marshal(pluginapi.ModelRouteRequest{SourceFormat: "openai", RequestedModel: "a", Metadata: tt.metadata})
+			if err != nil {
+				t.Fatalf("marshal request: %v", err)
+			}
+			respRaw, err := handleModelRoute(raw)
+			if err != nil {
+				t.Fatalf("handleModelRoute error = %v", err)
+			}
+			var resp pluginapi.ModelRouteResponse
+			if err := json.Unmarshal(respRaw, &resp); err != nil {
+				t.Fatalf("decode route response: %v", err)
+			}
+			if resp.Handled != tt.handled {
+				t.Fatalf("Handled=%v, want %v", resp.Handled, tt.handled)
+			}
+		})
 	}
 }
 
@@ -772,6 +907,83 @@ func TestHandleExecutorExecuteForwardsMappedRequestAndRestoresResponse(t *testin
 	}
 }
 
+func TestHandleExecutorExecuteUsesCallerScopeAcrossRuleSets(t *testing.T) {
+	const rules = "sk-test#client-model=>scoped-target;client-model=>fallback-target"
+	tests := []struct {
+		name   string
+		cfg    Config
+		format string
+	}{
+		{name: "global rules", cfg: Config{Enabled: true, GlobalRules: rules}, format: "openai"},
+		{name: "openai completions rules", cfg: Config{Enabled: true, OpenAICompletionsRules: rules}, format: "openai"},
+		{name: "claude messages rules", cfg: Config{Enabled: true, ClaudeMessagesRules: rules}, format: "claude"},
+		{name: "codex responses rules", cfg: Config{Enabled: true, CodexResponsesRules: rules}, format: "openai-response"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, scopeTest := range []struct {
+				name     string
+				metadata map[string]any
+				upstream string
+			}{
+				{name: "matching scope", metadata: map[string]any{"caller_scope": callerScope("sk-test")}, upstream: "scoped-target"},
+				{name: "wrong scope", metadata: map[string]any{"caller_scope": callerScope("sk-other")}, upstream: "fallback-target"},
+			} {
+				t.Run(scopeTest.name, func(t *testing.T) {
+					setLoadedConfigForTest(tt.cfg)
+					req := rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+						Model:           "client-model",
+						Format:          tt.format,
+						SourceFormat:    tt.format,
+						Metadata:        scopeTest.metadata,
+						OriginalRequest: []byte(`{"model":"client-model"}`),
+					}}
+					rawReq, err := json.Marshal(req)
+					if err != nil {
+						t.Fatalf("marshal request: %v", err)
+					}
+					var captured hostModelExecutionRequest
+					respRaw, err := handleExecutorExecute(rawReq, func(method string, payload any) (json.RawMessage, error) {
+						if method != pluginabi.MethodHostModelExecute {
+							t.Fatalf("method=%q, want %q", method, pluginabi.MethodHostModelExecute)
+						}
+						raw, err := json.Marshal(payload)
+						if err != nil {
+							t.Fatalf("marshal host payload: %v", err)
+						}
+						if err := json.Unmarshal(raw, &captured); err != nil {
+							t.Fatalf("decode host payload: %v", err)
+						}
+						return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: 200, Body: []byte(`{"model":"` + scopeTest.upstream + `"}`)})
+					})
+					if err != nil {
+						t.Fatalf("handleExecutorExecute error = %v", err)
+					}
+					if captured.Model != scopeTest.upstream {
+						t.Fatalf("HostModelExecutionRequest.Model=%q, want %q", captured.Model, scopeTest.upstream)
+					}
+					var body struct {
+						Model string `json:"model"`
+					}
+					if err := json.Unmarshal(captured.Body, &body); err != nil {
+						t.Fatalf("unmarshal forwarded body: %v", err)
+					}
+					if body.Model != scopeTest.upstream {
+						t.Fatalf("forwarded body model=%q, want %q", body.Model, scopeTest.upstream)
+					}
+					var resp pluginapi.ExecutorResponse
+					if err := json.Unmarshal(respRaw, &resp); err != nil {
+						t.Fatalf("decode executor response: %v", err)
+					}
+					if !strings.Contains(string(resp.Payload), `"model":"client-model"`) {
+						t.Fatalf("response payload=%s", resp.Payload)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestHandleExecutorExecuteRestoresKnownResponseModelFields(t *testing.T) {
 	setLoadedConfigForTest(Config{Enabled: true, ClaudeMessagesRules: "claude-*=>gpt-5.5"})
 	req := rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{Model: "claude-opus-4", Format: "claude", SourceFormat: "claude", OriginalRequest: []byte(`{"model":"claude-opus-4"}`)}, HostCallbackID: "callback-1"}
@@ -836,6 +1048,106 @@ func TestHandleExecutorExecuteReturnsErrorForHostHTTPStatus(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "404") || !strings.Contains(err.Error(), "model not found") {
 		t.Fatalf("error=%v, want status and body in error", err)
+	}
+}
+
+func TestHandleExecutorExecuteStreamUsesCallerScope(t *testing.T) {
+	setLoadedConfigForTest(Config{Enabled: true, GlobalRules: "sk-test#client-model=>scoped-target"})
+	req := executorRPCRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "client-model",
+			Format:          "openai",
+			SourceFormat:    "openai",
+			Stream:          true,
+			OriginalRequest: []byte(`{"model":"client-model","stream":true}`),
+			Metadata:        map[string]any{"caller_scope": callerScope("sk-test")},
+		},
+		HostCallbackID: "callback-1",
+		StreamID:       "plugin-stream-caller-scope-1",
+	}
+	reads := []pluginapi.HostModelStreamReadResponse{
+		{Payload: []byte("data: {\"model\":\"scoped-target\"}\n\n")},
+		{Payload: []byte("data: [DONE]\n\n")},
+		{Done: true},
+	}
+	var forwarded pluginapi.HostModelExecutionRequest
+	emitted, closedHost, closedPlugin, _, err := runExecutorStreamTestWithForwarded(rpcExecutorRequest(req), reads, &forwarded)
+	if err != nil {
+		t.Fatalf("handleExecutorExecuteStream error = %v", err)
+	}
+	if forwarded.Model != "scoped-target" {
+		t.Fatalf("forwarded model=%q, want scoped-target", forwarded.Model)
+	}
+	var body struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(forwarded.Body, &body); err != nil {
+		t.Fatalf("unmarshal forwarded body: %v", err)
+	}
+	if body.Model != "scoped-target" {
+		t.Fatalf("forwarded body model=%q, want scoped-target", body.Model)
+	}
+	joined := strings.Join(emitted, "")
+	if !strings.Contains(joined, `"model":"client-model"`) || strings.Contains(joined, `"model":"scoped-target"`) || !strings.Contains(joined, "data: [DONE]") {
+		t.Fatalf("emitted=%q", joined)
+	}
+	if !closedHost || !closedPlugin {
+		t.Fatalf("closedHost=%v closedPlugin=%v", closedHost, closedPlugin)
+	}
+}
+
+func TestHandleExecutorExecuteStreamFallsBackForWrongOrMissingCallerScope(t *testing.T) {
+	setLoadedConfigForTest(Config{Enabled: true, GlobalRules: "sk-test#client-model=>scoped-target;client-model=>fallback-target"})
+	for _, scopeTest := range []struct {
+		name     string
+		metadata map[string]any
+	}{
+		{name: "wrong scope", metadata: map[string]any{"caller_scope": callerScope("other-key")}},
+		{name: "missing scope"},
+	} {
+		t.Run(scopeTest.name, func(t *testing.T) {
+			req := executorRPCRequest{
+				ExecutorRequest: pluginapi.ExecutorRequest{
+					Model:           "client-model",
+					Format:          "openai",
+					SourceFormat:    "openai",
+					Stream:          true,
+					OriginalRequest: []byte(`{"model":"client-model","stream":true}`),
+					Metadata:        scopeTest.metadata,
+				},
+				HostCallbackID: "callback-1",
+				StreamID:       "plugin-stream-caller-scope-fallback",
+			}
+			reads := []pluginapi.HostModelStreamReadResponse{
+				{Payload: []byte("data: {\"model\":\"fallback-target\"}\n\n")},
+				{Payload: []byte("data: [DONE]\n\n")},
+				{Done: true},
+			}
+			var forwarded pluginapi.HostModelExecutionRequest
+			emitted, closedHost, closedPlugin, _, err := runExecutorStreamTestWithForwarded(rpcExecutorRequest(req), reads, &forwarded)
+			if err != nil {
+				t.Fatalf("handleExecutorExecuteStream error = %v", err)
+			}
+			if forwarded.Model != "fallback-target" {
+				t.Fatalf("forwarded model=%q, want fallback-target", forwarded.Model)
+			}
+			var body struct {
+				Model string `json:"model"`
+			}
+			if err := json.Unmarshal(forwarded.Body, &body); err != nil {
+				t.Fatalf("unmarshal forwarded body: %v", err)
+			}
+			if body.Model != "fallback-target" {
+				t.Fatalf("forwarded body model=%q, want fallback-target", body.Model)
+			}
+			joined := strings.Join(emitted, "")
+			if !strings.Contains(joined, `"model":"client-model"`) || strings.Contains(joined, "fallback-target") || strings.Contains(joined, "scoped-target") || !strings.Contains(joined, "data: [DONE]") {
+				t.Fatalf("emitted=%q", joined)
+			}
+			if !closedHost || !closedPlugin {
+				t.Fatalf("closedHost=%v closedPlugin=%v", closedHost, closedPlugin)
+			}
+		})
 	}
 }
 
@@ -1207,10 +1519,18 @@ func TestHandleExecutorExecuteStreamClosesPluginOnChunkErrorAfterPendingPrefix(t
 }
 
 func runExecutorStreamTest(req rpcExecutorRequest, reads []pluginapi.HostModelStreamReadResponse) ([]string, bool, bool, []byte, error) {
-	return runExecutorStreamTestWithHostContentType(req, reads, "text/event-stream")
+	return runExecutorStreamTestWithHostContentTypeAndForwarded(req, reads, "text/event-stream", nil)
+}
+
+func runExecutorStreamTestWithForwarded(req rpcExecutorRequest, reads []pluginapi.HostModelStreamReadResponse, forwarded *pluginapi.HostModelExecutionRequest) ([]string, bool, bool, []byte, error) {
+	return runExecutorStreamTestWithHostContentTypeAndForwarded(req, reads, "text/event-stream", forwarded)
 }
 
 func runExecutorStreamTestWithHostContentType(req rpcExecutorRequest, reads []pluginapi.HostModelStreamReadResponse, contentType string) ([]string, bool, bool, []byte, error) {
+	return runExecutorStreamTestWithHostContentTypeAndForwarded(req, reads, contentType, nil)
+}
+
+func runExecutorStreamTestWithHostContentTypeAndForwarded(req rpcExecutorRequest, reads []pluginapi.HostModelStreamReadResponse, contentType string, forwarded *pluginapi.HostModelExecutionRequest) ([]string, bool, bool, []byte, error) {
 	var emitted []string
 	closedHost := false
 	closedPlugin := false
@@ -1218,6 +1538,15 @@ func runExecutorStreamTestWithHostContentType(req rpcExecutorRequest, reads []pl
 	fakeHost := func(method string, payload any) (json.RawMessage, error) {
 		switch method {
 		case pluginabi.MethodHostModelExecuteStream:
+			if forwarded != nil {
+				raw, err := json.Marshal(payload)
+				if err != nil {
+					return nil, err
+				}
+				if err := json.Unmarshal(raw, forwarded); err != nil {
+					return nil, err
+				}
+			}
 			return json.Marshal(pluginapi.HostModelStreamResponse{StatusCode: 200, Headers: http.Header{"Content-Type": []string{contentType}}, StreamID: "host-stream-1"})
 		case pluginabi.MethodHostModelStreamRead:
 			if len(reads) == 0 {
@@ -1310,7 +1639,7 @@ func TestHandleMethodDispatchesRegisterReconfigureAndUnknown(t *testing.T) {
 	if !env.OK || len(env.Result) == 0 {
 		t.Fatalf("reconfigure envelope=%#v", env)
 	}
-	decision, err := routeModel(loadedConfig(), "openai", "a")
+	decision, err := routeModel(loadedConfig(), "openai", "a", "")
 	if err != nil {
 		t.Fatalf("route after reconfigure: %v", err)
 	}
