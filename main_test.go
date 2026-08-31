@@ -146,6 +146,33 @@ func TestCallerScopeMatchesCPA(t *testing.T) {
 	}
 }
 
+func TestCallerAPIKeyUsesOnlyAuthenticatedCredential(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers http.Header
+		query   url.Values
+		scope   string
+		want    string
+	}{
+		{name: "authorization bearer", headers: http.Header{"Authorization": {"Bearer sk-auth"}}, scope: callerScope("sk-auth"), want: "sk-auth"},
+		{name: "authorization raw", headers: http.Header{"Authorization": {"sk-raw"}}, scope: callerScope("sk-raw"), want: "sk-raw"},
+		{name: "google header", headers: http.Header{"X-Goog-Api-Key": {"sk-google"}}, scope: callerScope("sk-google"), want: "sk-google"},
+		{name: "anthropic header", headers: http.Header{"X-Api-Key": {"sk-anthropic"}}, scope: callerScope("sk-anthropic"), want: "sk-anthropic"},
+		{name: "query key", query: url.Values{"key": {"sk-query"}}, scope: callerScope("sk-query"), want: "sk-query"},
+		{name: "query auth token", query: url.Values{"auth_token": {"sk-token"}}, scope: callerScope("sk-token"), want: "sk-token"},
+		{name: "matching candidate after wrong candidate", headers: http.Header{"Authorization": {"Bearer wrong"}, "X-Api-Key": {"sk-right"}}, scope: callerScope("sk-right"), want: "sk-right"},
+		{name: "header does not match authenticated scope", headers: http.Header{"Authorization": {"Bearer spoofed"}}, scope: callerScope("sk-authenticated")},
+		{name: "missing authenticated scope", headers: http.Header{"Authorization": {"Bearer sk-auth"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := callerAPIKey(tt.headers, tt.query, tt.scope); got != tt.want {
+				t.Fatalf("callerAPIKey()=%q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseRulesAcceptsValidRules(t *testing.T) {
 	tests := []string{
 		"a=>b",
@@ -154,6 +181,11 @@ func TestParseRulesAcceptsValidRules(t *testing.T) {
 		`literal\*=>star`,
 		`a\;b=>c\=>d`,
 		`a\=>b=>c`,
+		`#sk-test#xxx=>yyy`,
+		`#sk-test#\a`,
+		`sk-kimi-*#*=>kimi-k3`,
+		`#sk-*#*=>kimi`,
+		`sk-\*-\#-key#source=>target`,
 	}
 	for _, raw := range tests {
 		t.Run(raw, func(t *testing.T) {
@@ -200,7 +232,7 @@ func TestParseRulesAcceptsAPIKeyScopesAndEscapedHash(t *testing.T) {
 	if rules[1].callerScope != callerScope("sk-test") || rules[2].callerScope != "" {
 		t.Fatalf("scopes=%q %q", rules[1].callerScope, rules[2].callerScope)
 	}
-	mapped, matched, err := applyRules("vendor#model", callerScope("sk-test"), rules[1:2])
+	mapped, matched, err := applyRules("vendor#model", callerScope("sk-test"), "sk-test", rules[1:2])
 	if err != nil {
 		t.Fatalf("apply scoped escaped-hash rule: %v", err)
 	}
@@ -231,6 +263,8 @@ func TestParseRulesRejectsInvalidRules(t *testing.T) {
 		`a=>x$x`,
 		`a=>x$1`,
 		`a*=>x$2`,
+		`sk-*#source=>target-$1`,
+		`sk-*#source-*=>target-$2`,
 		`a\/b=>x`,
 		`a=>\\`,
 		`a=>\;`,
@@ -241,9 +275,15 @@ func TestParseRulesRejectsInvalidRules(t *testing.T) {
 		`x=>\a`,
 		`x=>\A`,
 		`#a=>b`,
+		`##a=>b`,
+		`#sk-test`,
+		`#sk-test#`,
+		`#sk-test#a=>b#c`,
 		`sk-test#`,
 		`sk-test#a=>b#c`,
 		`sk\-test#a=>b`,
+		`sk-\x#a=>b`,
+		`#sk-\x#a=>b`,
 	}
 	for _, raw := range tests {
 		t.Run(raw, func(t *testing.T) {
@@ -276,7 +316,7 @@ func TestApplyRulesAPIKeyScopeExactAndFallsThrough(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, matched, err := applyRules(tt.model, callerScope(tt.key), rules)
+			got, matched, err := applyRules(tt.model, callerScope(tt.key), tt.key, rules)
 			if err != nil || got != tt.want || matched != tt.matched {
 				t.Fatalf("applyRules=(%q,%v,%v), want (%q,%v,nil)", got, matched, err, tt.want, tt.matched)
 			}
@@ -284,9 +324,44 @@ func TestApplyRulesAPIKeyScopeExactAndFallsThrough(t *testing.T) {
 	}
 }
 
+func TestApplyRulesAPIKeyScopePatterns(t *testing.T) {
+	tests := []struct {
+		name, raw, scope, key, model, want string
+		matched                            bool
+	}{
+		{name: "inverse exact matches another key", raw: `#sk-key#xxx=>yyy`, scope: callerScope("sk-other"), key: "sk-other", model: "xxx", want: "yyy", matched: true},
+		{name: "inverse exact excludes the named key", raw: `#sk-key#xxx=>yyy`, scope: callerScope("sk-key"), key: "sk-key", model: "xxx", want: "xxx"},
+		{name: "inverse exact runs case operation", raw: `#sk-key#\a`, scope: callerScope("sk-other"), key: "sk-other", model: "ABC", want: "abc", matched: true},
+		{name: "inverse exact mapping and operation stay ordered", raw: `#sk-key#XXX=>YYY;#sk-key#\a`, scope: callerScope("sk-other"), key: "sk-other", model: "XXX", want: "yyy", matched: true},
+		{name: "inverse exact skips missing caller", raw: `#sk-key#xxx=>yyy`, model: "xxx", want: "xxx"},
+		{name: "wildcard scope matches", raw: `sk-kimi-*#*=>kimi-k3`, scope: callerScope("sk-kimi-team"), key: "sk-kimi-team", model: "gpt-5", want: "kimi-k3", matched: true},
+		{name: "multiple key wildcards do not create captures", raw: `sk-*-team-*#source-*=>target-$1`, scope: callerScope("sk-kimi-team-dev"), key: "sk-kimi-team-dev", model: "source-model", want: "target-model", matched: true},
+		{name: "wildcard scope does not match another key", raw: `sk-kimi-*#*=>kimi-k3`, scope: callerScope("sk-openai-team"), key: "sk-openai-team", model: "gpt-5", want: "gpt-5"},
+		{name: "key wildcard does not create model capture", raw: `sk-kimi-*#source-*=>target-$1`, scope: callerScope("sk-kimi-team"), key: "sk-kimi-team", model: "source-model", want: "target-model", matched: true},
+		{name: "escaped scope star is literal", raw: `sk-\*#source=>star`, scope: callerScope("sk-*"), key: "sk-*", model: "source", want: "star", matched: true},
+		{name: "escaped scope star is not wildcard", raw: `sk-\*#source=>star`, scope: callerScope("sk-other"), key: "sk-other", model: "source", want: "source"},
+		{name: "escaped scope hash is literal", raw: `sk-\#-key#source=>hash`, scope: callerScope("sk-#-key"), key: "sk-#-key", model: "source", want: "hash", matched: true},
+		{name: "inverse wildcard matches outside pattern", raw: `#sk-*#*=>kimi`, scope: callerScope("ak-team"), key: "ak-team", model: "gpt-5", want: "kimi", matched: true},
+		{name: "inverse wildcard excludes matching key", raw: `#sk-*#*=>kimi`, scope: callerScope("sk-team"), key: "sk-team", model: "gpt-5", want: "gpt-5"},
+		{name: "inverse wildcard skips missing caller", raw: `#sk-*#*=>kimi`, model: "gpt-5", want: "gpt-5"},
+		{name: "inverse wildcard skips unavailable caller key", raw: `#sk-*#*=>kimi`, scope: callerScope("ak-team"), model: "gpt-5", want: "gpt-5"},
+		{name: "inverse wildcard rejects key not bound to scope", raw: `#sk-*#*=>kimi`, scope: callerScope("ak-team"), key: "sk-spoofed", model: "gpt-5", want: "gpt-5"},
+		{name: "wildcard rejects key not bound to scope", raw: `sk-kimi-*#*=>kimi-k3`, scope: callerScope("sk-other"), key: "sk-kimi-spoofed", model: "gpt-5", want: "gpt-5"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setLoadedConfigForTest(defaultConfig())
+			got, matched, err := applyRules(tt.model, tt.scope, tt.key, mustParseRules(t, tt.raw))
+			if err != nil || got != tt.want || matched != tt.matched {
+				t.Fatalf("applyRules()=(%q,%v,%v), want (%q,%v,nil)", got, matched, err, tt.want, tt.matched)
+			}
+		})
+	}
+}
+
 func TestApplyRulesFullChain(t *testing.T) {
 	rules := mustParseRules(t, "deepseek-v4-pro=>deepseek-v4-flash;deepseek-v4-flash=>claude-v4-flash")
-	mapped, matched, err := applyRules("deepseek-v4-pro", "", rules)
+	mapped, matched, err := applyRules("deepseek-v4-pro", "", "", rules)
 	if err != nil {
 		t.Fatalf("applyRules error = %v", err)
 	}
@@ -297,7 +372,7 @@ func TestApplyRulesFullChain(t *testing.T) {
 
 func TestApplyRulesWildcardCapture(t *testing.T) {
 	rules := mustParseRules(t, "claude-*=>upstream-$1")
-	mapped, matched, err := applyRules("claude-sonnet", "", rules)
+	mapped, matched, err := applyRules("claude-sonnet", "", "", rules)
 	if err != nil {
 		t.Fatalf("applyRules error = %v", err)
 	}
@@ -348,7 +423,7 @@ func TestApplyRulesCharacterSemantics(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mapped, matched, err := applyRules(tt.model, "", mustParseRules(t, tt.raw))
+			mapped, matched, err := applyRules(tt.model, "", "", mustParseRules(t, tt.raw))
 			if err != nil {
 				t.Fatalf("applyRules error = %v", err)
 			}
@@ -362,7 +437,7 @@ func TestApplyRulesCharacterSemantics(t *testing.T) {
 func TestApplyRulesCaseOperationRejectsEmptyModel(t *testing.T) {
 	for _, raw := range []string{`\a`, `\A`} {
 		t.Run(raw, func(t *testing.T) {
-			mapped, matched, err := applyRules("", "", mustParseRules(t, raw))
+			mapped, matched, err := applyRules("", "", "", mustParseRules(t, raw))
 			if err == nil || err.Error() != "empty mapped model" {
 				t.Fatalf("mapped=%q matched=%v err=%v, want empty mapped model", mapped, matched, err)
 			}
@@ -375,7 +450,7 @@ func TestApplyRulesCaseOperationRejectsEmptyModel(t *testing.T) {
 
 func TestApplyRulesUnmatched(t *testing.T) {
 	rules := mustParseRules(t, "a=>b")
-	mapped, matched, err := applyRules("z", "", rules)
+	mapped, matched, err := applyRules("z", "", "", rules)
 	if err != nil {
 		t.Fatalf("applyRules error = %v", err)
 	}
@@ -386,7 +461,7 @@ func TestApplyRulesUnmatched(t *testing.T) {
 
 func TestApplyRulesUnchangedStillMatched(t *testing.T) {
 	rules := mustParseRules(t, "a=>a")
-	mapped, matched, err := applyRules("a", "", rules)
+	mapped, matched, err := applyRules("a", "", "", rules)
 	if err != nil {
 		t.Fatalf("applyRules error = %v", err)
 	}
@@ -397,7 +472,7 @@ func TestApplyRulesUnchangedStillMatched(t *testing.T) {
 
 func TestApplyRulesSinglePassNoLoop(t *testing.T) {
 	rules := mustParseRules(t, "a=>b;b=>a")
-	mapped, matched, err := applyRules("a", "", rules)
+	mapped, matched, err := applyRules("a", "", "", rules)
 	if err != nil {
 		t.Fatalf("applyRules error = %v", err)
 	}
@@ -459,7 +534,7 @@ func TestRouteModelAPIKeyScopeAcrossRuleSets(t *testing.T) {
 				{name: "missing scope", want: "fallback-target"},
 			} {
 				t.Run(scopeTest.name, func(t *testing.T) {
-					decision, err := routeModel(tt.cfg, tt.format, "client-model", scopeTest.scope)
+					decision, err := routeModel(tt.cfg, tt.format, "client-model", scopeTest.scope, "")
 					if err != nil {
 						t.Fatalf("routeModel error = %v", err)
 					}
@@ -486,7 +561,7 @@ func TestRouteModelSkipsDisabledNoRulesUnmatchedAndUnchanged(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			decision, err := routeModel(tt.cfg, tt.format, tt.model, "")
+			decision, err := routeModel(tt.cfg, tt.format, tt.model, "", "")
 			if err != nil {
 				t.Fatalf("routeModel error = %v", err)
 			}
@@ -499,7 +574,7 @@ func TestRouteModelSkipsDisabledNoRulesUnmatchedAndUnchanged(t *testing.T) {
 
 func TestRouteModelHandlesOnlyMatchedChanged(t *testing.T) {
 	cfg := Config{Enabled: true, OpenAICompletionsRules: "deepseek-v4-pro=>deepseek-v4-flash;deepseek-v4-flash=>gpt-5.4-mini", GlobalRules: "deepseek-v4-pro=>wrong"}
-	decision, err := routeModel(cfg, "openai", "deepseek-v4-pro", "")
+	decision, err := routeModel(cfg, "openai", "deepseek-v4-pro", "", "")
 	if err != nil {
 		t.Fatalf("routeModel error = %v", err)
 	}
@@ -510,7 +585,7 @@ func TestRouteModelHandlesOnlyMatchedChanged(t *testing.T) {
 
 func TestRouteModelCaseOperationChanged(t *testing.T) {
 	cfg := Config{Enabled: true, GlobalRules: `\A`}
-	decision, err := routeModel(cfg, "openai", "model-v2", "")
+	decision, err := routeModel(cfg, "openai", "model-v2", "", "")
 	if err != nil {
 		t.Fatalf("routeModel error = %v", err)
 	}
@@ -531,7 +606,7 @@ func TestRouteModelCaseOperationNoChangeIsUnhandled(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			decision, err := routeModel(Config{Enabled: true, GlobalRules: tt.rules}, "openai", tt.model, "")
+			decision, err := routeModel(Config{Enabled: true, GlobalRules: tt.rules}, "openai", tt.model, "", "")
 			if err != nil {
 				t.Fatalf("routeModel error = %v", err)
 			}
@@ -544,7 +619,7 @@ func TestRouteModelCaseOperationNoChangeIsUnhandled(t *testing.T) {
 
 func TestRouteModelBadSelectedRulesErrors(t *testing.T) {
 	cfg := Config{Enabled: true, ClaudeMessagesRules: "bad rule"}
-	if _, err := routeModel(cfg, "claude", "a", ""); err == nil {
+	if _, err := routeModel(cfg, "claude", "a", "", ""); err == nil {
 		t.Fatalf("routeModel bad selected rules error = nil")
 	}
 }
@@ -596,6 +671,8 @@ func TestHandleModelRouteUsesCallerScope(t *testing.T) {
 		name     string
 		rules    string
 		metadata map[string]any
+		headers  http.Header
+		query    url.Values
 		handled  bool
 	}{
 		{name: "matching scope", rules: scopedRules, metadata: map[string]any{"caller_scope": callerScope("sk-test")}, handled: true},
@@ -604,11 +681,18 @@ func TestHandleModelRouteUsesCallerScope(t *testing.T) {
 		{name: "non-string scope", rules: scopedRules, metadata: map[string]any{"caller_scope": 1}, handled: false},
 		{name: "fallback for missing metadata", rules: scopedRules + ";a=>c", handled: true},
 		{name: "fallback for wrong scope", rules: scopedRules + ";a=>c", metadata: map[string]any{"caller_scope": callerScope("sk-other")}, handled: true},
+		{name: "wildcard scope", rules: "sk-kimi-*#a=>b", metadata: map[string]any{"caller_scope": callerScope("sk-kimi-team")}, headers: http.Header{"Authorization": {"Bearer sk-kimi-team"}}, handled: true},
+		{name: "wildcard scope from query", rules: "sk-kimi-*#a=>b", metadata: map[string]any{"caller_scope": callerScope("sk-kimi-query")}, query: url.Values{"key": {"sk-kimi-query"}}, handled: true},
+		{name: "spoofed wildcard header", rules: "sk-kimi-*#a=>b", metadata: map[string]any{"caller_scope": callerScope("sk-other")}, headers: http.Header{"Authorization": {"Bearer sk-kimi-spoofed"}}, handled: false},
+		{name: "inverse exact other key", rules: "#sk-test#a=>b", metadata: map[string]any{"caller_scope": callerScope("sk-other")}, handled: true},
+		{name: "inverse exact named key", rules: "#sk-test#a=>b", metadata: map[string]any{"caller_scope": callerScope("sk-test")}, handled: false},
+		{name: "inverse wildcard outside pattern", rules: "#sk-*#a=>b", metadata: map[string]any{"caller_scope": callerScope("ak-team")}, headers: http.Header{"X-Api-Key": {"ak-team"}}, handled: true},
+		{name: "inverse wildcard inside pattern", rules: "#sk-*#a=>b", metadata: map[string]any{"caller_scope": callerScope("sk-team")}, headers: http.Header{"X-Api-Key": {"sk-team"}}, handled: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			setLoadedConfigForTest(Config{Enabled: true, GlobalRules: tt.rules})
-			raw, err := json.Marshal(pluginapi.ModelRouteRequest{SourceFormat: "openai", RequestedModel: "a", Metadata: tt.metadata})
+			raw, err := json.Marshal(pluginapi.ModelRouteRequest{SourceFormat: "openai", RequestedModel: "a", Metadata: tt.metadata, Headers: tt.headers, Query: tt.query})
 			if err != nil {
 				t.Fatalf("marshal request: %v", err)
 			}
@@ -907,8 +991,107 @@ func TestHandleExecutorExecuteForwardsMappedRequestAndRestoresResponse(t *testin
 	}
 }
 
+func TestExecutorReusesCallerPatternAfterHeadersChange(t *testing.T) {
+	tests := []struct {
+		name, rules, key, upstream string
+		headers                    http.Header
+	}{
+		{name: "positive wildcard", rules: "sk-kimi-*#client-model=>wildcard-target", key: "sk-kimi-team", headers: http.Header{"Authorization": {"Bearer sk-kimi-team"}}, upstream: "wildcard-target"},
+		{name: "inverse wildcard", rules: "#sk-*#client-model=>inverse-target", key: "ak-team", headers: http.Header{"X-Api-Key": {"ak-team"}}, upstream: "inverse-target"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setLoadedConfigForTest(Config{Enabled: true, GlobalRules: tt.rules})
+			metadata := map[string]any{"caller_scope": callerScope(tt.key)}
+			routeRaw, err := json.Marshal(pluginapi.ModelRouteRequest{SourceFormat: "openai", RequestedModel: "client-model", Metadata: metadata, Headers: tt.headers})
+			if err != nil {
+				t.Fatalf("marshal route request: %v", err)
+			}
+			responseRaw, err := handleModelRoute(routeRaw)
+			if err != nil {
+				t.Fatalf("handleModelRoute error = %v", err)
+			}
+			var routeResponse pluginapi.ModelRouteResponse
+			if err := json.Unmarshal(responseRaw, &routeResponse); err != nil || !routeResponse.Handled {
+				t.Fatalf("route response=%s err=%v, want handled", responseRaw, err)
+			}
+
+			req := rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+				Model:           "client-model",
+				Format:          "openai",
+				SourceFormat:    "openai",
+				Metadata:        metadata,
+				Headers:         http.Header{"Authorization": {"Bearer interceptor-replacement"}},
+				OriginalRequest: []byte(`{"model":"client-model"}`),
+			}}
+			rawReq, err := json.Marshal(req)
+			if err != nil {
+				t.Fatalf("marshal executor request: %v", err)
+			}
+			var captured hostModelExecutionRequest
+			_, err = handleExecutorExecute(rawReq, func(method string, payload any) (json.RawMessage, error) {
+				raw, err := json.Marshal(payload)
+				if err != nil {
+					return nil, err
+				}
+				if err := json.Unmarshal(raw, &captured); err != nil {
+					return nil, err
+				}
+				return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: 200, Body: []byte(`{"model":"` + tt.upstream + `"}`)})
+			})
+			if err != nil {
+				t.Fatalf("handleExecutorExecute error = %v", err)
+			}
+			if captured.Model != tt.upstream {
+				t.Fatalf("forwarded model=%q, want %q", captured.Model, tt.upstream)
+			}
+		})
+	}
+}
+
+func TestReconfigureClearsCallerPatternCache(t *testing.T) {
+	const rules = "sk-kimi-*#client-model=>wildcard-target"
+	setLoadedConfigForTest(Config{Enabled: true, GlobalRules: rules})
+	metadata := map[string]any{"caller_scope": callerScope("sk-kimi-team")}
+	routeRaw, err := json.Marshal(pluginapi.ModelRouteRequest{
+		SourceFormat:   "openai",
+		RequestedModel: "client-model",
+		Metadata:       metadata,
+		Headers:        http.Header{"Authorization": {"Bearer sk-kimi-team"}},
+	})
+	if err != nil {
+		t.Fatalf("marshal route request: %v", err)
+	}
+	responseRaw, err := handleModelRoute(routeRaw)
+	if err != nil {
+		t.Fatalf("warm caller pattern cache: %v", err)
+	}
+	var response pluginapi.ModelRouteResponse
+	if err := json.Unmarshal(responseRaw, &response); err != nil || !response.Handled {
+		t.Fatalf("warm route response=%s err=%v, want handled", responseRaw, err)
+	}
+
+	if _, err := handlePluginReconfigure([]byte(`{"enabled":true,"global_rules":"sk-kimi-*#client-model=>wildcard-target"}`)); err != nil {
+		t.Fatalf("reconfigure: %v", err)
+	}
+	routeRaw, err = json.Marshal(pluginapi.ModelRouteRequest{SourceFormat: "openai", RequestedModel: "client-model", Metadata: metadata})
+	if err != nil {
+		t.Fatalf("marshal route without credential: %v", err)
+	}
+	responseRaw, err = handleModelRoute(routeRaw)
+	if err != nil {
+		t.Fatalf("route after reconfigure: %v", err)
+	}
+	if err := json.Unmarshal(responseRaw, &response); err != nil {
+		t.Fatalf("decode route after reconfigure: %v", err)
+	}
+	if response.Handled {
+		t.Fatalf("route after reconfigure=%s, want unhandled without bound caller", responseRaw)
+	}
+}
+
 func TestHandleExecutorExecuteUsesCallerScopeAcrossRuleSets(t *testing.T) {
-	const rules = "sk-test#client-model=>scoped-target;client-model=>fallback-target"
+	const rules = "sk-test#client-model=>scoped-target;sk-kimi-*#client-model=>wildcard-target;#sk-*#client-model=>inverse-target;client-model=>fallback-target"
 	tests := []struct {
 		name   string
 		cfg    Config
@@ -921,14 +1104,19 @@ func TestHandleExecutorExecuteUsesCallerScopeAcrossRuleSets(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			for _, scopeTest := range []struct {
+			scopeTests := []struct {
 				name     string
 				metadata map[string]any
+				headers  http.Header
+				query    url.Values
 				upstream string
 			}{
-				{name: "matching scope", metadata: map[string]any{"caller_scope": callerScope("sk-test")}, upstream: "scoped-target"},
-				{name: "wrong scope", metadata: map[string]any{"caller_scope": callerScope("sk-other")}, upstream: "fallback-target"},
-			} {
+				{name: "matching exact scope", metadata: map[string]any{"caller_scope": callerScope("sk-test")}, upstream: "scoped-target"},
+				{name: "wrong exact scope", metadata: map[string]any{"caller_scope": callerScope("sk-other")}, upstream: "fallback-target"},
+				{name: "matching wildcard scope", metadata: map[string]any{"caller_scope": callerScope("sk-kimi-team")}, headers: http.Header{"Authorization": {"Bearer sk-kimi-team"}}, upstream: "wildcard-target"},
+				{name: "matching inverse wildcard scope", metadata: map[string]any{"caller_scope": callerScope("ak-team")}, query: url.Values{"auth_token": {"ak-team"}}, upstream: "inverse-target"},
+			}
+			for _, scopeTest := range scopeTests {
 				t.Run(scopeTest.name, func(t *testing.T) {
 					setLoadedConfigForTest(tt.cfg)
 					req := rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
@@ -936,6 +1124,8 @@ func TestHandleExecutorExecuteUsesCallerScopeAcrossRuleSets(t *testing.T) {
 						Format:          tt.format,
 						SourceFormat:    tt.format,
 						Metadata:        scopeTest.metadata,
+						Headers:         scopeTest.headers,
+						Query:           scopeTest.query,
 						OriginalRequest: []byte(`{"model":"client-model"}`),
 					}}
 					rawReq, err := json.Marshal(req)
@@ -1052,47 +1242,62 @@ func TestHandleExecutorExecuteReturnsErrorForHostHTTPStatus(t *testing.T) {
 }
 
 func TestHandleExecutorExecuteStreamUsesCallerScope(t *testing.T) {
-	setLoadedConfigForTest(Config{Enabled: true, GlobalRules: "sk-test#client-model=>scoped-target"})
-	req := executorRPCRequest{
-		ExecutorRequest: pluginapi.ExecutorRequest{
-			Model:           "client-model",
-			Format:          "openai",
-			SourceFormat:    "openai",
-			Stream:          true,
-			OriginalRequest: []byte(`{"model":"client-model","stream":true}`),
-			Metadata:        map[string]any{"caller_scope": callerScope("sk-test")},
-		},
-		HostCallbackID: "callback-1",
-		StreamID:       "plugin-stream-caller-scope-1",
+	tests := []struct {
+		name, rules, key, upstream string
+		headers                    http.Header
+		query                      url.Values
+	}{
+		{name: "exact", rules: "sk-test#client-model=>scoped-target", key: "sk-test", upstream: "scoped-target"},
+		{name: "wildcard", rules: "sk-kimi-*#client-model=>wildcard-target", key: "sk-kimi-team", headers: http.Header{"Authorization": {"Bearer sk-kimi-team"}}, upstream: "wildcard-target"},
+		{name: "inverse wildcard", rules: "#sk-*#client-model=>inverse-target", key: "ak-team", query: url.Values{"auth_token": {"ak-team"}}, upstream: "inverse-target"},
 	}
-	reads := []pluginapi.HostModelStreamReadResponse{
-		{Payload: []byte("data: {\"model\":\"scoped-target\"}\n\n")},
-		{Payload: []byte("data: [DONE]\n\n")},
-		{Done: true},
-	}
-	var forwarded pluginapi.HostModelExecutionRequest
-	emitted, closedHost, closedPlugin, _, err := runExecutorStreamTestWithForwarded(rpcExecutorRequest(req), reads, &forwarded)
-	if err != nil {
-		t.Fatalf("handleExecutorExecuteStream error = %v", err)
-	}
-	if forwarded.Model != "scoped-target" {
-		t.Fatalf("forwarded model=%q, want scoped-target", forwarded.Model)
-	}
-	var body struct {
-		Model string `json:"model"`
-	}
-	if err := json.Unmarshal(forwarded.Body, &body); err != nil {
-		t.Fatalf("unmarshal forwarded body: %v", err)
-	}
-	if body.Model != "scoped-target" {
-		t.Fatalf("forwarded body model=%q, want scoped-target", body.Model)
-	}
-	joined := strings.Join(emitted, "")
-	if !strings.Contains(joined, `"model":"client-model"`) || strings.Contains(joined, `"model":"scoped-target"`) || !strings.Contains(joined, "data: [DONE]") {
-		t.Fatalf("emitted=%q", joined)
-	}
-	if !closedHost || !closedPlugin {
-		t.Fatalf("closedHost=%v closedPlugin=%v", closedHost, closedPlugin)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setLoadedConfigForTest(Config{Enabled: true, GlobalRules: tt.rules})
+			req := executorRPCRequest{
+				ExecutorRequest: pluginapi.ExecutorRequest{
+					Model:           "client-model",
+					Format:          "openai",
+					SourceFormat:    "openai",
+					Stream:          true,
+					OriginalRequest: []byte(`{"model":"client-model","stream":true}`),
+					Metadata:        map[string]any{"caller_scope": callerScope(tt.key)},
+					Headers:         tt.headers,
+					Query:           tt.query,
+				},
+				HostCallbackID: "callback-1",
+				StreamID:       "plugin-stream-caller-scope-1",
+			}
+			reads := []pluginapi.HostModelStreamReadResponse{
+				{Payload: []byte("data: {\"model\":\"" + tt.upstream + "\"}\n\n")},
+				{Payload: []byte("data: [DONE]\n\n")},
+				{Done: true},
+			}
+			var forwarded pluginapi.HostModelExecutionRequest
+			emitted, closedHost, closedPlugin, _, err := runExecutorStreamTestWithForwarded(rpcExecutorRequest(req), reads, &forwarded)
+			if err != nil {
+				t.Fatalf("handleExecutorExecuteStream error = %v", err)
+			}
+			if forwarded.Model != tt.upstream {
+				t.Fatalf("forwarded model=%q, want %q", forwarded.Model, tt.upstream)
+			}
+			var body struct {
+				Model string `json:"model"`
+			}
+			if err := json.Unmarshal(forwarded.Body, &body); err != nil {
+				t.Fatalf("unmarshal forwarded body: %v", err)
+			}
+			if body.Model != tt.upstream {
+				t.Fatalf("forwarded body model=%q, want %q", body.Model, tt.upstream)
+			}
+			joined := strings.Join(emitted, "")
+			if !strings.Contains(joined, `"model":"client-model"`) || strings.Contains(joined, tt.upstream) || !strings.Contains(joined, "data: [DONE]") {
+				t.Fatalf("emitted=%q", joined)
+			}
+			if !closedHost || !closedPlugin {
+				t.Fatalf("closedHost=%v closedPlugin=%v", closedHost, closedPlugin)
+			}
+		})
 	}
 }
 
@@ -1639,7 +1844,7 @@ func TestHandleMethodDispatchesRegisterReconfigureAndUnknown(t *testing.T) {
 	if !env.OK || len(env.Result) == 0 {
 		t.Fatalf("reconfigure envelope=%#v", env)
 	}
-	decision, err := routeModel(loadedConfig(), "openai", "a", "")
+	decision, err := routeModel(loadedConfig(), "openai", "a", "", "")
 	if err != nil {
 		t.Fatalf("route after reconfigure: %v", err)
 	}

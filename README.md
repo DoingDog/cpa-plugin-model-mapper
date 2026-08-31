@@ -25,15 +25,25 @@ The plugin's own `enabled` field defaults to `true`. Empty rule fields mean the 
 
 ## Rule syntax
 
-Each ruleset is a `;`-separated ordered list of entries. Its grammar is `entry := [api-key#](\a|\A|find=>replace)`: an optional `api-key#` prefix scopes an entry to the authenticated inbound CPA client API key, not an upstream provider credential. Configured keys remain plaintext, so protect the plugin configuration. CPA exposes the authenticated `caller_scope` digest to the plugin; the plugin hashes configured plaintext keys using CPA's algorithm and compares digests. A mismatch skips only that entry and later entries continue. An unscoped entry is either a `find=>replace` mapping or an exact standalone case operation: `\a` lowercases ASCII English letters and `\A` uppercases them. Whitespace and quotes are invalid inside the decoded rule value.
+Each ruleset is a `;`-separated ordered list of entries. An entry is an unscoped body, a positive caller scope, or an inverse caller scope:
 
-Scoped rules require CPA v7.2.145 or a later compatible runtime that publishes authenticated `caller_scope`; when metadata is missing, scoped entries skip and unscoped fallback can continue.
+```text
+entry := body | api-key-pattern#body | #api-key-pattern#body
+body := \a | \A | find=>replace
+```
+
+`api-key-pattern#body` applies only to authenticated inbound CPA client API keys that match the pattern. `#api-key-pattern#body` applies to authenticated keys that do not match it. These are downstream client keys, not upstream provider credentials. Missing authenticated caller metadata skips both positive and inverse scoped entries, while later entries continue.
+
+Exact scope text is hashed and compared with CPA's irreversible `caller_scope`, which CPA derives from the authenticated principal. For wildcard matching, the plugin tries CPA's supported inbound credential sources (`Authorization`, `X-Goog-Api-Key`, `X-Api-Key`, `?key=`, or `?auth_token=`) and accepts a candidate only when its digest equals `caller_scope`; this recovers the authenticated principal without trusting client-controlled headers alone. The plugin caches only the boolean result for `caller_scope + pattern`, not the principal, so request interceptors may change headers between routing and execution; reconfiguration clears this cache. An access provider whose Principal differs from every presented credential cannot use key wildcards, so those entries safely skip. Invalid credentials are rejected by CPA before the plugin runs, and scoped rules do not alter CPA's authentication response. Configured keys and patterns remain plaintext, so protect the plugin configuration. Whitespace and quotes are invalid inside the decoded rule value.
+
+Scoped rules require CPA v7.2.145 or a later compatible runtime that publishes authenticated `caller_scope`; when metadata is missing, scoped entries skip and unscoped fallback can continue. This release assigns wildcard meaning to an unescaped `*` in an API-key scope; an existing literal key containing `*` must escape it as `\*` before upgrading.
 
 - Mappings remain case-sensitive and apply to the complete current model name; later mappings see the value produced by every earlier entry.
 - `\a` changes only `A` through `Z` to `a` through `z`; `\A` changes only `a` through `z` to `A` through `Z`. Non-ASCII bytes, digits, punctuation, and separators are unchanged.
 - Case operations must be complete standalone entries. They are not additional backslash escapes for `find` or `replace`.
-- In `find`, `*` captures zero or more characters, including `/`, and captures are numbered from left to right. Wildcard matching does not backtrack: each capture stops at the first occurrence of the next literal. `$` is literal.
-- In `replace`, `$1`, `$2`, and later numbers reuse captures. `*` is literal.
+- In `api-key-pattern`, an unescaped `*` matches zero or more key characters but does not create a replacement capture. `\*` and `\#` match literal `*` and `#` characters in the key. Scope matching is anchored to the complete key and does not backtrack.
+- In model `find`, `*` captures zero or more model-name characters, including `/`, and captures are numbered from left to right. Wildcard matching does not backtrack: each capture stops at the first occurrence of the next literal. `$` is literal.
+- In model `replace`, `$1`, `$2`, and later numbers reuse only the model `find` captures. Key-pattern wildcards never affect these numbers. `*` is literal.
 - Characters such as `@`, `/`, `[`, `]`, parentheses, dots, hyphens, and underscores are literal and need no escaping.
 - Entries are order-sensitive: the selected ruleset runs left to right exactly once, and later entries see the model produced by earlier entries.
 - Put more specific wildcard rules before broader fallback rules.
@@ -124,6 +134,30 @@ claude_messages_rules: 'sk-test#\a;sk-test#claude-haiku-*=>gpt-5.6-luna;claude-h
 ```
 
 Only the exact inbound client API key `sk-test` matches the scoped entries: `\a` lowercases the requested model and the scoped mapping selects `gpt-5.6-luna`. A different key or missing authenticated metadata skips the scoped entries; a lowercase `claude-haiku-*` then matches the unscoped fallback to `gpt-5.6-sol`. With a different key and an uppercase requested model, the scoped lowercase operation is skipped, so the case-sensitive fallback does not match.
+
+A positive key wildcard can map every model for one key family:
+
+```yaml
+global_rules: 'sk-kimi-*#*=>kimi-k3'
+```
+
+Here the key pattern `sk-kimi-*` selects authenticated keys with that prefix. The second `*` is the model `find`; it does not refer to or capture text from the key.
+
+An inverse exact scope applies an ordered chain to every authenticated key except one:
+
+```yaml
+global_rules: '#sk-key#xxx=>yyy;#sk-key#\a'
+```
+
+Both entries skip `sk-key`. Other authenticated keys first map `xxx` to `yyy`, then lowercase the current model.
+
+Inverse and wildcard scope syntax can be combined:
+
+```yaml
+global_rules: '#sk-*#*=>kimi'
+```
+
+This maps every model to `kimi` only when the authenticated key does not match `sk-*`.
 
 ## Common use cases
 

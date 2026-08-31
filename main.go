@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"unicode"
@@ -340,9 +341,15 @@ func decodeConfig(raw json.RawMessage) (Config, error) {
 	return cfg, nil
 }
 
+type callerPatternCacheKey struct {
+	scope   string
+	pattern string
+}
+
 var (
-	loadedConfigMu sync.RWMutex
-	loadedCfg      = defaultConfig()
+	loadedConfigMu     sync.RWMutex
+	loadedCfg          = defaultConfig()
+	callerPatternCache = make(map[callerPatternCacheKey]bool)
 
 	hostAPIMu      sync.RWMutex
 	hostCallbackFn hostCallback
@@ -359,6 +366,7 @@ func loadedConfig() Config {
 func setLoadedConfigForTest(cfg Config) {
 	loadedConfigMu.Lock()
 	loadedCfg = cfg
+	callerPatternCache = make(map[callerPatternCacheKey]bool)
 	loadedConfigMu.Unlock()
 }
 
@@ -417,7 +425,8 @@ func handleModelRoute(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
-	decision, err := routeModel(loadedConfig(), req.SourceFormat, req.RequestedModel, callerScopeFromMetadata(req.Metadata))
+	scope := callerScopeFromMetadata(req.Metadata)
+	decision, err := routeModel(loadedConfig(), req.SourceFormat, req.RequestedModel, scope, callerAPIKey(req.Headers, req.Query, scope))
 	if err != nil {
 		return nil, err
 	}
@@ -427,7 +436,7 @@ func handleModelRoute(raw []byte) ([]byte, error) {
 	return json.Marshal(pluginapi.ModelRouteResponse{Handled: true, TargetKind: pluginapi.ModelRouteTargetSelf, Reason: "model mapped by model-mapper"})
 }
 
-func routeModel(cfg Config, format, model, scope string) (routeDecision, error) {
+func routeModel(cfg Config, format, model, scope, key string) (routeDecision, error) {
 	if !cfg.Enabled {
 		return routeDecision{}, nil
 	}
@@ -439,7 +448,7 @@ func routeModel(cfg Config, format, model, scope string) (routeDecision, error) 
 	if err != nil {
 		return routeDecision{}, err
 	}
-	mapped, matched, err := applyRules(model, scope, rules)
+	mapped, matched, err := applyRules(model, scope, key, rules)
 	if err != nil {
 		return routeDecision{}, err
 	}
@@ -497,7 +506,8 @@ func startExecutorStream(req executorRPCRequest, call hostCaller, closeStream fu
 }
 
 func runStreamForward(req executorRPCRequest, call hostCaller) error {
-	decision, err := routeModel(loadedConfig(), req.SourceFormat, req.Model, callerScopeFromMetadata(req.Metadata))
+	scope := callerScopeFromMetadata(req.Metadata)
+	decision, err := routeModel(loadedConfig(), req.SourceFormat, req.Model, scope, callerAPIKey(req.Headers, req.Query, scope))
 	if err != nil {
 		return fmt.Errorf("route stream: %w", err)
 	}
@@ -629,7 +639,8 @@ func handleExecutorExecute(raw []byte, call hostCaller) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
-	decision, err := routeModel(loadedConfig(), req.SourceFormat, req.Model, callerScopeFromMetadata(req.Metadata))
+	scope := callerScopeFromMetadata(req.Metadata)
+	decision, err := routeModel(loadedConfig(), req.SourceFormat, req.Model, scope, callerAPIKey(req.Headers, req.Query, scope))
 	if err != nil {
 		return nil, err
 	}
@@ -883,6 +894,9 @@ const (
 
 type rule struct {
 	callerScope       string
+	callerPattern     []token
+	callerPatternText string
+	excludeCaller     bool
 	patternTokens     []token
 	replacementTokens []token
 	captureCount      int
@@ -908,6 +922,30 @@ func callerScopeFromMetadata(metadata map[string]any) string {
 	return scope
 }
 
+func callerAPIKey(headers http.Header, query url.Values, scope string) string {
+	if scope == "" {
+		return ""
+	}
+	authorization := headers.Get("Authorization")
+	parts := strings.SplitN(authorization, " ", 2)
+	if len(parts) == 2 && strings.EqualFold(parts[0], "bearer") {
+		authorization = strings.TrimSpace(parts[1])
+	}
+	for _, candidate := range []string{
+		authorization,
+		headers.Get("X-Goog-Api-Key"),
+		headers.Get("X-Api-Key"),
+		query.Get("key"),
+		query.Get("auth_token"),
+	} {
+		candidate = strings.TrimSpace(candidate)
+		if candidate != "" && callerScope(candidate) == scope {
+			return candidate
+		}
+	}
+	return ""
+}
+
 func defaultConfig() Config {
 	return Config{Enabled: true}
 }
@@ -928,26 +966,41 @@ func parseRules(raw string) ([]rule, error) {
 	}
 	out := make([]rule, 0, len(parts))
 	for _, part := range parts {
+		excludeCaller := strings.HasPrefix(part, "#")
+		if excludeCaller {
+			part = part[1:]
+		}
 		scopeParts, err := splitEscaped(part, '#')
-		if err != nil || len(scopeParts) > 2 {
+		if err != nil || len(scopeParts) > 2 || excludeCaller && len(scopeParts) != 2 {
 			return nil, fmt.Errorf("invalid rule")
 		}
 		body := scopeParts[0]
 		scope := ""
+		var scopePattern []token
+		scopePatternText := ""
 		if len(scopeParts) == 2 {
-			if scopeParts[0] == "" || strings.ContainsRune(scopeParts[0], '\\') {
+			scopeTokens, wildcards, err := parseFind(scopeParts[0])
+			if err != nil || len(scopeTokens) == 0 {
 				return nil, fmt.Errorf("invalid API key scope")
 			}
-			scope = callerScope(scopeParts[0])
+			if wildcards == 0 {
+				scope = callerScope(scopeTokens[0].literal)
+			} else {
+				scopePattern = scopeTokens
+				scopePatternText = scopeParts[0]
+			}
 			body = scopeParts[1]
 		}
 
+		scopeRule := rule{callerScope: scope, callerPattern: scopePattern, callerPatternText: scopePatternText, excludeCaller: excludeCaller}
 		switch body {
 		case `\a`:
-			out = append(out, rule{callerScope: scope, caseOperation: caseOperationLower})
+			scopeRule.caseOperation = caseOperationLower
+			out = append(out, scopeRule)
 			continue
 		case `\A`:
-			out = append(out, rule{callerScope: scope, caseOperation: caseOperationUpper})
+			scopeRule.caseOperation = caseOperationUpper
+			out = append(out, scopeRule)
 			continue
 		}
 		sep, ok := findRuleSeparator(body)
@@ -966,7 +1019,10 @@ func parseRules(raw string) ([]rule, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, rule{callerScope: scope, patternTokens: pt, replacementTokens: rt, captureCount: captures})
+		scopeRule.patternTokens = pt
+		scopeRule.replacementTokens = rt
+		scopeRule.captureCount = captures
+		out = append(out, scopeRule)
 	}
 	return out, nil
 }
@@ -1138,11 +1194,44 @@ func applyASCIIModelCase(model string, operation caseOperation) string {
 	return string(converted)
 }
 
-func applyRules(model, scope string, rules []rule) (string, bool, error) {
+func callerPatternMatch(r rule, scope, key string) (bool, bool) {
+	cacheKey := callerPatternCacheKey{scope: scope, pattern: r.callerPatternText}
+	if key != "" && callerScope(key) == scope {
+		_, matched := matchTokens(key, r.callerPattern)
+		loadedConfigMu.Lock()
+		callerPatternCache[cacheKey] = matched
+		loadedConfigMu.Unlock()
+		return matched, true
+	}
+	loadedConfigMu.RLock()
+	matched, ok := callerPatternCache[cacheKey]
+	loadedConfigMu.RUnlock()
+	return matched, ok
+}
+
+func callerMatchesRule(r rule, scope, key string) bool {
+	if r.callerScope == "" && len(r.callerPattern) == 0 {
+		return true
+	}
+	if scope == "" {
+		return false
+	}
+	matched := r.callerScope == scope
+	if len(r.callerPattern) > 0 {
+		var ok bool
+		matched, ok = callerPatternMatch(r, scope, key)
+		if !ok {
+			return false
+		}
+	}
+	return matched != r.excludeCaller
+}
+
+func applyRules(model, scope, key string, rules []rule) (string, bool, error) {
 	current := model
 	matchedAny := false
 	for _, r := range rules {
-		if r.callerScope != "" && r.callerScope != scope {
+		if !callerMatchesRule(r, scope, key) {
 			continue
 		}
 		if r.caseOperation != caseOperationNone {
