@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"unicode"
+	"unicode/utf8"
 
 	pluginabi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	pluginapi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -153,19 +154,19 @@ func (r *sseRewriter) rewriteEvent(event []byte) ([][]byte, error) {
 
 func sseEventDelimiter(buf []byte, start int) (eventLen, delimLen, next int) {
 	start = max(0, min(start, len(buf)))
-	lf := bytes.Index(buf[start:], []byte("\n\n"))
-	if lf >= 0 {
-		lf += start
-	}
-	crlf := bytes.Index(buf[start:], []byte("\r\n\r\n"))
-	if crlf >= 0 {
-		crlf += start
-	}
-	if lf >= 0 && (crlf < 0 || lf < crlf) {
-		return lf, 2, 0
-	}
-	if crlf >= 0 {
-		return crlf, 4, 0
+	for search := start; search < len(buf); {
+		newline := bytes.IndexByte(buf[search:], '\n')
+		if newline < 0 {
+			break
+		}
+		newline += search
+		if newline+1 < len(buf) && buf[newline+1] == '\n' {
+			return newline, 2, 0
+		}
+		if newline > start && newline+2 < len(buf) && buf[newline-1] == '\r' && buf[newline+1] == '\r' && buf[newline+2] == '\n' {
+			return newline - 1, 4, 0
+		}
+		search = newline + 1
 	}
 	return 0, 0, max(0, len(buf)-3)
 }
@@ -214,7 +215,18 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 
 func (r *streamChunkRewriter) rawJSONChunks(p []byte) ([][]byte, error) {
 	trimmed := bytes.Trim(p, " \t\r\n")
-	if len(trimmed) > 0 && json.Valid(trimmed) {
+	couldBeComplete := len(trimmed) > 0
+	if couldBeComplete {
+		switch trimmed[0] {
+		case '{':
+			couldBeComplete = trimmed[len(trimmed)-1] == '}'
+		case '[':
+			couldBeComplete = trimmed[len(trimmed)-1] == ']'
+		case '"':
+			couldBeComplete = trimmed[len(trimmed)-1] == '"'
+		}
+	}
+	if couldBeComplete && json.Valid(trimmed) {
 		restored, _, err := r.sse.restoreResponseModel(trimmed)
 		if err != nil {
 			return nil, err
@@ -991,7 +1003,7 @@ func rewriteRawStringField(doc map[string]json.RawMessage, key, model string, re
 	if len(trimmed) == 0 || trimmed[0] != '"' {
 		return false
 	}
-	if bytes.IndexByte(trimmed, '\\') < 0 {
+	if bytes.IndexByte(trimmed, '\\') < 0 && utf8.Valid(trimmed[1:len(trimmed)-1]) {
 		if len(trimmed) == len(model)+2 && bytes.Equal(trimmed[1:len(trimmed)-1], []byte(model)) {
 			return false
 		}
@@ -1412,6 +1424,9 @@ func matchTokens(s string, tokens []token) ([]string, bool) {
 				return nil, false
 			}
 			end = pos + idx
+		}
+		if captures == nil {
+			captures = make([]string, 0, len(tokens))
 		}
 		captures = append(captures, s[pos:end])
 		pos = end
