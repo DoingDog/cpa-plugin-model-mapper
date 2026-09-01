@@ -134,13 +134,19 @@ func (r *sseRewriter) rewriteEvent(event []byte) ([][]byte, error) {
 
 func sseEventDelimiter(buf []byte, start int) (eventLen, delimLen, next int) {
 	start = max(0, min(start, len(buf)))
-	for i := start; i < len(buf); i++ {
-		if i+1 < len(buf) && buf[i] == '\n' && buf[i+1] == '\n' {
-			return i, 2, 0
-		}
-		if i+3 < len(buf) && buf[i] == '\r' && buf[i+1] == '\n' && buf[i+2] == '\r' && buf[i+3] == '\n' {
-			return i, 4, 0
-		}
+	lf := bytes.Index(buf[start:], []byte("\n\n"))
+	if lf >= 0 {
+		lf += start
+	}
+	crlf := bytes.Index(buf[start:], []byte("\r\n\r\n"))
+	if crlf >= 0 {
+		crlf += start
+	}
+	if lf >= 0 && (crlf < 0 || lf < crlf) {
+		return lf, 2, 0
+	}
+	if crlf >= 0 {
+		return crlf, 4, 0
 	}
 	return 0, 0, max(0, len(buf)-3)
 }
@@ -271,7 +277,7 @@ func isSSEChunk(p []byte) bool {
 
 func isIncompleteSSEPrefix(p []byte) bool {
 	trimmed := bytes.TrimLeft(p, " \t\r\n")
-	if len(trimmed) == 0 || strings.ContainsAny(string(trimmed), "\r\n") {
+	if len(trimmed) == 0 {
 		return false
 	}
 	for _, field := range [][]byte{[]byte("data:"), []byte("event:"), []byte(":")} {

@@ -1017,6 +1017,43 @@ func TestSSERewriterHandlesSplitDelimiters(t *testing.T) {
 	}
 }
 
+func TestIncompleteSSEPrefixLargeRawJSONDoesNotAllocate(t *testing.T) {
+	payload := []byte(`{"type":"response.delta","text":"` + strings.Repeat("x", 64<<10) + `"}`)
+	allocs := testing.AllocsPerRun(100, func() {
+		if isIncompleteSSEPrefix(payload) {
+			panic("raw JSON classified as incomplete SSE prefix")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("isIncompleteSSEPrefix allocations=%v, want 0", allocs)
+	}
+}
+
+func TestSSEEventDelimiterFromScanOffset(t *testing.T) {
+	tests := []struct {
+		name     string
+		buf      string
+		start    int
+		eventLen int
+		delimLen int
+		next     int
+	}{
+		{name: "LF", buf: "data: one\n\ntail", start: 0, eventLen: 9, delimLen: 2},
+		{name: "CRLF", buf: "data: one\r\n\r\ntail", start: 0, eventLen: 9, delimLen: 4},
+		{name: "earliest mixed", buf: "a\n\nb\r\n\r\n", start: 0, eventLen: 1, delimLen: 2},
+		{name: "scan offset", buf: "ignored\n\ndata: two\n\n", start: 9, eventLen: 18, delimLen: 2},
+		{name: "split CRLF tail", buf: "data: one\r\n\r", start: 8, next: 9},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			eventLen, delimLen, next := sseEventDelimiter([]byte(tt.buf), tt.start)
+			if eventLen != tt.eventLen || delimLen != tt.delimLen || next != tt.next {
+				t.Fatalf("delimiter=(%d,%d,%d), want (%d,%d,%d)", eventLen, delimLen, next, tt.eventLen, tt.delimLen, tt.next)
+			}
+		})
+	}
+}
+
 func TestSSERewriterPassesThroughDoneCommentsAndNonJSON(t *testing.T) {
 	r := newSSERewriter("A")
 	input := ": keepalive\n\ndata: [DONE]\n\ndata: hello\n\n"
@@ -1139,6 +1176,19 @@ func TestSSERewriterAvoidsWholeEventCopy(t *testing.T) {
 	})
 	if got, limit := result.AllocedBytesPerOp(), int64(float64(len(input))*2.6); got > limit {
 		t.Fatalf("allocated bytes/op=%d, want <=%d without a whole-event copy", got, limit)
+	}
+}
+
+func BenchmarkSSERewriterCompleteLargeEvent(b *testing.B) {
+	payload := []byte("event: " + strings.Repeat("x", 64<<10) + "\n\n")
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
+	for i := 0; i < b.N; i++ {
+		r := newSSERewriter("client")
+		chunks, err := r.Write(payload)
+		if err != nil || len(chunks) != 2 {
+			b.Fatalf("Write=(%d,%v)", len(chunks), err)
+		}
 	}
 }
 
