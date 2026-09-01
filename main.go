@@ -26,6 +26,7 @@ var pluginVersion = "0.0.0-dev"
 type sseRewriter struct {
 	originalModel string
 	buf           []byte
+	scanFrom      int
 }
 
 type streamChunkRewriter struct {
@@ -51,20 +52,33 @@ func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
 		r.buf = append(r.buf, '\n')
 	}
 	r.buf = append(r.buf, p...)
+	bufferCap := cap(r.buf)
 	var out [][]byte
+	consumed := false
 	for {
-		delim, n := sseEventDelimiter(r.buf)
+		delim, n, next := sseEventDelimiter(r.buf, r.scanFrom)
 		if n == 0 {
+			r.scanFrom = next
 			break
 		}
-		event := append([]byte(nil), r.buf[:delim]...)
+		event := r.buf[:delim]
 		r.buf = r.buf[delim+n:]
+		r.scanFrom = 0
+		consumed = true
 		rewritten, err := r.rewriteEvent(event)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, rewritten...)
 		out = append(out, r.delimiterBytes(n))
+	}
+	if consumed {
+		if len(r.buf) == 0 {
+			r.buf = nil
+			r.scanFrom = 0
+		} else if bufferCap > 2*len(r.buf) {
+			r.buf = bytes.Clone(r.buf)
+		}
 	}
 	return out, nil
 }
@@ -73,8 +87,9 @@ func (r *sseRewriter) Flush() ([][]byte, error) {
 	if len(r.buf) == 0 {
 		return nil, nil
 	}
-	event := append([]byte(nil), r.buf...)
+	event := r.buf
 	r.buf = nil
+	r.scanFrom = 0
 	return r.rewriteEvent(event)
 }
 
@@ -117,16 +132,17 @@ func (r *sseRewriter) rewriteEvent(event []byte) ([][]byte, error) {
 	return out, nil
 }
 
-func sseEventDelimiter(buf []byte) (eventLen, delimLen int) {
-	lf := bytes.Index(buf, []byte("\n\n"))
-	crlf := bytes.Index(buf, []byte("\r\n\r\n"))
-	if lf < 0 && crlf < 0 {
-		return 0, 0
+func sseEventDelimiter(buf []byte, start int) (eventLen, delimLen, next int) {
+	start = max(0, min(start, len(buf)))
+	for i := start; i < len(buf); i++ {
+		if i+1 < len(buf) && buf[i] == '\n' && buf[i+1] == '\n' {
+			return i, 2, 0
+		}
+		if i+3 < len(buf) && buf[i] == '\r' && buf[i+1] == '\n' && buf[i+2] == '\r' && buf[i+3] == '\n' {
+			return i, 4, 0
+		}
 	}
-	if lf >= 0 && (crlf < 0 || lf < crlf) {
-		return lf, 2
-	}
-	return crlf, 4
+	return 0, 0, max(0, len(buf)-3)
 }
 
 func (r *sseRewriter) delimiterBytes(n int) []byte {
@@ -168,15 +184,7 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 		r.pending = append(r.pending, p...)
 		return nil, nil
 	}
-	restored, changed, err := restoreResponseModel(p, r.originalModel)
-	if err != nil {
-		return nil, err
-	}
-	out := append([]byte(nil), p...)
-	if changed {
-		out = restored
-	}
-	return r.rawJSONChunks(out)
+	return r.rawJSONChunks(p)
 }
 
 func (r *streamChunkRewriter) rawJSONChunks(p []byte) ([][]byte, error) {
@@ -220,7 +228,7 @@ func splitJSONValues(p []byte) ([][]byte, bool) {
 		if err != nil {
 			return nil, false
 		}
-		values = append(values, append([]byte(nil), raw...))
+		values = append(values, raw)
 	}
 	return values, len(values) > 0
 }
@@ -275,11 +283,15 @@ func isIncompleteSSEPrefix(p []byte) bool {
 }
 
 type Config struct {
-	Enabled                bool   `json:"enabled"`
 	GlobalRules            string `json:"global_rules"`
 	ClaudeMessagesRules    string `json:"claude_messages_rules"`
 	CodexResponsesRules    string `json:"codex_responses_rules"`
 	OpenAICompletionsRules string `json:"openai_completions_rules"`
+
+	globalRules            []rule
+	claudeMessagesRules    []rule
+	codexResponsesRules    []rule
+	openAICompletionsRules []rule
 }
 
 type registration struct {
@@ -305,7 +317,6 @@ func pluginRegistration() registration {
 			Author:           "DoingDog",
 			GitHubRepository: "https://github.com/DoingDog/cpa-plugin-model-mapper",
 			ConfigFields: []pluginapi.ConfigField{
-				{Name: "enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enable model request mapping."},
 				{Name: "global_rules", Type: pluginapi.ConfigFieldTypeString, Description: "Fallback rules used when an endpoint-specific ruleset is empty."},
 				{Name: "claude_messages_rules", Type: pluginapi.ConfigFieldTypeString, Description: "Rules for Claude Messages-compatible requests."},
 				{Name: "codex_responses_rules", Type: pluginapi.ConfigFieldTypeString, Description: "Rules for OpenAI Responses/Codex-compatible requests."},
@@ -330,15 +341,31 @@ func decodeConfig(raw json.RawMessage) (Config, error) {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return Config{}, err
 	}
-	for _, rules := range []string{cfg.GlobalRules, cfg.ClaudeMessagesRules, cfg.CodexResponsesRules, cfg.OpenAICompletionsRules} {
-		if rules == "" {
-			continue
-		}
-		if _, err := parseRules(rules); err != nil {
-			return Config{}, err
-		}
+	return compileConfig(cfg)
+}
+
+func compileConfig(cfg Config) (Config, error) {
+	var err error
+	if cfg.globalRules, err = compileRuleSet(cfg.GlobalRules); err != nil {
+		return Config{}, err
+	}
+	if cfg.claudeMessagesRules, err = compileRuleSet(cfg.ClaudeMessagesRules); err != nil {
+		return Config{}, err
+	}
+	if cfg.codexResponsesRules, err = compileRuleSet(cfg.CodexResponsesRules); err != nil {
+		return Config{}, err
+	}
+	if cfg.openAICompletionsRules, err = compileRuleSet(cfg.OpenAICompletionsRules); err != nil {
+		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func compileRuleSet(raw string) ([]rule, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	return parseRules(raw)
 }
 
 type callerPatternCacheKey struct {
@@ -347,9 +374,11 @@ type callerPatternCacheKey struct {
 }
 
 var (
-	loadedConfigMu     sync.RWMutex
-	loadedCfg          = defaultConfig()
-	callerPatternCache = make(map[callerPatternCacheKey]bool)
+	loadedConfigMu sync.RWMutex
+	loadedCfg      = defaultConfig()
+
+	callerPatternCacheMu sync.RWMutex
+	callerPatternCache   = make(map[callerPatternCacheKey]bool)
 
 	hostAPIMu      sync.RWMutex
 	hostCallbackFn hostCallback
@@ -364,9 +393,14 @@ func loadedConfig() Config {
 }
 
 func setLoadedConfigForTest(cfg Config) {
+	if compiled, err := compileConfig(cfg); err == nil {
+		cfg = compiled
+	}
 	loadedConfigMu.Lock()
+	callerPatternCacheMu.Lock()
 	loadedCfg = cfg
 	callerPatternCache = make(map[callerPatternCacheKey]bool)
+	callerPatternCacheMu.Unlock()
 	loadedConfigMu.Unlock()
 }
 
@@ -399,29 +433,37 @@ type routeDecision struct {
 	UpstreamModel string
 }
 
-func selectRules(cfg Config, format string) (string, bool) {
+func selectRules(cfg Config, format string) (string, []rule, bool) {
 	switch format {
 	case "claude":
 		if cfg.ClaudeMessagesRules != "" {
-			return cfg.ClaudeMessagesRules, true
+			return cfg.ClaudeMessagesRules, cfg.claudeMessagesRules, true
 		}
 	case "openai-response":
 		if cfg.CodexResponsesRules != "" {
-			return cfg.CodexResponsesRules, true
+			return cfg.CodexResponsesRules, cfg.codexResponsesRules, true
 		}
 	case "openai":
 		if cfg.OpenAICompletionsRules != "" {
-			return cfg.OpenAICompletionsRules, true
+			return cfg.OpenAICompletionsRules, cfg.openAICompletionsRules, true
 		}
 	}
 	if cfg.GlobalRules != "" {
-		return cfg.GlobalRules, true
+		return cfg.GlobalRules, cfg.globalRules, true
 	}
-	return "", false
+	return "", nil, false
+}
+
+type modelRouteRPCRequest struct {
+	SourceFormat   string
+	RequestedModel string
+	Headers        http.Header
+	Query          url.Values
+	Metadata       map[string]any
 }
 
 func handleModelRoute(raw []byte) ([]byte, error) {
-	var req pluginapi.ModelRouteRequest
+	var req modelRouteRPCRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
@@ -437,16 +479,16 @@ func handleModelRoute(raw []byte) ([]byte, error) {
 }
 
 func routeModel(cfg Config, format, model, scope, key string) (routeDecision, error) {
-	if !cfg.Enabled {
-		return routeDecision{}, nil
-	}
-	raw, ok := selectRules(cfg, format)
+	raw, rules, ok := selectRules(cfg, format)
 	if !ok {
 		return routeDecision{}, nil
 	}
-	rules, err := parseRules(raw)
-	if err != nil {
-		return routeDecision{}, err
+	if rules == nil {
+		var err error
+		rules, err = parseRules(raw)
+		if err != nil {
+			return routeDecision{}, err
+		}
 	}
 	mapped, matched, err := applyRules(model, scope, key, rules)
 	if err != nil {
@@ -469,9 +511,16 @@ func restoreResponseModel(body []byte, originalModel string) ([]byte, bool, erro
 type hostCaller func(method string, payload any) (json.RawMessage, error)
 
 type executorRPCRequest struct {
-	pluginapi.ExecutorRequest
-	HostCallbackID string `json:"host_callback_id,omitempty"`
-	StreamID       string `json:"stream_id,omitempty"`
+	Model           string
+	Format          string
+	Alt             string
+	Headers         http.Header
+	Query           url.Values
+	OriginalRequest []byte
+	SourceFormat    string
+	Metadata        map[string]any
+	HostCallbackID  string `json:"host_callback_id,omitempty"`
+	StreamID        string `json:"stream_id,omitempty"`
 }
 
 type hostModelExecutePayload struct {
@@ -681,22 +730,14 @@ func handleExecutorExecute(raw []byte, call hostCaller) ([]byte, error) {
 	return json.Marshal(pluginapi.ExecutorResponse{Payload: payload, Headers: hostResp.Headers})
 }
 
-func okEnvelope(v any) ([]byte, error) {
-	if v == nil {
-		v = map[string]any{}
-	}
-	raw, err := json.Marshal(v)
-	if err != nil {
-		return nil, err
-	}
-	return json.Marshal(pluginabi.Envelope{OK: true, Result: raw})
-}
-
 func wrapEnvelope(payload []byte, err error) ([]byte, error) {
 	if err != nil {
 		return errorEnvelope("plugin_error", err.Error()), nil
 	}
-	return okEnvelope(json.RawMessage(payload))
+	if len(payload) == 0 {
+		payload = []byte("null")
+	}
+	return json.Marshal(pluginabi.Envelope{OK: true, Result: json.RawMessage(payload)})
 }
 
 func errorEnvelope(code, message string) []byte {
@@ -758,8 +799,6 @@ func decodeLifecycleConfig(raw []byte) (json.RawMessage, bool, error) {
 			key = strings.TrimSpace(key)
 			value = unquoteYAMLScalar(strings.TrimSpace(value))
 			switch key {
-			case "enabled":
-				cfg.Enabled = strings.EqualFold(value, "true")
 			case "global_rules":
 				cfg.GlobalRules = value
 			case "claude_messages_rules":
@@ -818,17 +857,20 @@ func callHost(method string, payload any) (json.RawMessage, error) {
 		}
 		return nil, fmt.Errorf("host callback %s failed: %s", method, env.Error.Message)
 	}
-	return append(json.RawMessage(nil), env.Result...), nil
+	return env.Result, nil
 }
 
 func rewriteTopLevelModel(body []byte, model string) ([]byte, bool, error) {
-	var doc map[string]any
+	var doc map[string]json.RawMessage
 	if err := json.Unmarshal(body, &doc); err != nil {
-		return append([]byte(nil), body...), false, nil
+		return bytes.Clone(body), false, nil
 	}
-	changed := rewriteStringField(doc, "model", model)
-	if !changed {
-		return append([]byte(nil), body...), false, nil
+	replacement, err := json.Marshal(model)
+	if err != nil {
+		return nil, false, err
+	}
+	if !rewriteRawStringField(doc, "model", model, replacement) {
+		return bytes.Clone(body), false, nil
 	}
 	out, err := json.Marshal(doc)
 	if err != nil {
@@ -838,13 +880,28 @@ func rewriteTopLevelModel(body []byte, model string) ([]byte, bool, error) {
 }
 
 func rewriteResponseModelFields(body []byte, model string) ([]byte, bool, error) {
-	var doc map[string]any
+	var doc map[string]json.RawMessage
 	if err := json.Unmarshal(body, &doc); err != nil {
-		return append([]byte(nil), body...), false, nil
+		return bytes.Clone(body), false, nil
 	}
-	changed := rewriteModelFields(doc, model)
+	replacement, err := json.Marshal(model)
+	if err != nil {
+		return nil, false, err
+	}
+	changed := rewriteRawStringField(doc, "model", model, replacement)
+	changed = rewriteRawStringField(doc, "modelVersion", model, replacement) || changed
+	messageChanged, err := rewriteNestedRawStringFields(doc, "message", model, replacement, "model")
+	if err != nil {
+		return nil, false, err
+	}
+	changed = messageChanged || changed
+	responseChanged, err := rewriteNestedRawStringFields(doc, "response", model, replacement, "model", "modelVersion")
+	if err != nil {
+		return nil, false, err
+	}
+	changed = responseChanged || changed
 	if !changed {
-		return append([]byte(nil), body...), false, nil
+		return bytes.Clone(body), false, nil
 	}
 	out, err := json.Marshal(doc)
 	if err != nil {
@@ -853,29 +910,44 @@ func rewriteResponseModelFields(body []byte, model string) ([]byte, bool, error)
 	return out, true, nil
 }
 
-func rewriteModelFields(doc map[string]any, model string) bool {
-	changed := rewriteStringField(doc, "model", model)
-	changed = rewriteStringField(doc, "modelVersion", model) || changed
-	changed = rewriteNestedModelFields(doc, "message", model) || changed
-	changed = rewriteNestedModelFields(doc, "response", model) || changed
-	return changed
+func rewriteNestedRawStringFields(doc map[string]json.RawMessage, key, model string, replacement json.RawMessage, fields ...string) (bool, error) {
+	raw, ok := doc[key]
+	if !ok {
+		return false, nil
+	}
+	var nested map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &nested); err != nil {
+		return false, nil
+	}
+	changed := false
+	for _, field := range fields {
+		changed = rewriteRawStringField(nested, field, model, replacement) || changed
+	}
+	if !changed {
+		return false, nil
+	}
+	out, err := json.Marshal(nested)
+	if err != nil {
+		return false, err
+	}
+	doc[key] = out
+	return true, nil
 }
 
-func rewriteNestedModelFields(doc map[string]any, key string, model string) bool {
-	nested, ok := doc[key].(map[string]any)
+func rewriteRawStringField(doc map[string]json.RawMessage, key, model string, replacement json.RawMessage) bool {
+	raw, ok := doc[key]
 	if !ok {
 		return false
 	}
-	changed := rewriteStringField(nested, "model", model)
-	changed = rewriteStringField(nested, "modelVersion", model) || changed
-	return changed
-}
-
-func rewriteStringField(doc map[string]any, key string, model string) bool {
-	if _, ok := doc[key].(string); !ok {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '"' {
 		return false
 	}
-	doc[key] = model
+	var current string
+	if err := json.Unmarshal(trimmed, &current); err != nil || current == model {
+		return false
+	}
+	doc[key] = replacement
 	return true
 }
 
@@ -947,7 +1019,7 @@ func callerAPIKey(headers http.Header, query url.Values, scope string) string {
 }
 
 func defaultConfig() Config {
-	return Config{Enabled: true}
+	return Config{}
 }
 
 func parseRules(raw string) ([]rule, error) {
@@ -1196,17 +1268,24 @@ func applyASCIIModelCase(model string, operation caseOperation) string {
 
 func callerPatternMatch(r rule, scope, key string) (bool, bool) {
 	cacheKey := callerPatternCacheKey{scope: scope, pattern: r.callerPatternText}
-	if key != "" && callerScope(key) == scope {
-		_, matched := matchTokens(key, r.callerPattern)
-		loadedConfigMu.Lock()
-		callerPatternCache[cacheKey] = matched
-		loadedConfigMu.Unlock()
+	callerPatternCacheMu.RLock()
+	matched, ok := callerPatternCache[cacheKey]
+	callerPatternCacheMu.RUnlock()
+	if ok {
 		return matched, true
 	}
-	loadedConfigMu.RLock()
-	matched, ok := callerPatternCache[cacheKey]
-	loadedConfigMu.RUnlock()
-	return matched, ok
+	if key == "" || callerScope(key) != scope {
+		return false, false
+	}
+	_, matched = matchTokens(key, r.callerPattern)
+	callerPatternCacheMu.Lock()
+	if cached, exists := callerPatternCache[cacheKey]; exists {
+		matched = cached
+	} else {
+		callerPatternCache[cacheKey] = matched
+	}
+	callerPatternCacheMu.Unlock()
+	return matched, true
 }
 
 func callerMatchesRule(r rule, scope, key string) bool {

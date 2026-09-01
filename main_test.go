@@ -8,9 +8,11 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	pluginabi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	pluginapi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -39,7 +41,7 @@ func TestPluginRegistrationMetadataAndConfigFields(t *testing.T) {
 	if !reflect.DeepEqual(reg.Capabilities.ExecutorOutputFormats, []string{"openai", "claude", "openai-response"}) {
 		t.Fatalf("executor output formats=%v", reg.Capabilities.ExecutorOutputFormats)
 	}
-	wantFields := []string{"enabled", "global_rules", "claude_messages_rules", "codex_responses_rules", "openai_completions_rules"}
+	wantFields := []string{"global_rules", "claude_messages_rules", "codex_responses_rules", "openai_completions_rules"}
 	got := make([]string, 0, len(reg.Metadata.ConfigFields))
 	for _, field := range reg.Metadata.ConfigFields {
 		got = append(got, field.Name)
@@ -94,12 +96,8 @@ func TestDecodeLifecycleConfigPreservesCaseOperations(t *testing.T) {
 }
 
 func TestDecodeConfigDefaultAndBadRules(t *testing.T) {
-	cfg, err := decodeConfig(nil)
-	if err != nil {
+	if _, err := decodeConfig(nil); err != nil {
 		t.Fatalf("decodeConfig nil error = %v", err)
-	}
-	if !cfg.Enabled {
-		t.Fatalf("decoded default enabled=false")
 	}
 	if _, err := decodeConfig(json.RawMessage(`{"enabled":true,"global_rules":"bad rule"}`)); err == nil {
 		t.Fatalf("decodeConfig bad rules error = nil")
@@ -114,20 +112,59 @@ func TestDecodeConfigDefaultAndBadRules(t *testing.T) {
 	if _, err := decodeConfig(badOperation); err == nil {
 		t.Fatalf("decodeConfig unknown operation error = nil")
 	}
-	cfg, err = decodeConfig(json.RawMessage(`{"enabled":false,"global_rules":"a=>b"}`))
+}
+
+func TestDecodeConfigIgnoresCPAEnabled(t *testing.T) {
+	cfg, err := decodeConfig(json.RawMessage(`{"enabled":false,"global_rules":"a=>b"}`))
 	if err != nil {
-		t.Fatalf("decodeConfig valid error = %v", err)
+		t.Fatalf("decodeConfig error = %v", err)
 	}
-	if cfg.Enabled {
-		t.Fatalf("enabled=true, want false from config")
+	decision, err := routeModel(cfg, "openai", "a", "", "")
+	if err != nil {
+		t.Fatalf("routeModel error = %v", err)
+	}
+	if !decision.Handled || decision.UpstreamModel != "b" {
+		t.Fatalf("decision=%#v, want a=>b", decision)
 	}
 }
 
-func TestDefaultConfigEnabledTrue(t *testing.T) {
-	cfg := defaultConfig()
-	if !cfg.Enabled {
-		t.Fatalf("default enabled = false, want true")
+func TestRouteModelReusesDecodedRules(t *testing.T) {
+	var rawRules strings.Builder
+	for i := 0; i < 24; i++ {
+		if i > 0 {
+			rawRules.WriteByte(';')
+		}
+		fmt.Fprintf(&rawRules, "model-%d=>target-%d", i, i)
 	}
+	rawConfig, err := json.Marshal(map[string]string{"global_rules": rawRules.String()})
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	decoded, err := decodeConfig(rawConfig)
+	if err != nil {
+		t.Fatalf("decodeConfig error = %v", err)
+	}
+	direct := Config{GlobalRules: rawRules.String()}
+
+	decodedAllocs := testing.AllocsPerRun(100, func() {
+		decision, err := routeModel(decoded, "openai", "model-23", "", "")
+		if err != nil || !decision.Handled {
+			panic(fmt.Sprintf("decoded route failed: %#v %v", decision, err))
+		}
+	})
+	directAllocs := testing.AllocsPerRun(100, func() {
+		decision, err := routeModel(direct, "openai", "model-23", "", "")
+		if err != nil || !decision.Handled {
+			panic(fmt.Sprintf("direct route failed: %#v %v", decision, err))
+		}
+	})
+	if decodedAllocs >= directAllocs {
+		t.Fatalf("decoded config allocations=%v, direct config allocations=%v; decoded rules were not reused", decodedAllocs, directAllocs)
+	}
+}
+
+func TestDefaultConfigRulesEmpty(t *testing.T) {
+	cfg := defaultConfig()
 	if cfg.GlobalRules != "" || cfg.ClaudeMessagesRules != "" || cfg.CodexResponsesRules != "" || cfg.OpenAICompletionsRules != "" {
 		t.Fatalf("default rule fields must be empty: %#v", cfg)
 	}
@@ -482,14 +519,14 @@ func TestApplyRulesSinglePassNoLoop(t *testing.T) {
 }
 
 func TestSelectRulesEndpointSpecificOverridesGlobal(t *testing.T) {
-	cfg := Config{Enabled: true, GlobalRules: "global=>x", ClaudeMessagesRules: "claude=>x", CodexResponsesRules: "codex=>x", OpenAICompletionsRules: "openai=>x"}
+	cfg := Config{GlobalRules: "global=>x", ClaudeMessagesRules: "claude=>x", CodexResponsesRules: "codex=>x", OpenAICompletionsRules: "openai=>x"}
 	tests := map[string]string{
 		"claude":          "claude=>x",
 		"openai-response": "codex=>x",
 		"openai":          "openai=>x",
 	}
 	for format, want := range tests {
-		raw, ok := selectRules(cfg, format)
+		raw, _, ok := selectRules(cfg, format)
 		if !ok || raw != want {
 			t.Fatalf("selectRules(%q)=(%q,%v), want %q true", format, raw, ok, want)
 		}
@@ -497,9 +534,9 @@ func TestSelectRulesEndpointSpecificOverridesGlobal(t *testing.T) {
 }
 
 func TestSelectRulesFallsBackToGlobal(t *testing.T) {
-	cfg := Config{Enabled: true, GlobalRules: "global=>x"}
+	cfg := Config{GlobalRules: "global=>x"}
 	for _, format := range []string{"claude", "openai-response", "openai", "gemini"} {
-		raw, ok := selectRules(cfg, format)
+		raw, _, ok := selectRules(cfg, format)
 		if !ok || raw != "global=>x" {
 			t.Fatalf("selectRules(%q)=(%q,%v), want global=>x true", format, raw, ok)
 		}
@@ -507,7 +544,7 @@ func TestSelectRulesFallsBackToGlobal(t *testing.T) {
 }
 
 func TestSelectRulesBothEmptySkips(t *testing.T) {
-	if raw, ok := selectRules(defaultConfig(), "claude"); ok || raw != "" {
+	if raw, _, ok := selectRules(defaultConfig(), "claude"); ok || raw != "" {
 		t.Fatalf("selectRules empty=(%q,%v), want empty false", raw, ok)
 	}
 }
@@ -519,10 +556,10 @@ func TestRouteModelAPIKeyScopeAcrossRuleSets(t *testing.T) {
 		cfg    Config
 		format string
 	}{
-		{name: "global rules plus openai", cfg: Config{Enabled: true, GlobalRules: rules}, format: "openai"},
-		{name: "claude messages rules plus claude", cfg: Config{Enabled: true, ClaudeMessagesRules: rules}, format: "claude"},
-		{name: "codex responses rules plus openai response", cfg: Config{Enabled: true, CodexResponsesRules: rules}, format: "openai-response"},
-		{name: "openai completions rules plus openai", cfg: Config{Enabled: true, OpenAICompletionsRules: rules}, format: "openai"},
+		{name: "global rules plus openai", cfg: Config{GlobalRules: rules}, format: "openai"},
+		{name: "claude messages rules plus claude", cfg: Config{ClaudeMessagesRules: rules}, format: "claude"},
+		{name: "codex responses rules plus openai response", cfg: Config{CodexResponsesRules: rules}, format: "openai-response"},
+		{name: "openai completions rules plus openai", cfg: Config{OpenAICompletionsRules: rules}, format: "openai"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -547,17 +584,16 @@ func TestRouteModelAPIKeyScopeAcrossRuleSets(t *testing.T) {
 	}
 }
 
-func TestRouteModelSkipsDisabledNoRulesUnmatchedAndUnchanged(t *testing.T) {
+func TestRouteModelSkipsNoRulesUnmatchedAndUnchanged(t *testing.T) {
 	tests := []struct {
 		name   string
 		cfg    Config
 		format string
 		model  string
 	}{
-		{name: "disabled", cfg: Config{Enabled: false, GlobalRules: "a=>b"}, format: "openai", model: "a"},
 		{name: "no rules", cfg: defaultConfig(), format: "openai", model: "a"},
-		{name: "unmatched", cfg: Config{Enabled: true, GlobalRules: "x=>y"}, format: "openai", model: "a"},
-		{name: "unchanged", cfg: Config{Enabled: true, GlobalRules: "a=>a"}, format: "openai", model: "a"},
+		{name: "unmatched", cfg: Config{GlobalRules: "x=>y"}, format: "openai", model: "a"},
+		{name: "unchanged", cfg: Config{GlobalRules: "a=>a"}, format: "openai", model: "a"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -573,7 +609,7 @@ func TestRouteModelSkipsDisabledNoRulesUnmatchedAndUnchanged(t *testing.T) {
 }
 
 func TestRouteModelHandlesOnlyMatchedChanged(t *testing.T) {
-	cfg := Config{Enabled: true, OpenAICompletionsRules: "deepseek-v4-pro=>deepseek-v4-flash;deepseek-v4-flash=>gpt-5.4-mini", GlobalRules: "deepseek-v4-pro=>wrong"}
+	cfg := Config{OpenAICompletionsRules: "deepseek-v4-pro=>deepseek-v4-flash;deepseek-v4-flash=>gpt-5.4-mini", GlobalRules: "deepseek-v4-pro=>wrong"}
 	decision, err := routeModel(cfg, "openai", "deepseek-v4-pro", "", "")
 	if err != nil {
 		t.Fatalf("routeModel error = %v", err)
@@ -584,7 +620,7 @@ func TestRouteModelHandlesOnlyMatchedChanged(t *testing.T) {
 }
 
 func TestRouteModelCaseOperationChanged(t *testing.T) {
-	cfg := Config{Enabled: true, GlobalRules: `\A`}
+	cfg := Config{GlobalRules: `\A`}
 	decision, err := routeModel(cfg, "openai", "model-v2", "", "")
 	if err != nil {
 		t.Fatalf("routeModel error = %v", err)
@@ -606,7 +642,7 @@ func TestRouteModelCaseOperationNoChangeIsUnhandled(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			decision, err := routeModel(Config{Enabled: true, GlobalRules: tt.rules}, "openai", tt.model, "", "")
+			decision, err := routeModel(Config{GlobalRules: tt.rules}, "openai", tt.model, "", "")
 			if err != nil {
 				t.Fatalf("routeModel error = %v", err)
 			}
@@ -618,14 +654,14 @@ func TestRouteModelCaseOperationNoChangeIsUnhandled(t *testing.T) {
 }
 
 func TestRouteModelBadSelectedRulesErrors(t *testing.T) {
-	cfg := Config{Enabled: true, ClaudeMessagesRules: "bad rule"}
+	cfg := Config{ClaudeMessagesRules: "bad rule"}
 	if _, err := routeModel(cfg, "claude", "a", "", ""); err == nil {
 		t.Fatalf("routeModel bad selected rules error = nil")
 	}
 }
 
 func TestHandleModelRouteUnhandledWhenNoChange(t *testing.T) {
-	setLoadedConfigForTest(Config{Enabled: true, GlobalRules: "a=>a"})
+	setLoadedConfigForTest(Config{GlobalRules: "a=>a"})
 	raw, err := json.Marshal(pluginapi.ModelRouteRequest{SourceFormat: "openai", RequestedModel: "a"})
 	if err != nil {
 		t.Fatalf("marshal request: %v", err)
@@ -644,7 +680,7 @@ func TestHandleModelRouteUnhandledWhenNoChange(t *testing.T) {
 }
 
 func TestHandleModelRouteHandledSelfForChangedModel(t *testing.T) {
-	setLoadedConfigForTest(Config{Enabled: true, GlobalRules: "deepseek-v4-pro=>gpt-5.4-mini"})
+	setLoadedConfigForTest(Config{GlobalRules: "deepseek-v4-pro=>gpt-5.4-mini"})
 	raw, err := json.Marshal(pluginapi.ModelRouteRequest{SourceFormat: "openai", RequestedModel: "deepseek-v4-pro"})
 	if err != nil {
 		t.Fatalf("marshal request: %v", err)
@@ -662,6 +698,22 @@ func TestHandleModelRouteHandledSelfForChangedModel(t *testing.T) {
 	}
 	if resp.TargetModel != "" {
 		t.Fatalf("self route TargetModel=%q, want empty because SDK only defines it for provider routes", resp.TargetModel)
+	}
+}
+
+func TestHandleModelRouteIgnoresUnusedBody(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "a=>b"})
+	raw := []byte(`{"SourceFormat":"openai","RequestedModel":"a","Body":{"unused":true}}`)
+	respRaw, err := handleModelRoute(raw)
+	if err != nil {
+		t.Fatalf("handleModelRoute error = %v", err)
+	}
+	var resp pluginapi.ModelRouteResponse
+	if err := json.Unmarshal(respRaw, &resp); err != nil {
+		t.Fatalf("decode route response: %v", err)
+	}
+	if !resp.Handled || resp.TargetKind != pluginapi.ModelRouteTargetSelf {
+		t.Fatalf("route response=%#v, want handled self route", resp)
 	}
 }
 
@@ -691,7 +743,7 @@ func TestHandleModelRouteUsesCallerScope(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			setLoadedConfigForTest(Config{Enabled: true, GlobalRules: tt.rules})
+			setLoadedConfigForTest(Config{GlobalRules: tt.rules})
 			raw, err := json.Marshal(pluginapi.ModelRouteRequest{SourceFormat: "openai", RequestedModel: "a", Metadata: tt.metadata, Headers: tt.headers, Query: tt.query})
 			if err != nil {
 				t.Fatalf("marshal request: %v", err)
@@ -708,6 +760,73 @@ func TestHandleModelRouteUsesCallerScope(t *testing.T) {
 				t.Fatalf("Handled=%v, want %v", resp.Handled, tt.handled)
 			}
 		})
+	}
+}
+
+func TestModelRewriteTreatsOpaqueContentAsRawJSON(t *testing.T) {
+	request := []byte(`{"model":"A","counter":9007199254740993,"message":{"model":"nested"},"content":[{"model":"content"}]}`)
+	rewritten, changed, err := rewriteRequestModel(request, "B")
+	if err != nil {
+		t.Fatalf("rewriteRequestModel error = %v", err)
+	}
+	if !changed || !bytes.Contains(rewritten, []byte(`9007199254740993`)) {
+		t.Fatalf("changed=%v body=%s, want exact opaque integer", changed, rewritten)
+	}
+	var requestDoc map[string]json.RawMessage
+	if err := json.Unmarshal(rewritten, &requestDoc); err != nil {
+		t.Fatalf("decode request: %v", err)
+	}
+	if string(requestDoc["model"]) != `"B"` || string(requestDoc["message"]) != `{"model":"nested"}` || string(requestDoc["content"]) != `[{"model":"content"}]` {
+		t.Fatalf("request rewrite touched unsupported fields: %s", rewritten)
+	}
+
+	response := []byte(`{"model":"upstream","modelVersion":"upstream","counter":9007199254740993,"message":{"model":"upstream","modelVersion":"keep-message-version","nested":{"model":"keep-nested"}},"response":{"model":"upstream","modelVersion":"upstream","output":[{"model":"keep-output"}]},"content":[{"model":"keep-content"}]}`)
+	restored, changed, err := restoreResponseModel(response, "client")
+	if err != nil {
+		t.Fatalf("restoreResponseModel error = %v", err)
+	}
+	if !changed || !bytes.Contains(restored, []byte(`9007199254740993`)) {
+		t.Fatalf("changed=%v body=%s, want exact opaque integer", changed, restored)
+	}
+	var responseDoc map[string]json.RawMessage
+	if err := json.Unmarshal(restored, &responseDoc); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	for _, key := range []string{"model", "modelVersion"} {
+		if string(responseDoc[key]) != `"client"` {
+			t.Fatalf("%s=%s, want client", key, responseDoc[key])
+		}
+	}
+	var message, nestedResponse map[string]json.RawMessage
+	if err := json.Unmarshal(responseDoc["message"], &message); err != nil {
+		t.Fatalf("decode message: %v", err)
+	}
+	if err := json.Unmarshal(responseDoc["response"], &nestedResponse); err != nil {
+		t.Fatalf("decode nested response: %v", err)
+	}
+	if string(message["model"]) != `"client"` || string(message["modelVersion"]) != `"keep-message-version"` || string(message["nested"]) != `{"model":"keep-nested"}` {
+		t.Fatalf("message=%s, response whitelist violated", responseDoc["message"])
+	}
+	if string(nestedResponse["model"]) != `"client"` || string(nestedResponse["modelVersion"]) != `"client"` || string(nestedResponse["output"]) != `[{"model":"keep-output"}]` {
+		t.Fatalf("response=%s, response whitelist violated", responseDoc["response"])
+	}
+	if string(responseDoc["content"]) != `[{"model":"keep-content"}]` {
+		t.Fatalf("content=%s, want unchanged", responseDoc["content"])
+	}
+
+	small := []byte(`{"model":"A","messages":[{"value":1}]}`)
+	item := `{"value":9007199254740993,"content":{"model":"opaque"}}`
+	large := []byte(`{"model":"A","messages":[` + strings.TrimSuffix(strings.Repeat(item+",", 256), ",") + `]}`)
+	allocs := func(body []byte) float64 {
+		return testing.AllocsPerRun(50, func() {
+			if _, _, err := rewriteRequestModel(body, "B"); err != nil {
+				panic(err)
+			}
+		})
+	}
+	smallAllocs, largeAllocs := allocs(small), allocs(large)
+	if largeAllocs > smallAllocs+32 {
+		t.Fatalf("rewrite allocations scale with opaque nodes: small=%v large=%v", smallAllocs, largeAllocs)
 	}
 }
 
@@ -828,6 +947,31 @@ func TestSSERewriterBuffersSplitJSONUntilComplete(t *testing.T) {
 	}
 }
 
+func TestSSERewriterHandlesSplitDelimiters(t *testing.T) {
+	for _, delimiter := range []string{"\n\n", "\r\n\r\n"} {
+		for split := 1; split < len(delimiter); split++ {
+			t.Run(fmt.Sprintf("%q at %d", delimiter, split), func(t *testing.T) {
+				r := newSSERewriter("A")
+				prefix := "data: hello" + delimiter[:split]
+				out, err := r.Write([]byte(prefix))
+				if err != nil {
+					t.Fatalf("first Write error = %v", err)
+				}
+				if len(out) != 0 {
+					t.Fatalf("first Write chunks=%q, want buffered", out)
+				}
+				out, err = r.Write([]byte(delimiter[split:]))
+				if err != nil {
+					t.Fatalf("second Write error = %v", err)
+				}
+				if got, want := flattenChunks(out), "data: hello"+delimiter; got != want {
+					t.Fatalf("output=%q, want %q", got, want)
+				}
+			})
+		}
+	}
+}
+
 func TestSSERewriterPassesThroughDoneCommentsAndNonJSON(t *testing.T) {
 	r := newSSERewriter("A")
 	input := ": keepalive\n\ndata: [DONE]\n\ndata: hello\n\n"
@@ -904,10 +1048,67 @@ func TestSSERewriterPreservesMultilineEventBoundaries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Write error = %v", err)
 	}
-	got := flattenChunks(out)
-	want := "event: message\ndata: {\"model\":\"A\"}\nid: 1\n\n"
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
+	want := [][]byte{
+		[]byte("event: message\n"),
+		[]byte("data: {\"model\":\"A\"}\n"),
+		[]byte("id: 1"),
+		[]byte("\n\n"),
+	}
+	if !reflect.DeepEqual(out, want) {
+		t.Fatalf("chunks=%q, want %q", out, want)
+	}
+}
+
+func TestSSERewriterReleasesLargeEventBufferAfterSmallTail(t *testing.T) {
+	r := newSSERewriter("A")
+	input := "event: " + strings.Repeat("x", 256<<10) + "\n\nx"
+	backing := make([]byte, len(input))
+	copy(backing, input)
+	r.buf = backing
+	start := uintptr(unsafe.Pointer(unsafe.SliceData(backing)))
+	end := start + uintptr(cap(backing))
+	if _, err := r.Write(nil); err != nil {
+		t.Fatalf("Write error = %v", err)
+	}
+	if string(r.buf) != "x" {
+		t.Fatalf("tail=%q, want x", r.buf)
+	}
+	tail := uintptr(unsafe.Pointer(unsafe.SliceData(r.buf)))
+	runtime.KeepAlive(backing)
+	if tail >= start && tail < end {
+		t.Fatal("small tail still aliases the consumed event allocation")
+	}
+}
+
+func TestSSERewriterAvoidsWholeEventCopy(t *testing.T) {
+	input := []byte("event: " + strings.Repeat("x", 256<<10) + "\n\n")
+	result := testing.Benchmark(func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			r := newSSERewriter("A")
+			chunks, err := r.Write(input)
+			if err != nil || len(chunks) != 2 {
+				b.Fatalf("Write=(%d,%v)", len(chunks), err)
+			}
+		}
+	})
+	if got, limit := result.AllocedBytesPerOp(), int64(float64(len(input))*2.6); got > limit {
+		t.Fatalf("allocated bytes/op=%d, want <=%d without a whole-event copy", got, limit)
+	}
+}
+
+func BenchmarkSSERewriterSplitLargeEvent(b *testing.B) {
+	payload := []byte("data: {\"text\":\"" + strings.Repeat("x", 64<<10) + "\"}\n\n")
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
+	for i := 0; i < b.N; i++ {
+		r := newSSERewriter("A")
+		for start := 0; start < len(payload); start += 32 {
+			end := min(start+32, len(payload))
+			if _, err := r.Write(payload[start:end]); err != nil {
+				b.Fatal(err)
+			}
+		}
 	}
 }
 
@@ -936,7 +1137,7 @@ type hostModelExecutionRequest struct {
 }
 
 func TestHandleExecutorExecuteForwardsMappedRequestAndRestoresResponse(t *testing.T) {
-	setLoadedConfigForTest(Config{Enabled: true, GlobalRules: "deepseek-v4-pro=>gpt-5.4-mini"})
+	setLoadedConfigForTest(Config{GlobalRules: "deepseek-v4-pro=>gpt-5.4-mini"})
 	req := rpcExecutorRequest{
 		ExecutorRequest: pluginapi.ExecutorRequest{
 			Model:           "deepseek-v4-pro",
@@ -991,6 +1192,36 @@ func TestHandleExecutorExecuteForwardsMappedRequestAndRestoresResponse(t *testin
 	}
 }
 
+func TestHandleExecutorExecuteIgnoresUnusedPayload(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "a=>b"})
+	rawReq, err := json.Marshal(map[string]any{
+		"Model":           "a",
+		"Format":          "openai",
+		"SourceFormat":    "openai",
+		"OriginalRequest": []byte(`{"model":"a"}`),
+		"Payload":         map[string]any{"unused": true},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	respRaw, err := handleExecutorExecute(rawReq, func(method string, payload any) (json.RawMessage, error) {
+		if method != pluginabi.MethodHostModelExecute {
+			t.Fatalf("method=%q, want %q", method, pluginabi.MethodHostModelExecute)
+		}
+		return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: 200, Body: []byte(`{"model":"b"}`)})
+	})
+	if err != nil {
+		t.Fatalf("handleExecutorExecute error = %v", err)
+	}
+	var resp pluginapi.ExecutorResponse
+	if err := json.Unmarshal(respRaw, &resp); err != nil {
+		t.Fatalf("decode executor response: %v", err)
+	}
+	if !bytes.Contains(resp.Payload, []byte(`"model":"a"`)) {
+		t.Fatalf("response payload=%s, want restored model a", resp.Payload)
+	}
+}
+
 func TestExecutorReusesCallerPatternAfterHeadersChange(t *testing.T) {
 	tests := []struct {
 		name, rules, key, upstream string
@@ -1001,7 +1232,7 @@ func TestExecutorReusesCallerPatternAfterHeadersChange(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			setLoadedConfigForTest(Config{Enabled: true, GlobalRules: tt.rules})
+			setLoadedConfigForTest(Config{GlobalRules: tt.rules})
 			metadata := map[string]any{"caller_scope": callerScope(tt.key)}
 			routeRaw, err := json.Marshal(pluginapi.ModelRouteRequest{SourceFormat: "openai", RequestedModel: "client-model", Metadata: metadata, Headers: tt.headers})
 			if err != nil {
@@ -1049,9 +1280,88 @@ func TestExecutorReusesCallerPatternAfterHeadersChange(t *testing.T) {
 	}
 }
 
+func TestSetLoadedConfigPublishesWithCallerCacheReset(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "old=>target"})
+	callerPatternCacheMu.Lock()
+	loadedConfigMu.RLock()
+	done := make(chan struct{})
+	go func() {
+		setLoadedConfigForTest(Config{GlobalRules: "new=>target"})
+		close(done)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for loadedConfigMu.TryRLock() {
+		loadedConfigMu.RUnlock()
+		if time.Now().After(deadline) {
+			loadedConfigMu.RUnlock()
+			callerPatternCacheMu.Unlock()
+			t.Fatal("reconfigure did not wait for the config write lock")
+		}
+		runtime.Gosched()
+	}
+	loadedConfigMu.RUnlock()
+
+	observed := make(chan Config, 1)
+	go func() { observed <- loadedConfig() }()
+	select {
+	case cfg := <-observed:
+		callerPatternCacheMu.Unlock()
+		<-done
+		if cfg.GlobalRules == "new=>target" {
+			t.Fatal("new config became visible before the caller cache reset")
+		}
+		t.Fatalf("observed unexpected config before reset: %#v", cfg)
+	case <-time.After(100 * time.Millisecond):
+		callerPatternCacheMu.Unlock()
+		<-done
+		cfg := <-observed
+		if cfg.GlobalRules != "new=>target" {
+			t.Fatalf("config after reset=%#v, want new rules", cfg)
+		}
+	}
+}
+
+func TestHandleModelRouteWarmCallerPatternHitDoesNotRequireConfigWriteLock(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "sk-kimi-*#client-model=>wildcard-target"})
+	raw, err := json.Marshal(pluginapi.ModelRouteRequest{
+		SourceFormat:   "openai",
+		RequestedModel: "client-model",
+		Metadata:       map[string]any{"caller_scope": callerScope("sk-kimi-team")},
+		Headers:        http.Header{"Authorization": {"Bearer sk-kimi-team"}},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	if _, err := handleModelRoute(raw); err != nil {
+		t.Fatalf("warm route: %v", err)
+	}
+
+	loadedConfigMu.RLock()
+	done := make(chan error, 1)
+	go func() {
+		_, err := handleModelRoute(raw)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		loadedConfigMu.RUnlock()
+		if err != nil {
+			t.Fatalf("warm route error = %v", err)
+		}
+	case <-time.After(time.Second):
+		loadedConfigMu.RUnlock()
+		err := <-done
+		if err != nil {
+			t.Fatalf("blocked route error = %v", err)
+		}
+		t.Fatal("warm caller-pattern hit blocked on the config write lock")
+	}
+}
+
 func TestReconfigureClearsCallerPatternCache(t *testing.T) {
 	const rules = "sk-kimi-*#client-model=>wildcard-target"
-	setLoadedConfigForTest(Config{Enabled: true, GlobalRules: rules})
+	setLoadedConfigForTest(Config{GlobalRules: rules})
 	metadata := map[string]any{"caller_scope": callerScope("sk-kimi-team")}
 	routeRaw, err := json.Marshal(pluginapi.ModelRouteRequest{
 		SourceFormat:   "openai",
@@ -1097,10 +1407,10 @@ func TestHandleExecutorExecuteUsesCallerScopeAcrossRuleSets(t *testing.T) {
 		cfg    Config
 		format string
 	}{
-		{name: "global rules", cfg: Config{Enabled: true, GlobalRules: rules}, format: "openai"},
-		{name: "openai completions rules", cfg: Config{Enabled: true, OpenAICompletionsRules: rules}, format: "openai"},
-		{name: "claude messages rules", cfg: Config{Enabled: true, ClaudeMessagesRules: rules}, format: "claude"},
-		{name: "codex responses rules", cfg: Config{Enabled: true, CodexResponsesRules: rules}, format: "openai-response"},
+		{name: "global rules", cfg: Config{GlobalRules: rules}, format: "openai"},
+		{name: "openai completions rules", cfg: Config{OpenAICompletionsRules: rules}, format: "openai"},
+		{name: "claude messages rules", cfg: Config{ClaudeMessagesRules: rules}, format: "claude"},
+		{name: "codex responses rules", cfg: Config{CodexResponsesRules: rules}, format: "openai-response"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1175,7 +1485,7 @@ func TestHandleExecutorExecuteUsesCallerScopeAcrossRuleSets(t *testing.T) {
 }
 
 func TestHandleExecutorExecuteRestoresKnownResponseModelFields(t *testing.T) {
-	setLoadedConfigForTest(Config{Enabled: true, ClaudeMessagesRules: "claude-*=>gpt-5.5"})
+	setLoadedConfigForTest(Config{ClaudeMessagesRules: "claude-*=>gpt-5.5"})
 	req := rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{Model: "claude-opus-4", Format: "claude", SourceFormat: "claude", OriginalRequest: []byte(`{"model":"claude-opus-4"}`)}, HostCallbackID: "callback-1"}
 	rawReq, err := json.Marshal(req)
 	if err != nil {
@@ -1212,7 +1522,7 @@ func TestHandleExecutorExecuteRestoresKnownResponseModelFields(t *testing.T) {
 }
 
 func TestHandleExecutorExecutePreservesHostError(t *testing.T) {
-	setLoadedConfigForTest(Config{Enabled: true, GlobalRules: "a=>b"})
+	setLoadedConfigForTest(Config{GlobalRules: "a=>b"})
 	req := rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{Model: "a", Format: "openai", SourceFormat: "openai", OriginalRequest: []byte(`{"model":"a"}`)}, HostCallbackID: "callback-1"}
 	rawReq, err := json.Marshal(req)
 	if err != nil {
@@ -1227,7 +1537,7 @@ func TestHandleExecutorExecutePreservesHostError(t *testing.T) {
 }
 
 func TestHandleExecutorExecuteReturnsErrorForHostHTTPStatus(t *testing.T) {
-	setLoadedConfigForTest(Config{Enabled: true, GlobalRules: "a=>b"})
+	setLoadedConfigForTest(Config{GlobalRules: "a=>b"})
 	req := rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{Model: "a", Format: "openai", SourceFormat: "openai", OriginalRequest: []byte(`{"model":"a"}`)}, HostCallbackID: "callback-1"}
 	rawReq, err := json.Marshal(req)
 	if err != nil {
@@ -1253,8 +1563,8 @@ func TestHandleExecutorExecuteStreamUsesCallerScope(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			setLoadedConfigForTest(Config{Enabled: true, GlobalRules: tt.rules})
-			req := executorRPCRequest{
+			setLoadedConfigForTest(Config{GlobalRules: tt.rules})
+			req := rpcExecutorRequest{
 				ExecutorRequest: pluginapi.ExecutorRequest{
 					Model:           "client-model",
 					Format:          "openai",
@@ -1274,7 +1584,7 @@ func TestHandleExecutorExecuteStreamUsesCallerScope(t *testing.T) {
 				{Done: true},
 			}
 			var forwarded pluginapi.HostModelExecutionRequest
-			emitted, closedHost, closedPlugin, _, err := runExecutorStreamTestWithForwarded(rpcExecutorRequest(req), reads, &forwarded)
+			emitted, closedHost, closedPlugin, _, err := runExecutorStreamTestWithForwarded(req, reads, &forwarded)
 			if err != nil {
 				t.Fatalf("handleExecutorExecuteStream error = %v", err)
 			}
@@ -1302,7 +1612,7 @@ func TestHandleExecutorExecuteStreamUsesCallerScope(t *testing.T) {
 }
 
 func TestHandleExecutorExecuteStreamFallsBackForWrongOrMissingCallerScope(t *testing.T) {
-	setLoadedConfigForTest(Config{Enabled: true, GlobalRules: "sk-test#client-model=>scoped-target;client-model=>fallback-target"})
+	setLoadedConfigForTest(Config{GlobalRules: "sk-test#client-model=>scoped-target;client-model=>fallback-target"})
 	for _, scopeTest := range []struct {
 		name     string
 		metadata map[string]any
@@ -1311,7 +1621,7 @@ func TestHandleExecutorExecuteStreamFallsBackForWrongOrMissingCallerScope(t *tes
 		{name: "missing scope"},
 	} {
 		t.Run(scopeTest.name, func(t *testing.T) {
-			req := executorRPCRequest{
+			req := rpcExecutorRequest{
 				ExecutorRequest: pluginapi.ExecutorRequest{
 					Model:           "client-model",
 					Format:          "openai",
@@ -1329,7 +1639,7 @@ func TestHandleExecutorExecuteStreamFallsBackForWrongOrMissingCallerScope(t *tes
 				{Done: true},
 			}
 			var forwarded pluginapi.HostModelExecutionRequest
-			emitted, closedHost, closedPlugin, _, err := runExecutorStreamTestWithForwarded(rpcExecutorRequest(req), reads, &forwarded)
+			emitted, closedHost, closedPlugin, _, err := runExecutorStreamTestWithForwarded(req, reads, &forwarded)
 			if err != nil {
 				t.Fatalf("handleExecutorExecuteStream error = %v", err)
 			}
@@ -1357,7 +1667,7 @@ func TestHandleExecutorExecuteStreamFallsBackForWrongOrMissingCallerScope(t *tes
 }
 
 func TestHandleExecutorExecuteStreamStartsForwarderAndRestoresChunks(t *testing.T) {
-	setLoadedConfigForTest(Config{Enabled: true, GlobalRules: "deepseek-v4-pro=>gpt-5.4-mini"})
+	setLoadedConfigForTest(Config{GlobalRules: "deepseek-v4-pro=>gpt-5.4-mini"})
 	req := rpcExecutorRequest{
 		ExecutorRequest: pluginapi.ExecutorRequest{
 			Model:           "deepseek-v4-pro",
@@ -1397,7 +1707,7 @@ func TestHandleExecutorExecuteStreamStartsForwarderAndRestoresChunks(t *testing.
 }
 
 func TestHandleExecutorExecuteStreamBuffersSplitSSEPrefix(t *testing.T) {
-	setLoadedConfigForTest(Config{Enabled: true, GlobalRules: "deepseek-v4-pro=>gpt-5.4-mini"})
+	setLoadedConfigForTest(Config{GlobalRules: "deepseek-v4-pro=>gpt-5.4-mini"})
 	req := rpcExecutorRequest{
 		ExecutorRequest: pluginapi.ExecutorRequest{
 			Model:           "deepseek-v4-pro",
@@ -1430,7 +1740,7 @@ func TestHandleExecutorExecuteStreamBuffersSplitSSEPrefix(t *testing.T) {
 }
 
 func TestHandleExecutorExecuteStreamRestoresRawJSONWebSocketLikeChunks(t *testing.T) {
-	setLoadedConfigForTest(Config{Enabled: true, CodexResponsesRules: "deepseek-v4-pro=>gpt-5.4-mini"})
+	setLoadedConfigForTest(Config{CodexResponsesRules: "deepseek-v4-pro=>gpt-5.4-mini"})
 	req := rpcExecutorRequest{
 		ExecutorRequest: pluginapi.ExecutorRequest{
 			Model:           "deepseek-v4-pro",
@@ -1457,7 +1767,7 @@ func TestHandleExecutorExecuteStreamRestoresRawJSONWebSocketLikeChunks(t *testin
 }
 
 func TestHandleExecutorExecuteStreamRestoresRawJSONNestedResponseModel(t *testing.T) {
-	setLoadedConfigForTest(Config{Enabled: true, CodexResponsesRules: "codex-ws*=>deepseek-v4-flash"})
+	setLoadedConfigForTest(Config{CodexResponsesRules: "codex-ws*=>deepseek-v4-flash"})
 	req := rpcExecutorRequest{
 		ExecutorRequest: pluginapi.ExecutorRequest{
 			Model:           "codex-ws-client",
@@ -1484,7 +1794,7 @@ func TestHandleExecutorExecuteStreamRestoresRawJSONNestedResponseModel(t *testin
 }
 
 func TestHandleExecutorExecuteStreamRestoresLineDelimitedRawJSONEvents(t *testing.T) {
-	setLoadedConfigForTest(Config{Enabled: true, CodexResponsesRules: "codex-ws*=>deepseek-v4-flash"})
+	setLoadedConfigForTest(Config{CodexResponsesRules: "codex-ws*=>deepseek-v4-flash"})
 	req := rpcExecutorRequest{
 		ExecutorRequest: pluginapi.ExecutorRequest{
 			Model:           "codex-ws-client",
@@ -1514,7 +1824,7 @@ func TestHandleExecutorExecuteStreamRestoresLineDelimitedRawJSONEvents(t *testin
 }
 
 func TestHandleExecutorExecuteStreamRestoresLineDelimitedRawJSONForWebSocket(t *testing.T) {
-	setLoadedConfigForTest(Config{Enabled: true, CodexResponsesRules: "codex-ws*=>deepseek-v4-flash"})
+	setLoadedConfigForTest(Config{CodexResponsesRules: "codex-ws*=>deepseek-v4-flash"})
 	req := rpcExecutorRequest{
 		ExecutorRequest: pluginapi.ExecutorRequest{
 			Model:           "codex-ws-client",
@@ -1541,7 +1851,7 @@ func TestHandleExecutorExecuteStreamRestoresLineDelimitedRawJSONForWebSocket(t *
 }
 
 func TestHandleExecutorExecuteStreamRestoresSpaceDelimitedRawJSONForWebSocket(t *testing.T) {
-	setLoadedConfigForTest(Config{Enabled: true, CodexResponsesRules: "codex-ws*=>deepseek-v4-flash"})
+	setLoadedConfigForTest(Config{CodexResponsesRules: "codex-ws*=>deepseek-v4-flash"})
 	req := rpcExecutorRequest{
 		ExecutorRequest: pluginapi.ExecutorRequest{
 			Model:           "codex-ws-client",
@@ -1568,7 +1878,7 @@ func TestHandleExecutorExecuteStreamRestoresSpaceDelimitedRawJSONForWebSocket(t 
 }
 
 func TestHandleExecutorExecuteStreamFlushesUnterminatedSSEDataForWebSocket(t *testing.T) {
-	setLoadedConfigForTest(Config{Enabled: true, CodexResponsesRules: "codex-ws*=>deepseek-v4-flash"})
+	setLoadedConfigForTest(Config{CodexResponsesRules: "codex-ws*=>deepseek-v4-flash"})
 	req := rpcExecutorRequest{
 		ExecutorRequest: pluginapi.ExecutorRequest{
 			Model:           "codex-ws-client",
@@ -1609,8 +1919,59 @@ func TestStreamChunkRewriterDoesNotBufferRawJSONStartingWithEvent(t *testing.T) 
 	}
 }
 
+func TestStreamChunkRewriterRawJSONUsesOneRestorePass(t *testing.T) {
+	item := `{"type":"output_text","text":"opaque"}`
+	body := []byte(`{"type":"response.completed","model":"upstream","output":[` + strings.TrimSuffix(strings.Repeat(item+",", 128), ",") + `]}`)
+	viaWrite := newStreamChunkRewriter("client")
+	viaRaw := newStreamChunkRewriter("client")
+	writeAllocs := testing.AllocsPerRun(50, func() {
+		chunks, err := viaWrite.Write(body)
+		if err != nil || len(chunks) != 1 {
+			panic(fmt.Sprintf("Write=(%d,%v)", len(chunks), err))
+		}
+	})
+	rawAllocs := testing.AllocsPerRun(50, func() {
+		chunks, err := viaRaw.rawJSONChunks(body)
+		if err != nil || len(chunks) != 1 {
+			panic(fmt.Sprintf("rawJSONChunks=(%d,%v)", len(chunks), err))
+		}
+	})
+	if writeAllocs > rawAllocs+4 {
+		t.Fatalf("Write allocations=%v, rawJSONChunks allocations=%v; raw JSON was restored more than once", writeAllocs, rawAllocs)
+	}
+}
+
+func TestSplitJSONValuesKeepsDecoderOwnedPayload(t *testing.T) {
+	input := []byte(strings.Repeat(`{"type":"event","value":1}`+"\n", 64))
+	reference := func() {
+		dec := json.NewDecoder(bytes.NewReader(input))
+		values := make([][]byte, 0, 1)
+		for {
+			var raw json.RawMessage
+			err := dec.Decode(&raw)
+			if err != nil {
+				break
+			}
+			values = append(values, raw)
+		}
+		if len(values) != 64 {
+			panic(fmt.Sprintf("reference values=%d", len(values)))
+		}
+	}
+	productionAllocs := testing.AllocsPerRun(50, func() {
+		values, ok := splitJSONValues(input)
+		if !ok || len(values) != 64 {
+			panic(fmt.Sprintf("splitJSONValues=(%d,%v)", len(values), ok))
+		}
+	})
+	referenceAllocs := testing.AllocsPerRun(50, reference)
+	if productionAllocs > referenceAllocs+2 {
+		t.Fatalf("splitJSONValues allocations=%v, decoder reference allocations=%v", productionAllocs, referenceAllocs)
+	}
+}
+
 func TestHandleExecutorExecuteStreamRestoresKnownSSEModelFields(t *testing.T) {
-	setLoadedConfigForTest(Config{Enabled: true, ClaudeMessagesRules: "claude-*=>gpt-5.5"})
+	setLoadedConfigForTest(Config{ClaudeMessagesRules: "claude-*=>gpt-5.5"})
 	req := rpcExecutorRequest{
 		ExecutorRequest: pluginapi.ExecutorRequest{
 			Model:           "claude-opus-4",
@@ -1642,7 +2003,7 @@ func TestHandleExecutorExecuteStreamRestoresKnownSSEModelFields(t *testing.T) {
 }
 
 func TestHandleExecutorExecuteStreamFramesRawResponsesJSONAsSSE(t *testing.T) {
-	setLoadedConfigForTest(Config{Enabled: true, CodexResponsesRules: "gpt-*-openai-compact=>gpt-$1"})
+	setLoadedConfigForTest(Config{CodexResponsesRules: "gpt-*-openai-compact=>gpt-$1"})
 	req := rpcExecutorRequest{
 		ExecutorRequest: pluginapi.ExecutorRequest{
 			Model:           "gpt-5.5-openai-compact",
@@ -1669,7 +2030,7 @@ func TestHandleExecutorExecuteStreamFramesRawResponsesJSONAsSSE(t *testing.T) {
 }
 
 func TestHandleExecutorExecuteStreamClosesWebSocketLikeRawJSONError(t *testing.T) {
-	setLoadedConfigForTest(Config{Enabled: true, CodexResponsesRules: "gpt-*-openai-compact=>gpt-$1"})
+	setLoadedConfigForTest(Config{CodexResponsesRules: "gpt-*-openai-compact=>gpt-$1"})
 	req := rpcExecutorRequest{
 		ExecutorRequest: pluginapi.ExecutorRequest{
 			Model:           "gpt-none-openai-compact",
@@ -1695,7 +2056,7 @@ func TestHandleExecutorExecuteStreamClosesWebSocketLikeRawJSONError(t *testing.T
 }
 
 func TestHandleExecutorExecuteStreamClosesPluginOnChunkErrorAfterPendingPrefix(t *testing.T) {
-	setLoadedConfigForTest(Config{Enabled: true, CodexResponsesRules: "gpt-*-openai-compact=>gpt-$1"})
+	setLoadedConfigForTest(Config{CodexResponsesRules: "gpt-*-openai-compact=>gpt-$1"})
 	req := rpcExecutorRequest{
 		ExecutorRequest: pluginapi.ExecutorRequest{
 			Model:           "gpt-none-openai-compact",
@@ -1800,6 +2161,75 @@ func runExecutorStreamTestWithHostContentTypeAndForwarded(req rpcExecutorRequest
 		return nil, false, false, nil, fmt.Errorf("stream forwarder did not close plugin stream")
 	}
 	return emitted, closedHost, closedPlugin, respRaw, nil
+}
+
+func TestWrapEnvelopeAvoidsPayloadSizedIntermediate(t *testing.T) {
+	payload := []byte(`{"data":"` + strings.Repeat("x", 256<<10) + `"}`)
+	production := testing.Benchmark(func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, err := wrapEnvelope(payload, nil); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	reference := testing.Benchmark(func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, err := json.Marshal(pluginabi.Envelope{OK: true, Result: json.RawMessage(payload)}); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	if got, limit := production.AllocedBytesPerOp(), reference.AllocedBytesPerOp()+int64(len(payload))/4; got > limit {
+		t.Fatalf("wrapEnvelope bytes/op=%d, direct envelope bytes/op=%d", got, reference.AllocedBytesPerOp())
+	}
+
+	empty, err := wrapEnvelope(nil, nil)
+	if err != nil {
+		t.Fatalf("wrap empty envelope: %v", err)
+	}
+	if string(empty) != `{"ok":true,"result":null}` {
+		t.Fatalf("empty envelope=%s, want explicit null result", empty)
+	}
+}
+
+func TestCallHostReturnsDecoderOwnedResult(t *testing.T) {
+	resultPayload := json.RawMessage(`{"data":"` + strings.Repeat("x", 256<<10) + `"}`)
+	responseBytes, err := json.Marshal(pluginabi.Envelope{OK: true, Result: resultPayload})
+	if err != nil {
+		t.Fatalf("marshal host response: %v", err)
+	}
+	callback := func(string, []byte) ([]byte, error) {
+		return responseBytes, nil
+	}
+	setHostCallbackForTest(callback)
+	defer setHostCallbackForTest(nil)
+	requestPayload := map[string]string{"request": "x"}
+
+	production := testing.Benchmark(func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, err := callHost("test.method", requestPayload); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	reference := testing.Benchmark(func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, err := json.Marshal(requestPayload); err != nil {
+				b.Fatal(err)
+			}
+			var env pluginabi.Envelope
+			if err := json.Unmarshal(responseBytes, &env); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	if got, limit := production.AllocedBytesPerOp(), reference.AllocedBytesPerOp()+int64(len(resultPayload))/4; got > limit {
+		t.Fatalf("callHost bytes/op=%d, single-decode reference bytes/op=%d", got, reference.AllocedBytesPerOp())
+	}
 }
 
 func TestHandleMethodDispatchesRegisterReconfigureAndUnknown(t *testing.T) {
