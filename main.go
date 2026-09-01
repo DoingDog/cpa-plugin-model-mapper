@@ -1266,7 +1266,7 @@ func applyASCIIModelCase(model string, operation caseOperation) string {
 	return string(converted)
 }
 
-func callerPatternMatch(r rule, scope, key string) (bool, bool) {
+func callerPatternMatch(r *rule, scope, key string) (bool, bool) {
 	cacheKey := callerPatternCacheKey{scope: scope, pattern: r.callerPatternText}
 	callerPatternCacheMu.RLock()
 	matched, ok := callerPatternCache[cacheKey]
@@ -1288,7 +1288,7 @@ func callerPatternMatch(r rule, scope, key string) (bool, bool) {
 	return matched, true
 }
 
-func callerMatchesRule(r rule, scope, key string) bool {
+func callerMatchesRule(r *rule, scope, key string) bool {
 	if r.callerScope == "" && len(r.callerPattern) == 0 {
 		return true
 	}
@@ -1309,7 +1309,8 @@ func callerMatchesRule(r rule, scope, key string) bool {
 func applyRules(model, scope, key string, rules []rule) (string, bool, error) {
 	current := model
 	matchedAny := false
-	for _, r := range rules {
+	for i := range rules {
+		r := &rules[i]
 		if !callerMatchesRule(r, scope, key) {
 			continue
 		}
@@ -1332,7 +1333,7 @@ func applyRules(model, scope, key string, rules []rule) (string, bool, error) {
 }
 
 func matchTokens(s string, tokens []token) ([]string, bool) {
-	captures := make([]string, 0, len(tokens))
+	var captures []string
 	pos := 0
 	for i, tok := range tokens {
 		if tok.literal != "" {
@@ -1364,7 +1365,19 @@ func matchTokens(s string, tokens []token) ([]string, bool) {
 }
 
 func buildReplacement(tokens []token, captures []string) string {
+	if len(tokens) == 1 && tokens[0].literal != "" {
+		return tokens[0].literal
+	}
+	size := 0
+	for _, tok := range tokens {
+		if tok.literal != "" {
+			size += len(tok.literal)
+		} else {
+			size += len(captures[tok.capture-1])
+		}
+	}
 	var b strings.Builder
+	b.Grow(size)
 	for _, tok := range tokens {
 		if tok.literal != "" {
 			b.WriteString(tok.literal)

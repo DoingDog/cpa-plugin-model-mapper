@@ -163,6 +163,51 @@ func TestRouteModelReusesDecodedRules(t *testing.T) {
 	}
 }
 
+func TestApplyRulesExactRulesDoNotAllocate(t *testing.T) {
+	var raw strings.Builder
+	for i := 0; i < 24; i++ {
+		if i > 0 {
+			raw.WriteByte(';')
+		}
+		fmt.Fprintf(&raw, "model-%d=>target-%d", i, i)
+	}
+	rules, err := parseRules(raw.String())
+	if err != nil {
+		t.Fatalf("parseRules error = %v", err)
+	}
+
+	allocs := testing.AllocsPerRun(100, func() {
+		mapped, matched, err := applyRules("model-23", "", "", rules)
+		if err != nil || !matched || mapped != "target-23" {
+			panic(fmt.Sprintf("applyRules=(%q,%v,%v)", mapped, matched, err))
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("exact-rule allocations=%v, want 0", allocs)
+	}
+}
+
+func BenchmarkApplyRulesExact24(b *testing.B) {
+	var raw strings.Builder
+	for i := 0; i < 24; i++ {
+		if i > 0 {
+			raw.WriteByte(';')
+		}
+		fmt.Fprintf(&raw, "model-%d=>target-%d", i, i)
+	}
+	rules, err := parseRules(raw.String())
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		mapped, matched, err := applyRules("model-23", "", "", rules)
+		if err != nil || !matched || mapped != "target-23" {
+			b.Fatalf("applyRules=(%q,%v,%v)", mapped, matched, err)
+		}
+	}
+}
+
 func TestDefaultConfigRulesEmpty(t *testing.T) {
 	cfg := defaultConfig()
 	if cfg.GlobalRules != "" || cfg.ClaudeMessagesRules != "" || cfg.CodexResponsesRules != "" || cfg.OpenAICompletionsRules != "" {
