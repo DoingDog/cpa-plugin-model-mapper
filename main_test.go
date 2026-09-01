@@ -2088,6 +2088,92 @@ func TestStreamChunkRewriterRawJSONUsesOneRestorePass(t *testing.T) {
 	}
 }
 
+func legacyRawJSONChunksForTest(r *streamChunkRewriter, p []byte) ([][]byte, error) {
+	values, ok := splitJSONValues(p)
+	if !ok {
+		return [][]byte{bytes.Clone(p)}, nil
+	}
+	if len(values) == 0 {
+		return nil, nil
+	}
+	out := make([][]byte, 0, len(values))
+	for _, value := range values {
+		restored, _, err := restoreResponseModel(value, r.originalModel)
+		if err != nil {
+			return nil, err
+		}
+		if r.frameRawJSONAsSSE {
+			out = append(out, frameSSEData(restored))
+		} else {
+			out = append(out, restored)
+		}
+	}
+	return out, nil
+}
+
+func TestRawJSONSingleValueFastPathMatchesLegacy(t *testing.T) {
+	backslash := string(rune(92))
+	inputs := [][]byte{
+		nil,
+		[]byte(" \r\n\t "),
+		[]byte("not-json"),
+		[]byte(`{}`),
+		[]byte("  {\"id\":\"r1\"} \r\n"),
+		[]byte(`{"model":"upstream"}`),
+		[]byte(`{"response":{"model":"upstream"}}`),
+		[]byte(`{"` + backslash + `u006dodel":"upstream"}`),
+		[]byte("{\"model\":\"upstream\"}\n{\"model\":\"other\"}"),
+		[]byte("null true 123 \"text\""),
+		[]byte(`{"valid":true} trailing`),
+		[]byte{0xc2, 0xa0},
+	}
+	for _, framed := range []bool{false, true} {
+		for _, input := range inputs {
+			r := newStreamChunkRewriter("client")
+			r.frameRawJSONAsSSE = framed
+			got, gotErr := r.rawJSONChunks(input)
+			want, wantErr := legacyRawJSONChunksForTest(r, input)
+			if !reflect.DeepEqual(got, want) || (gotErr == nil) != (wantErr == nil) {
+				t.Fatalf("framed=%v input=%q\ngot=%q err=%v\nwant=%q err=%v", framed, input, got, gotErr, want, wantErr)
+			}
+		}
+	}
+}
+
+func TestRawJSONSingleValueFastPathAllocatesLessThanLegacy(t *testing.T) {
+	body := []byte(`{"type":"response.completed","model":"upstream","output":"` + strings.Repeat("x", 64<<10) + `"}`)
+	production := newStreamChunkRewriter("client")
+	reference := newStreamChunkRewriter("client")
+	productionAllocs := testing.AllocsPerRun(50, func() {
+		chunks, err := production.rawJSONChunks(body)
+		if err != nil || len(chunks) != 1 {
+			panic(fmt.Sprintf("production=(%d,%v)", len(chunks), err))
+		}
+	})
+	referenceAllocs := testing.AllocsPerRun(50, func() {
+		chunks, err := legacyRawJSONChunksForTest(reference, body)
+		if err != nil || len(chunks) != 1 {
+			panic(fmt.Sprintf("reference=(%d,%v)", len(chunks), err))
+		}
+	})
+	if productionAllocs >= referenceAllocs {
+		t.Fatalf("production allocations=%v, legacy allocations=%v", productionAllocs, referenceAllocs)
+	}
+}
+
+func BenchmarkStreamChunkRewriterSingleJSON(b *testing.B) {
+	body := []byte(`{"type":"response.completed","model":"upstream","output":"` + strings.Repeat("x", 64<<10) + `"}`)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(body)))
+	for i := 0; i < b.N; i++ {
+		r := newStreamChunkRewriter("client")
+		chunks, err := r.Write(body)
+		if err != nil || len(chunks) != 1 {
+			b.Fatalf("Write=(%d,%v)", len(chunks), err)
+		}
+	}
+}
+
 func TestSplitJSONValuesKeepsDecoderOwnedPayload(t *testing.T) {
 	input := []byte(strings.Repeat(`{"type":"event","value":1}`+"\n", 64))
 	reference := func() {

@@ -25,6 +25,7 @@ var pluginVersion = "0.0.0-dev"
 
 type sseRewriter struct {
 	originalModel string
+	encodedModel  json.RawMessage
 	buf           []byte
 	scanFrom      int
 }
@@ -38,6 +39,20 @@ type streamChunkRewriter struct {
 
 func newSSERewriter(originalModel string) *sseRewriter {
 	return &sseRewriter{originalModel: originalModel}
+}
+
+func (r *sseRewriter) restoreResponseModel(body []byte) ([]byte, bool, error) {
+	if !mightContainResponseModelField(body) {
+		return bytes.Clone(body), false, nil
+	}
+	if r.encodedModel == nil {
+		var err error
+		r.encodedModel, err = json.Marshal(r.originalModel)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	return rewriteResponseModelFieldsWithReplacement(body, r.originalModel, r.encodedModel)
 }
 
 func newStreamChunkRewriter(originalModel string) *streamChunkRewriter {
@@ -122,7 +137,7 @@ func (r *sseRewriter) rewriteEvent(event []byte) ([][]byte, error) {
 				out = append(out, append(append([]byte(nil), line...), lineBreak...))
 				continue
 			}
-			restored, changed, err := restoreResponseModel(value, r.originalModel)
+			restored, changed, err := r.restoreResponseModel(value)
 			if err != nil {
 				return nil, err
 			}
@@ -198,19 +213,27 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 }
 
 func (r *streamChunkRewriter) rawJSONChunks(p []byte) ([][]byte, error) {
+	trimmed := bytes.Trim(p, " \t\r\n")
+	if len(trimmed) > 0 && json.Valid(trimmed) {
+		restored, _, err := r.sse.restoreResponseModel(trimmed)
+		if err != nil {
+			return nil, err
+		}
+		if r.frameRawJSONAsSSE {
+			return [][]byte{frameSSEData(restored)}, nil
+		}
+		return [][]byte{restored}, nil
+	}
 	values, ok := splitJSONValues(p)
 	if !ok {
-		if r.frameRawJSONAsSSE && json.Valid(p) {
-			return [][]byte{frameSSEData(p)}, nil
-		}
-		return [][]byte{append([]byte(nil), p...)}, nil
+		return [][]byte{bytes.Clone(p)}, nil
 	}
 	if len(values) == 0 {
 		return nil, nil
 	}
 	out := make([][]byte, 0, len(values))
 	for _, value := range values {
-		restored, _, err := restoreResponseModel(value, r.originalModel)
+		restored, _, err := r.sse.restoreResponseModel(value)
 		if err != nil {
 			return nil, err
 		}
@@ -901,13 +924,17 @@ func rewriteResponseModelFields(body []byte, model string) ([]byte, bool, error)
 	if !mightContainResponseModelField(body) {
 		return bytes.Clone(body), false, nil
 	}
-	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(body, &doc); err != nil {
-		return bytes.Clone(body), false, nil
-	}
 	replacement, err := json.Marshal(model)
 	if err != nil {
 		return nil, false, err
+	}
+	return rewriteResponseModelFieldsWithReplacement(body, model, replacement)
+}
+
+func rewriteResponseModelFieldsWithReplacement(body []byte, model string, replacement json.RawMessage) ([]byte, bool, error) {
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return bytes.Clone(body), false, nil
 	}
 	changed := rewriteRawStringField(doc, "model", model, replacement)
 	changed = rewriteRawStringField(doc, "modelVersion", model, replacement) || changed
