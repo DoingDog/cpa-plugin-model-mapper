@@ -163,6 +163,78 @@ func TestRouteModelReusesDecodedRules(t *testing.T) {
 	}
 }
 
+func TestApplyRulesExactRulesDoNotAllocate(t *testing.T) {
+	var raw strings.Builder
+	for i := 0; i < 24; i++ {
+		if i > 0 {
+			raw.WriteByte(';')
+		}
+		fmt.Fprintf(&raw, "model-%d=>target-%d", i, i)
+	}
+	rules, err := parseRules(raw.String())
+	if err != nil {
+		t.Fatalf("parseRules error = %v", err)
+	}
+
+	allocs := testing.AllocsPerRun(100, func() {
+		mapped, matched, err := applyRules("model-23", "", "", rules)
+		if err != nil || !matched || mapped != "target-23" {
+			panic(fmt.Sprintf("applyRules=(%q,%v,%v)", mapped, matched, err))
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("exact-rule allocations=%v, want 0", allocs)
+	}
+}
+
+func TestMatchTokensWildcardCapturesAllocateOnce(t *testing.T) {
+	rules := mustParseRules(t, `a*b*c*d*e*f*g*h=>$1$2$3$4$5$6$7`)
+	allocs := testing.AllocsPerRun(100, func() {
+		captures, matched := matchTokens("a1b2c3d4e5f6g7h", rules[0].patternTokens)
+		if !matched || len(captures) != 7 {
+			panic(fmt.Sprintf("matchTokens=(%q,%v)", captures, matched))
+		}
+	})
+	if allocs != 1 {
+		t.Fatalf("wildcard capture allocations=%v, want 1", allocs)
+	}
+}
+
+func TestApplyRulesWildcardLateMissAllocatesOncePerRule(t *testing.T) {
+	raw := strings.TrimSuffix(strings.Repeat(`a*b*c*d*e*f*g*h*Z=>x;`, 24), ";")
+	rules := mustParseRules(t, raw)
+	allocs := testing.AllocsPerRun(100, func() {
+		mapped, matched, err := applyRules("a1b2c3d4e5f6g7h8Y", "", "", rules)
+		if err != nil || matched || mapped != "a1b2c3d4e5f6g7h8Y" {
+			panic(fmt.Sprintf("applyRules=(%q,%v,%v)", mapped, matched, err))
+		}
+	})
+	if allocs != 24 {
+		t.Fatalf("late-miss allocations=%v, want 24", allocs)
+	}
+}
+
+func BenchmarkApplyRulesExact24(b *testing.B) {
+	var raw strings.Builder
+	for i := 0; i < 24; i++ {
+		if i > 0 {
+			raw.WriteByte(';')
+		}
+		fmt.Fprintf(&raw, "model-%d=>target-%d", i, i)
+	}
+	rules, err := parseRules(raw.String())
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		mapped, matched, err := applyRules("model-23", "", "", rules)
+		if err != nil || !matched || mapped != "target-23" {
+			b.Fatalf("applyRules=(%q,%v,%v)", mapped, matched, err)
+		}
+	}
+}
+
 func TestDefaultConfigRulesEmpty(t *testing.T) {
 	cfg := defaultConfig()
 	if cfg.GlobalRules != "" || cfg.ClaudeMessagesRules != "" || cfg.CodexResponsesRules != "" || cfg.OpenAICompletionsRules != "" {
@@ -908,6 +980,82 @@ func TestRestoreResponseModelLeavesUnsupportedBodiesUnchanged(t *testing.T) {
 	}
 }
 
+func TestRestoreResponseWithoutModelUsesCloneOnly(t *testing.T) {
+	body := []byte(`{"type":"response.output_text.delta","delta":"hello"}`)
+	allocs := testing.AllocsPerRun(100, func() {
+		got, changed, err := restoreResponseModel(body, "client")
+		if err != nil || changed || !bytes.Equal(got, body) {
+			panic(fmt.Sprintf("restore=(%s,%v,%v)", got, changed, err))
+		}
+	})
+	if allocs > 1 {
+		t.Fatalf("no-model allocations=%v, want <=1 clone", allocs)
+	}
+}
+
+func TestRestoreResponseModelFastPathPreservesEscapedSemantics(t *testing.T) {
+	backslash := string(rune(92))
+	tests := []struct {
+		name    string
+		body    []byte
+		changed bool
+		want    string
+	}{
+		{name: "escaped model key", body: []byte(`{"` + backslash + `u006dodel":"upstream"}`), changed: true, want: `"model":"client"`},
+		{name: "escaped nested response and model keys", body: []byte(`{"res` + backslash + `u0070onse":{"` + backslash + `u006dodel":"upstream"}}`), changed: true, want: `"model":"client"`},
+		{name: "escaped equal value remains unchanged", body: []byte(`{"model":"cli` + backslash + `u0065nt"}`), changed: false},
+		{name: "ordinary escaped text remains unchanged", body: []byte(`{"text":"line` + backslash + `nnext"}`), changed: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, changed, err := restoreResponseModel(tt.body, "client")
+			if err != nil || changed != tt.changed {
+				t.Fatalf("restore=(%s,%v,%v)", got, changed, err)
+			}
+			if tt.want != "" && !strings.Contains(string(got), tt.want) {
+				t.Fatalf("body=%s missing %s", got, tt.want)
+			}
+			if !tt.changed && !bytes.Equal(got, tt.body) {
+				t.Fatalf("unchanged body=%s, want %s", got, tt.body)
+			}
+		})
+	}
+}
+
+func TestRestoreResponseModelPreservesEqualInvalidUTF8(t *testing.T) {
+	body := []byte{0x7b, 0x22, 0x6d, 0x6f, 0x64, 0x65, 0x6c, 0x22, 0x3a, 0x22, 0xff, 0x22, 0x7d}
+	got, changed, err := restoreResponseModel(body, "�")
+	if err != nil {
+		t.Fatalf("restoreResponseModel error = %v", err)
+	}
+	if changed || !bytes.Equal(got, body) {
+		t.Fatalf("restoreResponseModel=(%x,%v), want unchanged %x", got, changed, body)
+	}
+}
+
+func TestSSERewriterPreservesEqualInvalidUTF8(t *testing.T) {
+	body := []byte{0x7b, 0x22, 0x6d, 0x6f, 0x64, 0x65, 0x6c, 0x22, 0x3a, 0x22, 0xff, 0x22, 0x7d}
+	input := append([]byte("data: "), body...)
+	input = append(input, '\n', '\n')
+	chunks, err := newSSERewriter("�").Write(input)
+	if err != nil {
+		t.Fatalf("Write error = %v", err)
+	}
+	if got := []byte(flattenChunks(chunks)); !bytes.Equal(got, input) {
+		t.Fatalf("Write output=%x, want %x", got, input)
+	}
+}
+
+func BenchmarkRestoreResponseWithoutModel(b *testing.B) {
+	body := []byte(`{"type":"response.output_text.delta","delta":"hello"}`)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, _, err := restoreResponseModel(body, "client"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func flattenChunks(chunks [][]byte) string {
 	var b strings.Builder
 	for _, chunk := range chunks {
@@ -969,6 +1117,43 @@ func TestSSERewriterHandlesSplitDelimiters(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestIncompleteSSEPrefixLargeRawJSONDoesNotAllocate(t *testing.T) {
+	payload := []byte(`{"type":"response.delta","text":"` + strings.Repeat("x", 64<<10) + `"}`)
+	allocs := testing.AllocsPerRun(100, func() {
+		if isIncompleteSSEPrefix(payload) {
+			panic("raw JSON classified as incomplete SSE prefix")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("isIncompleteSSEPrefix allocations=%v, want 0", allocs)
+	}
+}
+
+func TestSSEEventDelimiterFromScanOffset(t *testing.T) {
+	tests := []struct {
+		name     string
+		buf      string
+		start    int
+		eventLen int
+		delimLen int
+		next     int
+	}{
+		{name: "LF", buf: "data: one\n\ntail", start: 0, eventLen: 9, delimLen: 2},
+		{name: "CRLF", buf: "data: one\r\n\r\ntail", start: 0, eventLen: 9, delimLen: 4},
+		{name: "earliest mixed", buf: "a\n\nb\r\n\r\n", start: 0, eventLen: 1, delimLen: 2},
+		{name: "scan offset", buf: "ignored\n\ndata: two\n\n", start: 9, eventLen: 18, delimLen: 2},
+		{name: "split CRLF tail", buf: "data: one\r\n\r", start: 8, next: 9},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			eventLen, delimLen, next := sseEventDelimiter([]byte(tt.buf), tt.start)
+			if eventLen != tt.eventLen || delimLen != tt.delimLen || next != tt.next {
+				t.Fatalf("delimiter=(%d,%d,%d), want (%d,%d,%d)", eventLen, delimLen, next, tt.eventLen, tt.delimLen, tt.next)
+			}
+		})
 	}
 }
 
@@ -1097,6 +1282,19 @@ func TestSSERewriterAvoidsWholeEventCopy(t *testing.T) {
 	}
 }
 
+func BenchmarkSSERewriterCompleteLargeEvent(b *testing.B) {
+	payload := []byte("event: " + strings.Repeat("x", 64<<10) + "\n\n")
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
+	for i := 0; i < b.N; i++ {
+		r := newSSERewriter("client")
+		chunks, err := r.Write(payload)
+		if err != nil || len(chunks) != 2 {
+			b.Fatalf("Write=(%d,%v)", len(chunks), err)
+		}
+	}
+}
+
 func BenchmarkSSERewriterSplitLargeEvent(b *testing.B) {
 	payload := []byte("data: {\"text\":\"" + strings.Repeat("x", 64<<10) + "\"}\n\n")
 	b.ReportAllocs()
@@ -1108,6 +1306,31 @@ func BenchmarkSSERewriterSplitLargeEvent(b *testing.B) {
 			if _, err := r.Write(payload[start:end]); err != nil {
 				b.Fatal(err)
 			}
+		}
+	}
+}
+
+func BenchmarkSSERewriterMultiEventBatches(b *testing.B) {
+	for _, delimiter := range []struct {
+		name  string
+		bytes []byte
+	}{
+		{name: "LF", bytes: []byte("data:x\n\n")},
+		{name: "CRLF", bytes: []byte("data:x\r\n\r\n")},
+	} {
+		for _, events := range []int{128, 512, 2048, 8192} {
+			b.Run(fmt.Sprintf("%s/%d", delimiter.name, events), func(b *testing.B) {
+				payload := bytes.Repeat(delimiter.bytes, events)
+				b.ReportAllocs()
+				b.SetBytes(int64(len(payload)))
+				for i := 0; i < b.N; i++ {
+					r := newSSERewriter("client")
+					chunks, err := r.Write(payload)
+					if err != nil || len(chunks) != 2*events {
+						b.Fatalf("Write=(%d,%v), want %d chunks", len(chunks), err, 2*events)
+					}
+				}
+			})
 		}
 	}
 }
@@ -1938,6 +2161,108 @@ func TestStreamChunkRewriterRawJSONUsesOneRestorePass(t *testing.T) {
 	})
 	if writeAllocs > rawAllocs+4 {
 		t.Fatalf("Write allocations=%v, rawJSONChunks allocations=%v; raw JSON was restored more than once", writeAllocs, rawAllocs)
+	}
+}
+
+func legacyRawJSONChunksForTest(r *streamChunkRewriter, p []byte) ([][]byte, error) {
+	values, ok := splitJSONValues(p)
+	if !ok {
+		return [][]byte{bytes.Clone(p)}, nil
+	}
+	if len(values) == 0 {
+		return nil, nil
+	}
+	out := make([][]byte, 0, len(values))
+	for _, value := range values {
+		restored, _, err := r.sse.restoreResponseModel(value)
+		if err != nil {
+			return nil, err
+		}
+		if r.frameRawJSONAsSSE {
+			out = append(out, frameSSEData(restored))
+		} else {
+			out = append(out, restored)
+		}
+	}
+	return out, nil
+}
+
+func TestRawJSONSingleValueFastPathMatchesLegacy(t *testing.T) {
+	backslash := string(rune(92))
+	inputs := [][]byte{
+		nil,
+		[]byte(" \r\n\t "),
+		[]byte("not-json"),
+		[]byte(`{}`),
+		[]byte("  {\"id\":\"r1\"} \r\n"),
+		[]byte(`{"model":"upstream"}`),
+		[]byte(`{"response":{"model":"upstream"}}`),
+		[]byte(`{"` + backslash + `u006dodel":"upstream"}`),
+		[]byte("{\"model\":\"upstream\"}\n{\"model\":\"other\"}"),
+		[]byte("null true 123 \"text\""),
+		[]byte(`{"valid":true} trailing`),
+		[]byte{0xc2, 0xa0},
+	}
+	for _, framed := range []bool{false, true} {
+		for _, input := range inputs {
+			r := newStreamChunkRewriter("client")
+			r.frameRawJSONAsSSE = framed
+			got, gotErr := r.rawJSONChunks(input)
+			want, wantErr := legacyRawJSONChunksForTest(r, input)
+			if !reflect.DeepEqual(got, want) || (gotErr == nil) != (wantErr == nil) {
+				t.Fatalf("framed=%v input=%q\ngot=%q err=%v\nwant=%q err=%v", framed, input, got, gotErr, want, wantErr)
+			}
+		}
+	}
+}
+
+func TestRawJSONSingleValueFastPathAllocatesLessThanLegacy(t *testing.T) {
+	body := []byte(`{"type":"response.completed","model":"upstream","output":"` + strings.Repeat("x", 64<<10) + `"}`)
+	production := newStreamChunkRewriter("client")
+	reference := newStreamChunkRewriter("client")
+	productionAllocs := testing.AllocsPerRun(50, func() {
+		chunks, err := production.rawJSONChunks(body)
+		if err != nil || len(chunks) != 1 {
+			panic(fmt.Sprintf("production=(%d,%v)", len(chunks), err))
+		}
+	})
+	referenceAllocs := testing.AllocsPerRun(50, func() {
+		chunks, err := legacyRawJSONChunksForTest(reference, body)
+		if err != nil || len(chunks) != 1 {
+			panic(fmt.Sprintf("reference=(%d,%v)", len(chunks), err))
+		}
+	})
+	if production.sse.encodedModel == nil || reference.sse.encodedModel == nil {
+		t.Fatalf("encoded model cache state differs: production=%v reference=%v", production.sse.encodedModel != nil, reference.sse.encodedModel != nil)
+	}
+	if productionAllocs >= referenceAllocs {
+		t.Fatalf("production allocations=%v, legacy allocations=%v", productionAllocs, referenceAllocs)
+	}
+}
+
+func BenchmarkStreamChunkRewriterSingleJSON(b *testing.B) {
+	body := []byte(`{"type":"response.completed","model":"upstream","output":"` + strings.Repeat("x", 64<<10) + `"}`)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(body)))
+	for i := 0; i < b.N; i++ {
+		r := newStreamChunkRewriter("client")
+		chunks, err := r.Write(body)
+		if err != nil || len(chunks) != 1 {
+			b.Fatalf("Write=(%d,%v)", len(chunks), err)
+		}
+	}
+}
+
+func BenchmarkStreamChunkRewriterLateInvalidJSON(b *testing.B) {
+	body := []byte(`{"model":"` + strings.Repeat("x", 64<<10))
+	r := newStreamChunkRewriter("client")
+	b.ReportAllocs()
+	b.SetBytes(int64(len(body)))
+	for i := 0; i < b.N; i++ {
+		chunks, err := r.rawJSONChunks(body)
+		if err != nil || len(chunks) != 1 || !bytes.Equal(chunks[0], body) {
+			b.Fatalf("rawJSONChunks=(%q,%v), want one unchanged chunk", chunks, err)
+		}
 	}
 }
 

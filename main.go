@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"unicode"
+	"unicode/utf8"
 
 	pluginabi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	pluginapi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -25,6 +26,7 @@ var pluginVersion = "0.0.0-dev"
 
 type sseRewriter struct {
 	originalModel string
+	encodedModel  json.RawMessage
 	buf           []byte
 	scanFrom      int
 }
@@ -38,6 +40,20 @@ type streamChunkRewriter struct {
 
 func newSSERewriter(originalModel string) *sseRewriter {
 	return &sseRewriter{originalModel: originalModel}
+}
+
+func (r *sseRewriter) restoreResponseModel(body []byte) ([]byte, bool, error) {
+	if !mightContainResponseModelField(body) {
+		return bytes.Clone(body), false, nil
+	}
+	if r.encodedModel == nil {
+		var err error
+		r.encodedModel, err = json.Marshal(r.originalModel)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	return rewriteResponseModelFieldsWithReplacement(body, r.originalModel, r.encodedModel)
 }
 
 func newStreamChunkRewriter(originalModel string) *streamChunkRewriter {
@@ -118,7 +134,11 @@ func (r *sseRewriter) rewriteEvent(event []byte) ([][]byte, error) {
 				out = append(out, append(append([]byte(nil), line...), lineBreak...))
 				continue
 			}
-			restored, changed, err := restoreResponseModel(value, r.originalModel)
+			if !mightContainResponseModelField(value) {
+				out = append(out, append(append([]byte(nil), line...), lineBreak...))
+				continue
+			}
+			restored, changed, err := r.restoreResponseModel(value)
 			if err != nil {
 				return nil, err
 			}
@@ -134,13 +154,19 @@ func (r *sseRewriter) rewriteEvent(event []byte) ([][]byte, error) {
 
 func sseEventDelimiter(buf []byte, start int) (eventLen, delimLen, next int) {
 	start = max(0, min(start, len(buf)))
-	for i := start; i < len(buf); i++ {
-		if i+1 < len(buf) && buf[i] == '\n' && buf[i+1] == '\n' {
-			return i, 2, 0
+	for search := start; search < len(buf); {
+		newline := bytes.IndexByte(buf[search:], '\n')
+		if newline < 0 {
+			break
 		}
-		if i+3 < len(buf) && buf[i] == '\r' && buf[i+1] == '\n' && buf[i+2] == '\r' && buf[i+3] == '\n' {
-			return i, 4, 0
+		newline += search
+		if newline+1 < len(buf) && buf[newline+1] == '\n' {
+			return newline, 2, 0
 		}
+		if newline > start && newline+2 < len(buf) && buf[newline-1] == '\r' && buf[newline+1] == '\r' && buf[newline+2] == '\n' {
+			return newline - 1, 4, 0
+		}
+		search = newline + 1
 	}
 	return 0, 0, max(0, len(buf)-3)
 }
@@ -188,19 +214,38 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 }
 
 func (r *streamChunkRewriter) rawJSONChunks(p []byte) ([][]byte, error) {
+	trimmed := bytes.Trim(p, " \t\r\n")
+	couldBeComplete := len(trimmed) > 0
+	if couldBeComplete {
+		switch trimmed[0] {
+		case '{':
+			couldBeComplete = trimmed[len(trimmed)-1] == '}'
+		case '[':
+			couldBeComplete = trimmed[len(trimmed)-1] == ']'
+		case '"':
+			couldBeComplete = trimmed[len(trimmed)-1] == '"'
+		}
+	}
+	if couldBeComplete && json.Valid(trimmed) {
+		restored, _, err := r.sse.restoreResponseModel(trimmed)
+		if err != nil {
+			return nil, err
+		}
+		if r.frameRawJSONAsSSE {
+			return [][]byte{frameSSEData(restored)}, nil
+		}
+		return [][]byte{restored}, nil
+	}
 	values, ok := splitJSONValues(p)
 	if !ok {
-		if r.frameRawJSONAsSSE && json.Valid(p) {
-			return [][]byte{frameSSEData(p)}, nil
-		}
-		return [][]byte{append([]byte(nil), p...)}, nil
+		return [][]byte{bytes.Clone(p)}, nil
 	}
 	if len(values) == 0 {
 		return nil, nil
 	}
 	out := make([][]byte, 0, len(values))
 	for _, value := range values {
-		restored, _, err := restoreResponseModel(value, r.originalModel)
+		restored, _, err := r.sse.restoreResponseModel(value)
 		if err != nil {
 			return nil, err
 		}
@@ -271,7 +316,7 @@ func isSSEChunk(p []byte) bool {
 
 func isIncompleteSSEPrefix(p []byte) bool {
 	trimmed := bytes.TrimLeft(p, " \t\r\n")
-	if len(trimmed) == 0 || strings.ContainsAny(string(trimmed), "\r\n") {
+	if len(trimmed) == 0 {
 		return false
 	}
 	for _, field := range [][]byte{[]byte("data:"), []byte("event:"), []byte(":")} {
@@ -879,14 +924,29 @@ func rewriteTopLevelModel(body []byte, model string) ([]byte, bool, error) {
 	return out, true, nil
 }
 
+func mightContainResponseModelField(body []byte) bool {
+	if bytes.IndexByte(body, '\\') >= 0 {
+		return true
+	}
+	return bytes.Contains(body, []byte(`"model"`)) ||
+		bytes.Contains(body, []byte(`"modelVersion"`))
+}
+
 func rewriteResponseModelFields(body []byte, model string) ([]byte, bool, error) {
-	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(body, &doc); err != nil {
+	if !mightContainResponseModelField(body) {
 		return bytes.Clone(body), false, nil
 	}
 	replacement, err := json.Marshal(model)
 	if err != nil {
 		return nil, false, err
+	}
+	return rewriteResponseModelFieldsWithReplacement(body, model, replacement)
+}
+
+func rewriteResponseModelFieldsWithReplacement(body []byte, model string, replacement json.RawMessage) ([]byte, bool, error) {
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return bytes.Clone(body), false, nil
 	}
 	changed := rewriteRawStringField(doc, "model", model, replacement)
 	changed = rewriteRawStringField(doc, "modelVersion", model, replacement) || changed
@@ -942,6 +1002,13 @@ func rewriteRawStringField(doc map[string]json.RawMessage, key, model string, re
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || trimmed[0] != '"' {
 		return false
+	}
+	if bytes.IndexByte(trimmed, '\\') < 0 && utf8.Valid(trimmed[1:len(trimmed)-1]) {
+		if len(trimmed) == len(model)+2 && bytes.Equal(trimmed[1:len(trimmed)-1], []byte(model)) {
+			return false
+		}
+		doc[key] = replacement
+		return true
 	}
 	var current string
 	if err := json.Unmarshal(trimmed, &current); err != nil || current == model {
@@ -1266,7 +1333,7 @@ func applyASCIIModelCase(model string, operation caseOperation) string {
 	return string(converted)
 }
 
-func callerPatternMatch(r rule, scope, key string) (bool, bool) {
+func callerPatternMatch(r *rule, scope, key string) (bool, bool) {
 	cacheKey := callerPatternCacheKey{scope: scope, pattern: r.callerPatternText}
 	callerPatternCacheMu.RLock()
 	matched, ok := callerPatternCache[cacheKey]
@@ -1288,7 +1355,7 @@ func callerPatternMatch(r rule, scope, key string) (bool, bool) {
 	return matched, true
 }
 
-func callerMatchesRule(r rule, scope, key string) bool {
+func callerMatchesRule(r *rule, scope, key string) bool {
 	if r.callerScope == "" && len(r.callerPattern) == 0 {
 		return true
 	}
@@ -1309,7 +1376,8 @@ func callerMatchesRule(r rule, scope, key string) bool {
 func applyRules(model, scope, key string, rules []rule) (string, bool, error) {
 	current := model
 	matchedAny := false
-	for _, r := range rules {
+	for i := range rules {
+		r := &rules[i]
 		if !callerMatchesRule(r, scope, key) {
 			continue
 		}
@@ -1332,7 +1400,7 @@ func applyRules(model, scope, key string, rules []rule) (string, bool, error) {
 }
 
 func matchTokens(s string, tokens []token) ([]string, bool) {
-	captures := make([]string, 0, len(tokens))
+	var captures []string
 	pos := 0
 	for i, tok := range tokens {
 		if tok.literal != "" {
@@ -1357,6 +1425,9 @@ func matchTokens(s string, tokens []token) ([]string, bool) {
 			}
 			end = pos + idx
 		}
+		if captures == nil {
+			captures = make([]string, 0, len(tokens))
+		}
 		captures = append(captures, s[pos:end])
 		pos = end
 	}
@@ -1364,7 +1435,19 @@ func matchTokens(s string, tokens []token) ([]string, bool) {
 }
 
 func buildReplacement(tokens []token, captures []string) string {
+	if len(tokens) == 1 && tokens[0].literal != "" {
+		return tokens[0].literal
+	}
+	size := 0
+	for _, tok := range tokens {
+		if tok.literal != "" {
+			size += len(tok.literal)
+		} else {
+			size += len(captures[tok.capture-1])
+		}
+	}
 	var b strings.Builder
+	b.Grow(size)
 	for _, tok := range tokens {
 		if tok.literal != "" {
 			b.WriteString(tok.literal)
