@@ -118,6 +118,10 @@ func (r *sseRewriter) rewriteEvent(event []byte) ([][]byte, error) {
 				out = append(out, append(append([]byte(nil), line...), lineBreak...))
 				continue
 			}
+			if !mightContainResponseModelField(value) {
+				out = append(out, append(append([]byte(nil), line...), lineBreak...))
+				continue
+			}
 			restored, changed, err := restoreResponseModel(value, r.originalModel)
 			if err != nil {
 				return nil, err
@@ -885,7 +889,18 @@ func rewriteTopLevelModel(body []byte, model string) ([]byte, bool, error) {
 	return out, true, nil
 }
 
+func mightContainResponseModelField(body []byte) bool {
+	if bytes.IndexByte(body, '\\') >= 0 {
+		return true
+	}
+	return bytes.Contains(body, []byte(`"model"`)) ||
+		bytes.Contains(body, []byte(`"modelVersion"`))
+}
+
 func rewriteResponseModelFields(body []byte, model string) ([]byte, bool, error) {
+	if !mightContainResponseModelField(body) {
+		return bytes.Clone(body), false, nil
+	}
 	var doc map[string]json.RawMessage
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return bytes.Clone(body), false, nil
@@ -948,6 +963,13 @@ func rewriteRawStringField(doc map[string]json.RawMessage, key, model string, re
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || trimmed[0] != '"' {
 		return false
+	}
+	if bytes.IndexByte(trimmed, '\\') < 0 {
+		if len(trimmed) == len(model)+2 && bytes.Equal(trimmed[1:len(trimmed)-1], []byte(model)) {
+			return false
+		}
+		doc[key] = replacement
+		return true
 	}
 	var current string
 	if err := json.Unmarshal(trimmed, &current); err != nil || current == model {

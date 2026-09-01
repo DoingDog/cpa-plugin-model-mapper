@@ -953,6 +953,58 @@ func TestRestoreResponseModelLeavesUnsupportedBodiesUnchanged(t *testing.T) {
 	}
 }
 
+func TestRestoreResponseWithoutModelUsesCloneOnly(t *testing.T) {
+	body := []byte(`{"type":"response.output_text.delta","delta":"hello"}`)
+	allocs := testing.AllocsPerRun(100, func() {
+		got, changed, err := restoreResponseModel(body, "client")
+		if err != nil || changed || !bytes.Equal(got, body) {
+			panic(fmt.Sprintf("restore=(%s,%v,%v)", got, changed, err))
+		}
+	})
+	if allocs > 1 {
+		t.Fatalf("no-model allocations=%v, want <=1 clone", allocs)
+	}
+}
+
+func TestRestoreResponseModelFastPathPreservesEscapedSemantics(t *testing.T) {
+	backslash := string(rune(92))
+	tests := []struct {
+		name    string
+		body    []byte
+		changed bool
+		want    string
+	}{
+		{name: "escaped model key", body: []byte(`{"` + backslash + `u006dodel":"upstream"}`), changed: true, want: `"model":"client"`},
+		{name: "escaped nested response and model keys", body: []byte(`{"res` + backslash + `u0070onse":{"` + backslash + `u006dodel":"upstream"}}`), changed: true, want: `"model":"client"`},
+		{name: "escaped equal value remains unchanged", body: []byte(`{"model":"cli` + backslash + `u0065nt"}`), changed: false},
+		{name: "ordinary escaped text remains unchanged", body: []byte(`{"text":"line` + backslash + `nnext"}`), changed: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, changed, err := restoreResponseModel(tt.body, "client")
+			if err != nil || changed != tt.changed {
+				t.Fatalf("restore=(%s,%v,%v)", got, changed, err)
+			}
+			if tt.want != "" && !strings.Contains(string(got), tt.want) {
+				t.Fatalf("body=%s missing %s", got, tt.want)
+			}
+			if !tt.changed && !bytes.Equal(got, tt.body) {
+				t.Fatalf("unchanged body=%s, want %s", got, tt.body)
+			}
+		})
+	}
+}
+
+func BenchmarkRestoreResponseWithoutModel(b *testing.B) {
+	body := []byte(`{"type":"response.output_text.delta","delta":"hello"}`)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, _, err := restoreResponseModel(body, "client"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func flattenChunks(chunks [][]byte) string {
 	var b strings.Builder
 	for _, chunk := range chunks {
