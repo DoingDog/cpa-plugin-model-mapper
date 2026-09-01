@@ -21,7 +21,7 @@ plugins:
       openai_completions_rules: ""
 ```
 
-The plugin's own `enabled` field defaults to `true`. Empty rule fields mean the request is skipped and CPA behaves normally.
+CPA owns `plugins.enabled` and each plugin instance's `enabled` and `priority` fields. `model-mapper` itself exposes only the four rule fields below; when the selected rules field is empty, the request is skipped and CPA behaves normally.
 
 ## Rule syntax
 
