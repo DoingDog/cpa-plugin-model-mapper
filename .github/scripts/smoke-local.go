@@ -8,13 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -168,14 +168,17 @@ func runCase(env smokeEnv, tc caseConfig) error {
 		}
 		return err
 	}
-	defer stopCPA(proc)
-	if err := waitReady(env.port, localAPIKey); err != nil {
-		return err
+	var caseErr error
+	if readyErr := waitReady(proc, env.port, localAPIKey); readyErr != nil {
+		if !tc.allowStartFailure {
+			caseErr = readyErr
+		}
+	} else if tc.stream {
+		caseErr = runStreamCase(env.port, tc)
+	} else {
+		caseErr = runJSONCase(env.port, tc)
 	}
-	if tc.stream {
-		return runStreamCase(env.port, tc)
-	}
-	return runJSONCase(env.port, tc)
+	return errors.Join(caseErr, stopCPA(proc))
 }
 
 func buildConfig(env smokeEnv, tc caseConfig) string {
@@ -225,6 +228,9 @@ func buildConfig(env smokeEnv, tc caseConfig) string {
 }
 
 func startCPA(env smokeEnv) (*cpaProcess, error) {
+	if err := checkPortAvailable(fmt.Sprintf("127.0.0.1:%d", env.port)); err != nil {
+		return nil, err
+	}
 	logFile, err := os.Create(env.logFile)
 	if err != nil {
 		return nil, fmt.Errorf("create log file: %w", err)
@@ -244,38 +250,65 @@ func startCPA(env smokeEnv) (*cpaProcess, error) {
 	}()
 	select {
 	case err := <-proc.waitDone:
+		_ = logFile.Close()
 		return nil, earlyExitError(env.logFile, err)
-	case <-time.After(300 * time.Millisecond):
+	default:
 		return proc, nil
 	}
 }
 
-func stopCPA(proc *cpaProcess) {
+func stopCPA(proc *cpaProcess) (stopErr error) {
 	if proc == nil || proc.cmd == nil || proc.cmd.Process == nil {
-		return
+		return nil
 	}
 	defer func() {
 		if proc.logFile != nil {
-			_ = proc.logFile.Close()
+			if err := proc.logFile.Close(); err != nil {
+				stopErr = errors.Join(stopErr, fmt.Errorf("close CPA log: %w", err))
+			}
 		}
 	}()
-	_ = proc.cmd.Process.Signal(os.Interrupt)
 	select {
 	case <-proc.waitDone:
-		return
-	case <-time.After(2 * time.Second):
+		return nil
+	default:
 	}
-	_ = proc.cmd.Process.Signal(syscall.SIGTERM)
-	select {
-	case <-proc.waitDone:
-		return
-	case <-time.After(2 * time.Second):
+	interruptErr := proc.cmd.Process.Signal(os.Interrupt)
+	if interruptErr == nil {
+		select {
+		case <-proc.waitDone:
+			return nil
+		case <-time.After(2 * time.Second):
+		}
 	}
-	_ = proc.cmd.Process.Kill()
+	if err := proc.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		if interruptErr != nil {
+			return errors.Join(
+				fmt.Errorf("send interrupt to CPA: %w", interruptErr),
+				fmt.Errorf("kill CPA: %w", err),
+			)
+		}
+		return fmt.Errorf("kill CPA: %w", err)
+	}
 	<-proc.waitDone
+	return nil
+}
+
+func checkPortAvailable(address string) error {
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return fmt.Errorf("CPA port %s is unavailable: %w", address, err)
+	}
+	if err := listener.Close(); err != nil {
+		return fmt.Errorf("release CPA port %s: %w", address, err)
+	}
+	return nil
 }
 
 func earlyExitError(logPath string, waitErr error) error {
+	if waitErr == nil {
+		waitErr = errors.New("process exited before readiness")
+	}
 	body, readErr := os.ReadFile(logPath)
 	if readErr != nil {
 		return fmt.Errorf("CPA exited early: %w", waitErr)
@@ -287,9 +320,14 @@ func earlyExitError(logPath string, waitErr error) error {
 	return fmt.Errorf("CPA exited early: %s", trimmed)
 }
 
-func waitReady(port int, apiKey string) error {
+func waitReady(proc *cpaProcess, port int, apiKey string) error {
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
+		select {
+		case waitErr := <-proc.waitDone:
+			return earlyExitError(proc.logFile.Name(), waitErr)
+		default:
+		}
 		status, _, err := getModels(port, apiKey)
 		if err == nil && status/100 == 2 {
 			return nil
