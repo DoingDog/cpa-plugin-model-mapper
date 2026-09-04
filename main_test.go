@@ -35,7 +35,7 @@ func TestPluginRegistrationMetadataAndConfigFields(t *testing.T) {
 	if reg.Capabilities.ExecutorModelScope != string(pluginapi.ExecutorModelScopeStatic) {
 		t.Fatalf("executor scope=%q", reg.Capabilities.ExecutorModelScope)
 	}
-	if !reflect.DeepEqual(reg.Capabilities.ExecutorInputFormats, []string{"openai", "claude", "openai-response"}) {
+	if !reflect.DeepEqual(reg.Capabilities.ExecutorInputFormats, []string{"openai", "claude", "openai-response", "gemini"}) {
 		t.Fatalf("executor input formats=%v", reg.Capabilities.ExecutorInputFormats)
 	}
 	if !reflect.DeepEqual(reg.Capabilities.ExecutorOutputFormats, []string{"openai", "claude", "openai-response"}) {
@@ -73,6 +73,64 @@ func TestDecodeLifecycleConfigUnquotesYAMLEmptyRuleStrings(t *testing.T) {
 	}
 	if cfg.ClaudeMessagesRules != "literal\\*=>star" {
 		t.Fatalf("claude rules = %q", cfg.ClaudeMessagesRules)
+	}
+}
+
+func TestHandlePluginRegisterLoadsConfigYAML(t *testing.T) {
+	setLoadedConfigForTest(defaultConfig())
+	rawYAML := []byte("global_rules: a=>b\n")
+	rawReq, err := json.Marshal(map[string]string{"config_yaml": base64.StdEncoding.EncodeToString(rawYAML)})
+	if err != nil {
+		t.Fatalf("marshal lifecycle: %v", err)
+	}
+	if _, err := handlePluginRegister(rawReq); err != nil {
+		t.Fatalf("handlePluginRegister error = %v", err)
+	}
+	routeRaw, err := json.Marshal(pluginapi.ModelRouteRequest{SourceFormat: "openai", RequestedModel: "a"})
+	if err != nil {
+		t.Fatalf("marshal route: %v", err)
+	}
+	responseRaw, err := handleModelRoute(routeRaw)
+	if err != nil {
+		t.Fatalf("handleModelRoute error = %v", err)
+	}
+	var response pluginapi.ModelRouteResponse
+	if err := json.Unmarshal(responseRaw, &response); err != nil {
+		t.Fatalf("decode route response: %v", err)
+	}
+	if !response.Handled {
+		t.Fatalf("route response=%s, want handled after initial register", responseRaw)
+	}
+}
+
+func TestDecodeLifecycleConfigStripsYAMLInlineComments(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "plain", raw: "global_rules: a=>b # comment\n", want: "a=>b"},
+		{name: "single quoted", raw: "global_rules: 'a=>b' # comment\n", want: "a=>b"},
+		{name: "double quoted", raw: "global_rules: \"a=>b\" # comment\n", want: "a=>b"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rawReq, err := json.Marshal(map[string]string{"config_yaml": base64.StdEncoding.EncodeToString([]byte(tt.raw))})
+			if err != nil {
+				t.Fatalf("marshal lifecycle: %v", err)
+			}
+			cfgRaw, _, err := decodeLifecycleConfig(rawReq)
+			if err != nil {
+				t.Fatalf("decodeLifecycleConfig error = %v", err)
+			}
+			cfg, err := decodeConfig(cfgRaw)
+			if err != nil {
+				t.Fatalf("decodeConfig error = %v", err)
+			}
+			if cfg.GlobalRules != tt.want {
+				t.Fatalf("global rules=%q, want %q", cfg.GlobalRules, tt.want)
+			}
+		})
 	}
 }
 
@@ -2313,6 +2371,86 @@ func TestHandleExecutorExecuteStreamStartsForwarderAndRestoresChunks(t *testing.
 	}
 	if !closedHost || !closedPlugin {
 		t.Fatalf("closedHost=%v closedPlugin=%v", closedHost, closedPlugin)
+	}
+}
+
+func TestStreamChunkRewriterSeparatesKnownResponseEventAndDataChunks(t *testing.T) {
+	r := newStreamChunkRewriter("client")
+	first, err := r.Write([]byte("event: response.completed"))
+	if err != nil || len(first) != 0 {
+		t.Fatalf("first write = (%q, %v), want buffered", first, err)
+	}
+	second, err := r.Write([]byte(`data: {"response":{"model":"upstream"}}`))
+	if err != nil {
+		t.Fatalf("second write error = %v", err)
+	}
+	flushed, err := r.Flush()
+	if err != nil {
+		t.Fatalf("flush error = %v", err)
+	}
+	second = append(second, flushed...)
+	got := flattenChunks(second)
+	want := "event: response.completed\n" + `data: {"response":{"model":"client"}}`
+	if got != want {
+		t.Fatalf("output = %q, want %q", got, want)
+	}
+}
+
+func TestStreamChunkRewriterPreservesColonlessJSONScalarSSE(t *testing.T) {
+	r := newStreamChunkRewriter("client")
+	r.frameRawJSONAsSSE = true
+	chunks, err := r.Write([]byte("null\n\n"))
+	if err != nil {
+		t.Fatalf("write error = %v", err)
+	}
+	flushed, err := r.Flush()
+	if err != nil {
+		t.Fatalf("flush error = %v", err)
+	}
+	chunks = append(chunks, flushed...)
+	if got := flattenChunks(chunks); got != "null\n\n" {
+		t.Fatalf("output = %q, want unchanged colonless field", got)
+	}
+}
+
+func TestStreamChunkRewriterBOMPartitionInvariant(t *testing.T) {
+	input := append([]byte{0xef, 0xbb, 0xbf}, []byte("data: {\"model\":\"upstream\"}\n\n")...)
+	var want string
+	for split := 0; split <= len(input); split++ {
+		r := newStreamChunkRewriter("client")
+		first, err := r.Write(input[:split])
+		if err != nil {
+			t.Fatalf("split %d first write error = %v", split, err)
+		}
+		second, err := r.Write(input[split:])
+		if err != nil {
+			t.Fatalf("split %d second write error = %v", split, err)
+		}
+		flushed, err := r.Flush()
+		if err != nil {
+			t.Fatalf("split %d flush error = %v", split, err)
+		}
+		got := flattenChunks(append(append(first, second...), flushed...))
+		if split == 0 {
+			want = got
+		}
+		if got != want || !strings.Contains(got, `"model":"client"`) {
+			t.Fatalf("split %d output = %q, want partition-invariant restored output %q", split, got, want)
+		}
+	}
+}
+
+func TestSSERewriterPreservesNonJSONDataWhitespace(t *testing.T) {
+	input := append([]byte("data:"), byte('\v'))
+	input = append(input, []byte(`{"model":"upstream"}`)...)
+	input = append(input, byte('\f'), '\n', '\n')
+	r := newSSERewriter("client")
+	chunks, err := r.Write(input)
+	if err != nil {
+		t.Fatalf("write error = %v", err)
+	}
+	if got := flattenChunks(chunks); got != string(input) {
+		t.Fatalf("output = %q, want byte-preserving non-JSON data", got)
 	}
 }
 

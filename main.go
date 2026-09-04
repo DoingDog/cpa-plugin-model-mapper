@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
@@ -9,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -19,6 +19,7 @@ import (
 
 	pluginabi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	pluginapi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"gopkg.in/yaml.v3"
 )
 
 func main() {}
@@ -30,6 +31,8 @@ type sseRewriter struct {
 	encodedModel  json.RawMessage
 	buf           []byte
 	scanFrom      int
+	bomPrefix     []byte
+	bomDone       bool
 }
 
 type streamChunkRewriter struct {
@@ -41,6 +44,51 @@ type streamChunkRewriter struct {
 
 func newSSERewriter(originalModel string) *sseRewriter {
 	return &sseRewriter{originalModel: originalModel}
+}
+
+var utf8SSEBOM = [...]byte{0xef, 0xbb, 0xbf}
+
+func (r *sseRewriter) consumeLeadingBOM(p []byte) []byte {
+	if r.bomDone {
+		return p
+	}
+	for len(p) > 0 && len(r.bomPrefix) < len(utf8SSEBOM) {
+		if p[0] != utf8SSEBOM[len(r.bomPrefix)] {
+			r.bomDone = true
+			if len(r.bomPrefix) == 0 {
+				return p
+			}
+			restored := make([]byte, 0, len(r.bomPrefix)+len(p))
+			restored = append(restored, r.bomPrefix...)
+			restored = append(restored, p...)
+			r.bomPrefix = nil
+			return restored
+		}
+		r.bomPrefix = append(r.bomPrefix, p[0])
+		p = p[1:]
+	}
+	if len(r.bomPrefix) == len(utf8SSEBOM) {
+		r.bomPrefix = nil
+		r.bomDone = true
+	}
+	return p
+}
+
+func (r *sseRewriter) flushLeadingBOM() {
+	if r.bomDone || len(r.bomPrefix) == 0 {
+		return
+	}
+	r.buf = append(r.bomPrefix, r.buf...)
+	r.bomPrefix = nil
+	r.bomDone = true
+}
+
+func sseFieldValue(line []byte) []byte {
+	value := line[len("data:"):]
+	if len(value) > 0 && value[0] == ' ' {
+		return value[1:]
+	}
+	return value
 }
 
 func (r *sseRewriter) restoreResponseModel(body []byte) ([]byte, bool, error) {
@@ -65,11 +113,16 @@ func newStreamChunkRewriter(originalModel string) *streamChunkRewriter {
 }
 
 func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
+	p = r.consumeLeadingBOM(p)
+	if len(p) == 0 && !r.bomDone && len(r.bomPrefix) > 0 {
+		return nil, nil
+	}
 	r.buf = append(r.buf, p...)
 	return r.drain(false)
 }
 
 func (r *sseRewriter) Flush() ([][]byte, error) {
+	r.flushLeadingBOM()
 	if len(r.buf) == 0 {
 		return nil, nil
 	}
@@ -88,6 +141,9 @@ func (r *sseRewriter) drain(eof bool) ([][]byte, error) {
 		}
 		event := r.buf[:delim]
 		delimiter := r.buf[delim : delim+n : delim+n]
+		if cap(r.buf) >= 1<<20 {
+			delimiter = bytes.Clone(delimiter)
+		}
 		r.buf = r.buf[delim+n:]
 		r.scanFrom = 0
 		consumed = true
@@ -161,7 +217,7 @@ func (r *sseRewriter) rewriteMultiDataEvent(out [][]byte, event []byte) ([][]byt
 			nonDataFields++
 			continue
 		}
-		value := bytes.TrimSpace(line[len("data:"):])
+		value := sseFieldValue(line)
 		if dataFields > 0 {
 			joinedLen++
 		}
@@ -180,7 +236,7 @@ func (r *sseRewriter) rewriteMultiDataEvent(out [][]byte, event []byte) ([][]byt
 		if seenData > 0 {
 			joined = append(joined, 10)
 		}
-		joined = append(joined, bytes.TrimSpace(line[len("data:"):])...)
+		joined = append(joined, sseFieldValue(line)...)
 		seenData++
 	}
 	if !mightContainResponseModelField(joined) {
@@ -233,7 +289,7 @@ func (r *sseRewriter) rewriteEvent(out [][]byte, event []byte) ([][]byte, error)
 			if hasSSEDataField(remaining) {
 				return r.rewriteMultiDataEvent(out[:originalOutLen], originalEvent)
 			}
-			value := bytes.TrimSpace(line[len("data:"):])
+			value := sseFieldValue(line)
 			if len(value) == 0 || bytes.Equal(value, []byte("[DONE]")) {
 				out = append(out, append(append([]byte(nil), line...), lineBreak...))
 				continue
@@ -310,13 +366,83 @@ func sseEventDelimiter(buf []byte, start int) (eventLen, delimLen, next int) {
 	return findSSEEventDelimiter(buf, start, false)
 }
 
+func isSSEFieldStart(p []byte) bool {
+	trimmed := bytes.TrimLeft(p, " \t\r\n")
+	for _, prefix := range [][]byte{[]byte("data:"), []byte("event:"), []byte("id:"), []byte("retry:"), []byte(":")} {
+		if bytes.HasPrefix(trimmed, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func lastSSELine(p []byte) []byte {
+	for i := len(p) - 1; i >= 0; i-- {
+		if p[i] == '\n' || p[i] == '\r' {
+			return p[i+1:]
+		}
+	}
+	return p
+}
+
+func knownSSELogicalBoundary(pending, next []byte) bool {
+	if len(pending) == 0 || bytes.HasSuffix(pending, []byte("\n")) || bytes.HasSuffix(pending, []byte("\r")) {
+		return false
+	}
+	if !isSSEFieldStart(next) {
+		return false
+	}
+	line := lastSSELine(pending)
+	switch {
+	case bytes.HasPrefix(line, []byte("event:")):
+		return len(bytes.TrimSpace(line[len("event:"):])) > 0
+	case bytes.HasPrefix(line, []byte("data:")):
+		value := sseFieldValue(line)
+		return len(value) > 0 && json.Valid(bytes.TrimSpace(value))
+	default:
+		return false
+	}
+}
+
+func isColonlessSSEChunk(p []byte) bool {
+	trimmed := bytes.TrimLeft(p, " \t\r\n")
+	if len(trimmed) == 0 || trimmed[0] == '{' || trimmed[0] == '[' {
+		return false
+	}
+	eventLen, delimiterLength, _ := findSSEEventDelimiter(p, 0, true)
+	if delimiterLength == 0 {
+		return false
+	}
+	event := p[:eventLen]
+	for len(event) > 0 {
+		line, _, remaining := splitSSELine(event)
+		event = remaining
+		if bytes.IndexByte(line, ':') >= 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
+	if !r.sse.bomDone {
+		p = r.sse.consumeLeadingBOM(p)
+		if len(p) == 0 && !r.sse.bomDone {
+			return nil, nil
+		}
+	}
 	if len(r.pending) > 0 {
 		r.pending = append(r.pending, p...)
 		p = append([]byte(nil), r.pending...)
 		r.pending = nil
 	}
 	if len(r.sse.buf) > 0 {
+		if knownSSELogicalBoundary(r.sse.buf, p) {
+			r.sse.buf = append(r.sse.buf, '\n')
+		}
+		return r.sse.Write(p)
+	}
+	if r.frameRawJSONAsSSE && isColonlessSSEChunk(p) {
 		return r.sse.Write(p)
 	}
 	if couldStartJSONValue(p) {
@@ -450,6 +576,11 @@ func frameSSEData(p []byte) []byte {
 	return out.Bytes()
 }
 
+func isEventStreamContentType(value string) bool {
+	mediaType, _, err := mime.ParseMediaType(value)
+	return err == nil && strings.EqualFold(mediaType, "text/event-stream")
+}
+
 func hasSSEFieldPrefix(p []byte) bool {
 	trimmed := bytes.TrimLeft(p, " \t\r\n")
 	lineEnd := len(trimmed)
@@ -545,7 +676,7 @@ func pluginRegistration() registration {
 			ModelRouter:           true,
 			Executor:              true,
 			ExecutorModelScope:    string(pluginapi.ExecutorModelScopeStatic),
-			ExecutorInputFormats:  []string{"openai", "claude", "openai-response"},
+			ExecutorInputFormats:  []string{"openai", "claude", "openai-response", "gemini"},
 			ExecutorOutputFormats: []string{"openai", "claude", "openai-response"},
 		},
 	}
@@ -622,20 +753,30 @@ func setLoadedConfigForTest(cfg Config) {
 	loadedConfigMu.Unlock()
 }
 
+func applyLifecycleConfig(raw []byte) error {
+	cfgRaw, _, err := decodeLifecycleConfig(raw)
+	if err != nil {
+		return err
+	}
+	cfg, err := decodeConfig(cfgRaw)
+	if err != nil {
+		return err
+	}
+	setLoadedConfigForTest(cfg)
+	return nil
+}
+
 func handlePluginRegister(raw []byte) ([]byte, error) {
+	if err := applyLifecycleConfig(raw); err != nil {
+		return nil, err
+	}
 	return json.Marshal(pluginRegistration())
 }
 
 func handlePluginReconfigure(raw []byte) ([]byte, error) {
-	cfgRaw, _, err := decodeLifecycleConfig(raw)
-	if err != nil {
+	if err := applyLifecycleConfig(raw); err != nil {
 		return nil, err
 	}
-	cfg, err := decodeConfig(cfgRaw)
-	if err != nil {
-		return nil, err
-	}
-	setLoadedConfigForTest(cfg)
 	return json.Marshal(pluginRegistration())
 }
 
@@ -855,7 +996,7 @@ func runStreamForward(req executorRPCRequest, call hostCaller) error {
 		return err
 	}
 	rewriter := newStreamChunkRewriter(decision.OriginalModel)
-	rewriter.frameRawJSONAsSSE = strings.Contains(strings.ToLower(hostResp.Headers.Get("Content-Type")), "text/event-stream")
+	rewriter.frameRawJSONAsSSE = isEventStreamContentType(hostResp.Headers.Get("Content-Type"))
 	for {
 		readRaw, err := call(pluginabi.MethodHostModelStreamRead, pluginapi.HostModelStreamReadRequest{StreamID: hostStreamID})
 		if err != nil {
@@ -1012,6 +1153,13 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	}
 }
 
+type lifecycleYAMLConfig struct {
+	GlobalRules            string `yaml:"global_rules"`
+	ClaudeMessagesRules    string `yaml:"claude_messages_rules"`
+	CodexResponsesRules    string `yaml:"codex_responses_rules"`
+	OpenAICompletionsRules string `yaml:"openai_completions_rules"`
+}
+
 func decodeLifecycleConfig(raw []byte) (json.RawMessage, bool, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
@@ -1025,51 +1173,22 @@ func decodeLifecycleConfig(raw []byte) (json.RawMessage, bool, error) {
 		if err != nil {
 			return nil, true, err
 		}
-		cfg := defaultConfig()
-		scanner := bufio.NewScanner(bytes.NewReader(decoded))
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
-			}
-			key, value, ok := strings.Cut(line, ":")
-			if !ok {
-				continue
-			}
-			key = strings.TrimSpace(key)
-			value = unquoteYAMLScalar(strings.TrimSpace(value))
-			switch key {
-			case "global_rules":
-				cfg.GlobalRules = value
-			case "claude_messages_rules":
-				cfg.ClaudeMessagesRules = value
-			case "codex_responses_rules":
-				cfg.CodexResponsesRules = value
-			case "openai_completions_rules":
-				cfg.OpenAICompletionsRules = value
-			}
-		}
-		if err := scanner.Err(); err != nil {
+		var yamlConfig lifecycleYAMLConfig
+		if err := yaml.Unmarshal(decoded, &yamlConfig); err != nil {
 			return nil, true, err
 		}
-		cfgRaw, err := json.Marshal(cfg)
+		cfgRaw, err := json.Marshal(Config{
+			GlobalRules:            yamlConfig.GlobalRules,
+			ClaudeMessagesRules:    yamlConfig.ClaudeMessagesRules,
+			CodexResponsesRules:    yamlConfig.CodexResponsesRules,
+			OpenAICompletionsRules: yamlConfig.OpenAICompletionsRules,
+		})
 		if err != nil {
 			return nil, true, err
 		}
 		return cfgRaw, true, nil
 	}
 	return append(json.RawMessage(nil), trimmed...), false, nil
-}
-
-func unquoteYAMLScalar(value string) string {
-	if len(value) < 2 {
-		return value
-	}
-	quote := value[0]
-	if (quote != '"' && quote != '\'') || value[len(value)-1] != quote {
-		return value
-	}
-	return value[1 : len(value)-1]
 }
 
 func callHost(method string, payload any) (json.RawMessage, error) {
