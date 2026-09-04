@@ -1574,6 +1574,24 @@ func TestSSERewriterDoesNotInventLineBreakAtChunkBoundary(t *testing.T) {
 	}
 }
 
+func TestSSERewriterAvoidsJoiningLargeMultiDataWithoutModelMarker(t *testing.T) {
+	value := strings.Repeat("x", 4<<20)
+	input := []byte("data: " + value + "\ndata: " + value + "\n\n")
+	result := testing.Benchmark(func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			r := newSSERewriter("client")
+			chunks, err := r.Write(input)
+			if err != nil || len(chunks) != 3 {
+				b.Fatalf("Write=(%d,%v)", len(chunks), err)
+			}
+		}
+	})
+	if got, limit := result.AllocedBytesPerOp(), int64(float64(len(input))*2.6); got > limit {
+		t.Fatalf("large no-marker multi-data bytes/op=%d, want <=%d without joined payload", got, limit)
+	}
+}
+
 func TestSSERewriterPreservesUnchangedMultiDataEventsByteForByte(t *testing.T) {
 	lf := string([]byte{10})
 	cr := string([]byte{13})
@@ -3097,7 +3115,7 @@ func TestRunStreamForwardClosesHostStreamOnHTTPError(t *testing.T) {
 				return nil, fmt.Errorf("unexpected method %q", method)
 			}
 
-			err := runStreamForward(req, call)
+			err := runStreamForward(&req, call)
 			if err == nil || err.Error() != "execute stream status 503: upstream failed" {
 				t.Fatalf("runStreamForward error = %v, want original status error", err)
 			}

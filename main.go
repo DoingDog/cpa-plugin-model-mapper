@@ -91,18 +91,23 @@ func sseFieldValue(line []byte) []byte {
 	return value
 }
 
-func (r *sseRewriter) restoreResponseModel(body []byte) ([]byte, bool, error) {
-	if !mightContainResponseModelField(body) {
-		return bytes.Clone(body), false, nil
-	}
+func (r *sseRewriter) restoreResponseModelCandidate(body []byte) ([]byte, bool, bool, error) {
 	if r.encodedModel == nil {
 		var err error
 		r.encodedModel, err = json.Marshal(r.originalModel)
 		if err != nil {
-			return nil, false, err
+			return nil, false, false, err
 		}
 	}
-	return rewriteResponseModelFieldsWithReplacement(body, r.originalModel, r.encodedModel)
+	return rewriteResponseModelFieldsWithReplacementChecked(body, r.originalModel, r.encodedModel)
+}
+
+func (r *sseRewriter) restoreResponseModel(body []byte) ([]byte, bool, error) {
+	if !mightContainResponseModelField(body) {
+		return bytes.Clone(body), false, nil
+	}
+	out, changed, _, err := r.restoreResponseModelCandidate(body)
+	return out, changed, err
 }
 
 func newStreamChunkRewriter(originalModel string) *streamChunkRewriter {
@@ -210,6 +215,8 @@ func (r *sseRewriter) rewriteMultiDataEvent(out [][]byte, event []byte) ([][]byt
 	joinedLen := 0
 	dataFields := 0
 	nonDataFields := 0
+	hasMarker := false
+	var markerScanner responseModelMarkerScanner
 	for remaining := event; len(remaining) > 0; {
 		line, _, next := splitSSELine(remaining)
 		remaining = next
@@ -220,9 +227,23 @@ func (r *sseRewriter) rewriteMultiDataEvent(out [][]byte, event []byte) ([][]byt
 		value := sseFieldValue(line)
 		if dataFields > 0 {
 			joinedLen++
+			if !hasMarker {
+				hasMarker = markerScanner.feed('\n')
+			}
 		}
 		joinedLen += len(value)
+		if !hasMarker {
+			for _, b := range value {
+				if markerScanner.feed(b) {
+					hasMarker = true
+					break
+				}
+			}
+		}
 		dataFields++
+	}
+	if !hasMarker {
+		return appendUnchangedSSEEvent(out, event), nil
 	}
 
 	joined := make([]byte, 0, joinedLen)
@@ -238,9 +259,6 @@ func (r *sseRewriter) rewriteMultiDataEvent(out [][]byte, event []byte) ([][]byt
 		}
 		joined = append(joined, sseFieldValue(line)...)
 		seenData++
-	}
-	if !mightContainResponseModelField(joined) {
-		return appendUnchangedSSEEvent(out, event), nil
 	}
 	restored, changed, err := r.restoreResponseModel(joined)
 	if err != nil {
@@ -424,6 +442,23 @@ func isColonlessSSEChunk(p []byte) bool {
 	return true
 }
 
+func completeSSEEvents(p []byte) bool {
+	found := false
+	for len(p) > 0 {
+		eventLen, delimiterLen, _ := findSSEEventDelimiter(p, 0, true)
+		if delimiterLen == 0 {
+			return false
+		}
+		consumed := eventLen + delimiterLen
+		if consumed <= 0 || consumed > len(p) {
+			return false
+		}
+		p = p[consumed:]
+		found = true
+	}
+	return found
+}
+
 func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 	if !r.sse.bomDone {
 		p = r.sse.consumeLeadingBOM(p)
@@ -441,6 +476,9 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 			r.sse.buf = append(r.sse.buf, '\n')
 		}
 		return r.sse.Write(p)
+	}
+	if r.frameRawJSONAsSSE && !couldStartJSONValue(p) && completeSSEEvents(p) && !mightContainResponseModelField(p) {
+		return [][]byte{bytes.Clone(p)}, nil
 	}
 	if r.frameRawJSONAsSSE && isColonlessSSEChunk(p) {
 		return r.sse.Write(p)
@@ -496,15 +534,25 @@ func (r *streamChunkRewriter) tryRawJSONChunks(p []byte) ([][]byte, bool, error)
 			couldBeComplete = trimmed[len(trimmed)-1] == '"'
 		}
 	}
-	if couldBeComplete && json.Valid(trimmed) {
-		restored, _, err := r.sse.restoreResponseModel(trimmed)
-		if err != nil {
-			return nil, false, err
+	if couldBeComplete {
+		var restored []byte
+		valid := false
+		if mightContainResponseModelField(trimmed) {
+			var err error
+			restored, _, valid, err = r.sse.restoreResponseModelCandidate(trimmed)
+			if err != nil {
+				return nil, false, err
+			}
+		} else if json.Valid(trimmed) {
+			restored = bytes.Clone(trimmed)
+			valid = true
 		}
-		if r.frameRawJSONAsSSE {
-			return [][]byte{frameSSEData(restored)}, true, nil
+		if valid {
+			if r.frameRawJSONAsSSE {
+				return [][]byte{frameSSEData(restored)}, true, nil
+			}
+			return [][]byte{restored}, true, nil
 		}
-		return [][]byte{restored}, true, nil
 	}
 	values, ok := splitJSONValues(p)
 	if !ok {
@@ -904,6 +952,41 @@ type hostModelExecutePayload struct {
 	HostCallbackID string `json:"host_callback_id,omitempty"`
 }
 
+func releaseExecutorStreamSetup(req *executorRPCRequest) {
+	if req == nil {
+		return
+	}
+	req.OriginalRequest = nil
+	req.Headers = nil
+	req.Query = nil
+	req.Metadata = nil
+}
+
+func emitRewritten(chunks [][]byte, batch bool, emit func([]byte) error) error {
+	if !batch {
+		for _, chunk := range chunks {
+			if len(chunk) > 0 {
+				if err := emit(chunk); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	total := 0
+	for _, chunk := range chunks {
+		total += len(chunk)
+	}
+	if total == 0 {
+		return nil
+	}
+	batchPayload := make([]byte, 0, total)
+	for _, chunk := range chunks {
+		batchPayload = append(batchPayload, chunk...)
+	}
+	return emit(batchPayload)
+}
+
 func handleExecutorExecuteStream(raw []byte, call hostCaller) ([]byte, error) {
 	var req executorRPCRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
@@ -922,15 +1005,16 @@ func handleExecutorExecuteStream(raw []byte, call hostCaller) ([]byte, error) {
 }
 
 func startExecutorStream(req executorRPCRequest, call hostCaller, closeStream func(string, string) error) ([]byte, error) {
-	go func() {
+	reqCopy := req
+	go func(req *executorRPCRequest) {
 		if err := runStreamForward(req, call); err != nil {
 			_ = closeStream(req.StreamID, err.Error())
 		}
-	}()
+	}(&reqCopy)
 	return json.Marshal(map[string]any{"headers": http.Header{"Content-Type": []string{"text/event-stream"}}})
 }
 
-func runStreamForward(req executorRPCRequest, call hostCaller) error {
+func runStreamForward(req *executorRPCRequest, call hostCaller) error {
 	scope := callerScopeFromMetadata(req.Metadata)
 	cfg := loadedConfig()
 	decision, err := routeModel(cfg, req.SourceFormat, req.Model, scope, callerAPIKeyForSelectedRules(cfg, req.SourceFormat, req.Headers, req.Query, scope))
@@ -957,6 +1041,8 @@ func runStreamForward(req executorRPCRequest, call hostCaller) error {
 		},
 		HostCallbackID: req.HostCallbackID,
 	})
+	releaseExecutorStreamSetup(req)
+	body = nil
 	if err != nil {
 		return fmt.Errorf("execute stream: %w", err)
 	}
@@ -1014,11 +1100,9 @@ func runStreamForward(req executorRPCRequest, call hostCaller) error {
 				_ = closeHost()
 				return fmt.Errorf("flush stream rewriter before error close: %w", flushErr)
 			}
-			for _, out := range flushed {
-				if err := emit(out); err != nil {
-					_ = closeHost()
-					return fmt.Errorf("emit flushed stream chunk before error close: %w", err)
-				}
+			if err := emitRewritten(flushed, rewriter.frameRawJSONAsSSE, emit); err != nil {
+				_ = closeHost()
+				return fmt.Errorf("emit flushed stream chunk before error close: %w", err)
 			}
 			if err := closeHost(); err != nil {
 				return fmt.Errorf("close host stream: %w", err)
@@ -1036,11 +1120,9 @@ func runStreamForward(req executorRPCRequest, call hostCaller) error {
 			_ = closeHost()
 			return fmt.Errorf("rewrite stream chunk: %w", err)
 		}
-		for _, out := range chunks {
-			if err := emit(out); err != nil {
-				_ = closeHost()
-				return fmt.Errorf("emit stream chunk: %w", err)
-			}
+		if err := emitRewritten(chunks, rewriter.frameRawJSONAsSSE, emit); err != nil {
+			_ = closeHost()
+			return fmt.Errorf("emit stream chunk: %w", err)
 		}
 	}
 	flushed, err := rewriter.Flush()
@@ -1048,11 +1130,9 @@ func runStreamForward(req executorRPCRequest, call hostCaller) error {
 		_ = closeHost()
 		return fmt.Errorf("flush stream rewriter: %w", err)
 	}
-	for _, out := range flushed {
-		if err := emit(out); err != nil {
-			_ = closeHost()
-			return fmt.Errorf("emit flushed stream chunk: %w", err)
-		}
+	if err := emitRewritten(flushed, rewriter.frameRawJSONAsSSE, emit); err != nil {
+		_ = closeHost()
+		return fmt.Errorf("emit flushed stream chunk: %w", err)
 	}
 	if err := closeHost(); err != nil {
 		return fmt.Errorf("close host stream: %w", err)
@@ -1238,10 +1318,160 @@ func rewriteTopLevelModel(body []byte, model string) ([]byte, bool, error) {
 	return out, true, nil
 }
 
+func hexNibble(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	default:
+		return 0, false
+	}
+}
+
+func escapedResponseModelKey(raw []byte) bool {
+	if len(raw) < 2 || raw[0] != '"' || raw[len(raw)-1] != '"' {
+		return false
+	}
+	model := "model"
+	modelVersion := "modelVersion"
+	decoded := 0
+	for i := 1; i < len(raw)-1; i++ {
+		c := raw[i]
+		if c == '\\' {
+			i++
+			if i >= len(raw)-1 {
+				return false
+			}
+			switch raw[i] {
+			case '"', '\\', '/':
+				c = raw[i]
+			case 'b':
+				c = '\b'
+			case 'f':
+				c = '\f'
+			case 'n':
+				c = '\n'
+			case 'r':
+				c = '\r'
+			case 't':
+				c = '\t'
+			case 'u':
+				if i+4 >= len(raw) {
+					return false
+				}
+				value := uint16(0)
+				for j := 1; j <= 4; j++ {
+					nibble, ok := hexNibble(raw[i+j])
+					if !ok {
+						return false
+					}
+					value = value<<4 | uint16(nibble)
+				}
+				i += 4
+				if value > 0x7f {
+					return false
+				}
+				c = byte(value)
+			default:
+				return false
+			}
+		}
+		if decoded >= len(modelVersion) {
+			return false
+		}
+		matchesModel := decoded < len(model) && model[decoded] == c
+		matchesVersion := modelVersion[decoded] == c
+		if !matchesModel && !matchesVersion {
+			return false
+		}
+		decoded++
+	}
+	return decoded == len(model) || decoded == len(modelVersion)
+}
+
+type responseModelMarkerScanner struct {
+	tail        [14]byte
+	tailLen     int
+	inString    bool
+	escaped     bool
+	hadEscape   bool
+	afterString bool
+	key         [80]byte
+	keyLen      int
+	keyOverflow bool
+}
+
+func (s *responseModelMarkerScanner) feed(b byte) bool {
+	if s.tailLen < len(s.tail) {
+		s.tail[s.tailLen] = b
+		s.tailLen++
+	} else {
+		copy(s.tail[:], s.tail[1:])
+		s.tail[len(s.tail)-1] = b
+	}
+	tail := s.tail[:s.tailLen]
+	if bytes.HasSuffix(tail, []byte(`"model"`)) || bytes.HasSuffix(tail, []byte(`"modelVersion"`)) {
+		return true
+	}
+
+	if s.afterString {
+		switch b {
+		case ' ', '\t', '\r', '\n':
+			return false
+		case ':':
+			s.afterString = false
+			if !s.hadEscape || s.keyOverflow {
+				return false
+			}
+			return escapedResponseModelKey(s.key[:s.keyLen])
+		default:
+			s.afterString = false
+		}
+	}
+
+	if !s.inString {
+		if b != '"' {
+			return false
+		}
+		s.inString = true
+		s.escaped = false
+		s.hadEscape = false
+		s.keyLen = 0
+		s.keyOverflow = false
+	}
+	if s.keyLen < len(s.key) {
+		s.key[s.keyLen] = b
+		s.keyLen++
+	} else {
+		s.keyOverflow = true
+	}
+	if s.escaped {
+		s.escaped = false
+		return false
+	}
+	if b == '\\' {
+		s.escaped = true
+		s.hadEscape = true
+		return false
+	}
+	if b == '"' && s.keyLen > 1 {
+		s.inString = false
+		s.afterString = true
+	}
+	return false
+}
+
 func mightContainResponseModelField(body []byte) bool {
-	return bytes.Contains(body, []byte(`"model"`)) ||
-		bytes.Contains(body, []byte(`"modelVersion"`)) ||
-		bytes.Contains(body, []byte(`\u`))
+	var scanner responseModelMarkerScanner
+	for _, b := range body {
+		if scanner.feed(b) {
+			return true
+		}
+	}
+	return false
 }
 
 func rewriteResponseModelFields(body []byte, model string) ([]byte, bool, error) {
@@ -1256,30 +1486,35 @@ func rewriteResponseModelFields(body []byte, model string) ([]byte, bool, error)
 }
 
 func rewriteResponseModelFieldsWithReplacement(body []byte, model string, replacement json.RawMessage) ([]byte, bool, error) {
+	out, changed, _, err := rewriteResponseModelFieldsWithReplacementChecked(body, model, replacement)
+	return out, changed, err
+}
+
+func rewriteResponseModelFieldsWithReplacementChecked(body []byte, model string, replacement json.RawMessage) ([]byte, bool, bool, error) {
 	var doc map[string]json.RawMessage
 	if err := json.Unmarshal(body, &doc); err != nil {
-		return bytes.Clone(body), false, nil
+		return bytes.Clone(body), false, false, nil
 	}
 	changed := rewriteRawStringField(doc, "model", model, replacement)
 	changed = rewriteRawStringField(doc, "modelVersion", model, replacement) || changed
 	messageChanged, err := rewriteNestedRawStringFields(doc, "message", model, replacement, "model")
 	if err != nil {
-		return nil, false, err
+		return nil, false, true, err
 	}
 	changed = messageChanged || changed
 	responseChanged, err := rewriteNestedRawStringFields(doc, "response", model, replacement, "model", "modelVersion")
 	if err != nil {
-		return nil, false, err
+		return nil, false, true, err
 	}
 	changed = responseChanged || changed
 	if !changed {
-		return bytes.Clone(body), false, nil
+		return bytes.Clone(body), false, true, nil
 	}
 	out, err := json.Marshal(doc)
 	if err != nil {
-		return nil, false, err
+		return nil, false, true, err
 	}
-	return out, true, nil
+	return out, true, true, nil
 }
 
 func rewriteNestedRawStringFields(doc map[string]json.RawMessage, key, model string, replacement json.RawMessage, fields ...string) (bool, error) {
