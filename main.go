@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"unicode"
@@ -64,29 +65,48 @@ func newStreamChunkRewriter(originalModel string) *streamChunkRewriter {
 }
 
 func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
-	if sseNeedsLineBreak(r.buf, p) {
-		r.buf = append(r.buf, '\n')
-	}
 	r.buf = append(r.buf, p...)
+	return r.drain(false)
+}
+
+func (r *sseRewriter) Flush() ([][]byte, error) {
+	if len(r.buf) == 0 {
+		return nil, nil
+	}
+	return r.drain(true)
+}
+
+func (r *sseRewriter) drain(eof bool) ([][]byte, error) {
 	bufferCap := cap(r.buf)
 	var out [][]byte
 	consumed := false
 	for {
-		delim, n, next := sseEventDelimiter(r.buf, r.scanFrom)
+		delim, n, next := findSSEEventDelimiter(r.buf, r.scanFrom, eof)
 		if n == 0 {
 			r.scanFrom = next
 			break
 		}
 		event := r.buf[:delim]
+		delimiter := r.buf[delim : delim+n : delim+n]
 		r.buf = r.buf[delim+n:]
 		r.scanFrom = 0
 		consumed = true
-		rewritten, err := r.rewriteEvent(event)
+		var err error
+		out, err = r.rewriteEvent(out, event)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, rewritten...)
-		out = append(out, r.delimiterBytes(n))
+		out = append(out, delimiter)
+	}
+	if eof && len(r.buf) > 0 {
+		event := r.buf
+		r.buf = nil
+		r.scanFrom = 0
+		var err error
+		out, err = r.rewriteEvent(out, event)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if consumed {
 		if len(r.buf) == 0 {
@@ -99,36 +119,120 @@ func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
 	return out, nil
 }
 
-func (r *sseRewriter) Flush() ([][]byte, error) {
-	if len(r.buf) == 0 {
-		return nil, nil
+func splitSSELine(event []byte) (line, lineBreak, remaining []byte) {
+	lineEnd, lineBreakLen, _ := sseLineEnding(event, 0, true)
+	if lineBreakLen == 0 {
+		return event, nil, nil
 	}
-	event := r.buf
-	r.buf = nil
-	r.scanFrom = 0
-	return r.rewriteEvent(event)
+	return event[:lineEnd], event[lineEnd : lineEnd+lineBreakLen], event[lineEnd+lineBreakLen:]
 }
 
-func (r *sseRewriter) rewriteEvent(event []byte) ([][]byte, error) {
-	var out [][]byte
+func hasSSEDataField(event []byte) bool {
 	for len(event) > 0 {
-		lineEnd := bytes.IndexByte(event, '\n')
-		line := event
-		lineBreak := []byte(nil)
-		if lineEnd >= 0 {
-			line = event[:lineEnd]
-			lineBreak = []byte("\n")
-			event = event[lineEnd+1:]
-		} else {
-			event = nil
-		}
-		if n := len(line); n > 0 && line[n-1] == '\r' {
-			line = line[:n-1]
-			if len(lineBreak) > 0 {
-				lineBreak = []byte("\r\n")
-			}
-		}
+		line, _, remaining := splitSSELine(event)
+		event = remaining
 		if bytes.HasPrefix(line, []byte("data:")) {
+			return true
+		}
+	}
+	return false
+}
+
+func appendUnchangedSSEEvent(out [][]byte, event []byte) [][]byte {
+	for len(event) > 0 {
+		line, lineBreak, remaining := splitSSELine(event)
+		event = remaining
+		chunk := make([]byte, 0, len(line)+len(lineBreak))
+		chunk = append(chunk, line...)
+		chunk = append(chunk, lineBreak...)
+		out = append(out, chunk)
+	}
+	return out
+}
+
+func (r *sseRewriter) rewriteMultiDataEvent(out [][]byte, event []byte) ([][]byte, error) {
+	joinedLen := 0
+	dataFields := 0
+	nonDataFields := 0
+	for remaining := event; len(remaining) > 0; {
+		line, _, next := splitSSELine(remaining)
+		remaining = next
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			nonDataFields++
+			continue
+		}
+		value := bytes.TrimSpace(line[len("data:"):])
+		if dataFields > 0 {
+			joinedLen++
+		}
+		joinedLen += len(value)
+		dataFields++
+	}
+
+	joined := make([]byte, 0, joinedLen)
+	seenData := 0
+	for remaining := event; len(remaining) > 0; {
+		line, _, next := splitSSELine(remaining)
+		remaining = next
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		if seenData > 0 {
+			joined = append(joined, 10)
+		}
+		joined = append(joined, bytes.TrimSpace(line[len("data:"):])...)
+		seenData++
+	}
+	if !mightContainResponseModelField(joined) {
+		return appendUnchangedSSEEvent(out, event), nil
+	}
+	restored, changed, err := r.restoreResponseModel(joined)
+	if err != nil {
+		return nil, err
+	}
+	if !changed {
+		return appendUnchangedSSEEvent(out, event), nil
+	}
+
+	retainedFields := nonDataFields + 1
+	retained := 0
+	wroteData := false
+	for len(event) > 0 {
+		line, lineBreak, remaining := splitSSELine(event)
+		event = remaining
+		isData := bytes.HasPrefix(line, []byte("data:"))
+		if isData && wroteData {
+			continue
+		}
+		var chunk []byte
+		if isData {
+			wroteData = true
+			chunk = make([]byte, 0, len("data: ")+len(restored)+len(lineBreak))
+			chunk = append(chunk, "data: "...)
+			chunk = append(chunk, restored...)
+		} else {
+			chunk = make([]byte, 0, len(line)+len(lineBreak))
+			chunk = append(chunk, line...)
+		}
+		retained++
+		if retained < retainedFields {
+			chunk = append(chunk, lineBreak...)
+		}
+		out = append(out, chunk)
+	}
+	return out, nil
+}
+
+func (r *sseRewriter) rewriteEvent(out [][]byte, event []byte) ([][]byte, error) {
+	originalEvent := event
+	originalOutLen := len(out)
+	for len(event) > 0 {
+		line, lineBreak, remaining := splitSSELine(event)
+		event = remaining
+		if bytes.HasPrefix(line, []byte("data:")) {
+			if hasSSEDataField(remaining) {
+				return r.rewriteMultiDataEvent(out[:originalOutLen], originalEvent)
+			}
 			value := bytes.TrimSpace(line[len("data:"):])
 			if len(value) == 0 || bytes.Equal(value, []byte("[DONE]")) {
 				out = append(out, append(append([]byte(nil), line...), lineBreak...))
@@ -152,49 +256,58 @@ func (r *sseRewriter) rewriteEvent(event []byte) ([][]byte, error) {
 	return out, nil
 }
 
-func sseEventDelimiter(buf []byte, start int) (eventLen, delimLen, next int) {
+func sseLineEnding(buf []byte, start int, eof bool) (position, length, next int) {
 	start = max(0, min(start, len(buf)))
-	for search := start; search < len(buf); {
-		newline := bytes.IndexByte(buf[search:], '\n')
-		if newline < 0 {
-			break
+	for i := start; i < len(buf); i++ {
+		switch buf[i] {
+		case 10:
+			return i, 1, 0
+		case 13:
+			if i+1 < len(buf) {
+				if buf[i+1] == 10 {
+					return i, 2, 0
+				}
+				return i, 1, 0
+			}
+			if eof {
+				return i, 1, 0
+			}
+			return 0, 0, i
 		}
-		newline += search
-		if newline+1 < len(buf) && buf[newline+1] == '\n' {
-			return newline, 2, 0
-		}
-		if newline > start && newline+2 < len(buf) && buf[newline-1] == '\r' && buf[newline+1] == '\r' && buf[newline+2] == '\n' {
-			return newline - 1, 4, 0
-		}
-		search = newline + 1
 	}
-	return 0, 0, max(0, len(buf)-3)
+	return 0, 0, len(buf)
 }
 
-func (r *sseRewriter) delimiterBytes(n int) []byte {
-	if n == 4 {
-		return []byte("\r\n\r\n")
+func findSSEEventDelimiter(buf []byte, start int, eof bool) (eventLen, delimLen, next int) {
+	start = max(0, min(start, len(buf)))
+	search := start
+	previousPosition := -1
+	previousEnd := -1
+	for {
+		position, length, resume := sseLineEnding(buf, search, eof)
+		if length == 0 {
+			if resume < len(buf) {
+				if previousPosition >= 0 && previousEnd == resume {
+					return 0, 0, previousPosition
+				}
+				return 0, 0, resume
+			}
+			if previousPosition >= 0 && previousEnd == len(buf) {
+				return 0, 0, previousPosition
+			}
+			return 0, 0, len(buf)
+		}
+		if previousPosition >= 0 && previousEnd == position {
+			return previousPosition, position + length - previousPosition, 0
+		}
+		previousPosition = position
+		previousEnd = position + length
+		search = previousEnd
 	}
-	return []byte("\n\n")
 }
 
-func sseNeedsLineBreak(pending, chunk []byte) bool {
-	if len(pending) == 0 || len(chunk) == 0 {
-		return false
-	}
-	if bytes.HasSuffix(pending, []byte("\n")) || bytes.HasSuffix(pending, []byte("\r")) {
-		return false
-	}
-	if chunk[0] == '\n' || chunk[0] == '\r' {
-		return false
-	}
-	trimmed := bytes.TrimLeft(chunk, " \t")
-	for _, prefix := range [][]byte{[]byte("data:"), []byte("event:"), []byte("id:"), []byte("retry:"), []byte(":")} {
-		if bytes.HasPrefix(trimmed, prefix) {
-			return true
-		}
-	}
-	return false
+func sseEventDelimiter(buf []byte, start int) (eventLen, delimLen, next int) {
+	return findSSEEventDelimiter(buf, start, false)
 }
 
 func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
@@ -202,6 +315,14 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 		r.pending = append(r.pending, p...)
 		p = append([]byte(nil), r.pending...)
 		r.pending = nil
+	}
+	if len(r.sse.buf) > 0 {
+		return r.sse.Write(p)
+	}
+	if couldStartJSONValue(p) {
+		if chunks, ok, err := r.tryRawJSONChunks(p); ok || err != nil {
+			return chunks, err
+		}
 	}
 	if isSSEChunk(p) {
 		return r.sse.Write(p)
@@ -214,7 +335,30 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 }
 
 func (r *streamChunkRewriter) rawJSONChunks(p []byte) ([][]byte, error) {
+	chunks, ok, err := r.tryRawJSONChunks(p)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return [][]byte{bytes.Clone(p)}, nil
+	}
+	return chunks, nil
+}
+
+func (r *streamChunkRewriter) tryRawJSONChunks(p []byte) ([][]byte, bool, error) {
 	trimmed := bytes.Trim(p, " \t\r\n")
+	if len(trimmed) > 0 {
+		switch trimmed[0] {
+		case '{':
+			if bytes.IndexByte(trimmed, '}') < 0 {
+				return [][]byte{bytes.Clone(p)}, true, nil
+			}
+		case '[':
+			if bytes.IndexByte(trimmed, ']') < 0 {
+				return [][]byte{bytes.Clone(p)}, true, nil
+			}
+		}
+	}
 	couldBeComplete := len(trimmed) > 0
 	if couldBeComplete {
 		switch trimmed[0] {
@@ -229,25 +373,25 @@ func (r *streamChunkRewriter) rawJSONChunks(p []byte) ([][]byte, error) {
 	if couldBeComplete && json.Valid(trimmed) {
 		restored, _, err := r.sse.restoreResponseModel(trimmed)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if r.frameRawJSONAsSSE {
-			return [][]byte{frameSSEData(restored)}, nil
+			return [][]byte{frameSSEData(restored)}, true, nil
 		}
-		return [][]byte{restored}, nil
+		return [][]byte{restored}, true, nil
 	}
 	values, ok := splitJSONValues(p)
 	if !ok {
-		return [][]byte{bytes.Clone(p)}, nil
+		return nil, false, nil
 	}
 	if len(values) == 0 {
-		return nil, nil
+		return nil, true, nil
 	}
 	out := make([][]byte, 0, len(values))
 	for _, value := range values {
 		restored, _, err := r.sse.restoreResponseModel(value)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if r.frameRawJSONAsSSE {
 			out = append(out, frameSSEData(restored))
@@ -255,7 +399,7 @@ func (r *streamChunkRewriter) rawJSONChunks(p []byte) ([][]byte, error) {
 		}
 		out = append(out, restored)
 	}
-	return out, nil
+	return out, true, nil
 }
 
 func splitJSONValues(p []byte) ([][]byte, bool) {
@@ -306,12 +450,41 @@ func frameSSEData(p []byte) []byte {
 	return out.Bytes()
 }
 
-func isSSEChunk(p []byte) bool {
+func hasSSEFieldPrefix(p []byte) bool {
 	trimmed := bytes.TrimLeft(p, " \t\r\n")
-	if bytes.HasPrefix(trimmed, []byte("data:")) || bytes.HasPrefix(trimmed, []byte("event:")) || bytes.HasPrefix(trimmed, []byte(":")) {
+	lineEnd := len(trimmed)
+	if i := bytes.IndexByte(trimmed, 13); i >= 0 {
+		lineEnd = i
+	}
+	if i := bytes.IndexByte(trimmed[:lineEnd], 10); i >= 0 {
+		lineEnd = i
+	}
+	line := trimmed[:lineEnd]
+	return bytes.IndexByte(line, ':') >= 0 ||
+		bytes.Equal(line, []byte("data")) ||
+		bytes.Equal(line, []byte("event")) ||
+		bytes.Equal(line, []byte("id")) ||
+		bytes.Equal(line, []byte("retry"))
+}
+
+func couldStartJSONValue(p []byte) bool {
+	trimmed := bytes.TrimSpace(p)
+	if len(trimmed) == 0 {
+		return false
+	}
+	switch trimmed[0] {
+	case '{', '[', '"', '-', 't', 'f', 'n':
+		return true
+	default:
+		return trimmed[0] >= '0' && trimmed[0] <= '9'
+	}
+}
+func isSSEChunk(p []byte) bool {
+	if hasSSEFieldPrefix(p) {
 		return true
 	}
-	return bytes.Contains(p, []byte("\n\n")) || bytes.Contains(p, []byte("\r\n\r\n"))
+	_, delimiterLength, _ := findSSEEventDelimiter(p, 0, true)
+	return delimiterLength > 0 || hasSSEDataField(p)
 }
 
 func isIncompleteSSEPrefix(p []byte) bool {
@@ -319,7 +492,7 @@ func isIncompleteSSEPrefix(p []byte) bool {
 	if len(trimmed) == 0 {
 		return false
 	}
-	for _, field := range [][]byte{[]byte("data:"), []byte("event:"), []byte(":")} {
+	for _, field := range [][]byte{[]byte("data:"), []byte("event:"), []byte("id:"), []byte("retry:"), []byte(":")} {
 		if bytes.HasPrefix(field, trimmed) && len(trimmed) < len(field) {
 			return true
 		}
@@ -499,6 +672,22 @@ func selectRules(cfg Config, format string) (string, []rule, bool) {
 	return "", nil, false
 }
 
+func callerAPIKeyForSelectedRules(cfg Config, format string, headers http.Header, query url.Values, scope string) string {
+	_, rules, ok := selectRules(cfg, format)
+	if !ok {
+		return ""
+	}
+	if rules == nil {
+		return callerAPIKey(headers, query, scope)
+	}
+	for i := range rules {
+		if len(rules[i].callerPattern) > 0 {
+			return callerAPIKey(headers, query, scope)
+		}
+	}
+	return ""
+}
+
 type modelRouteRPCRequest struct {
 	SourceFormat   string
 	RequestedModel string
@@ -513,7 +702,8 @@ func handleModelRoute(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	scope := callerScopeFromMetadata(req.Metadata)
-	decision, err := routeModel(loadedConfig(), req.SourceFormat, req.RequestedModel, scope, callerAPIKey(req.Headers, req.Query, scope))
+	cfg := loadedConfig()
+	decision, err := routeModel(cfg, req.SourceFormat, req.RequestedModel, scope, callerAPIKeyForSelectedRules(cfg, req.SourceFormat, req.Headers, req.Query, scope))
 	if err != nil {
 		return nil, err
 	}
@@ -601,7 +791,8 @@ func startExecutorStream(req executorRPCRequest, call hostCaller, closeStream fu
 
 func runStreamForward(req executorRPCRequest, call hostCaller) error {
 	scope := callerScopeFromMetadata(req.Metadata)
-	decision, err := routeModel(loadedConfig(), req.SourceFormat, req.Model, scope, callerAPIKey(req.Headers, req.Query, scope))
+	cfg := loadedConfig()
+	decision, err := routeModel(cfg, req.SourceFormat, req.Model, scope, callerAPIKeyForSelectedRules(cfg, req.SourceFormat, req.Headers, req.Query, scope))
 	if err != nil {
 		return fmt.Errorf("route stream: %w", err)
 	}
@@ -636,6 +827,9 @@ func runStreamForward(req executorRPCRequest, call hostCaller) error {
 		return fmt.Errorf("decode host stream response: %w", err)
 	}
 	if hostResp.StatusCode >= 400 {
+		if hostResp.StreamID != "" {
+			_, _ = call(pluginabi.MethodHostModelStreamClose, pluginapi.HostModelStreamCloseRequest{StreamID: hostResp.StreamID})
+		}
 		return fmt.Errorf("execute stream status %d: %s", hostResp.StatusCode, string(hostResp.Body))
 	}
 	if hostResp.StreamID == "" {
@@ -734,7 +928,8 @@ func handleExecutorExecute(raw []byte, call hostCaller) ([]byte, error) {
 		return nil, err
 	}
 	scope := callerScopeFromMetadata(req.Metadata)
-	decision, err := routeModel(loadedConfig(), req.SourceFormat, req.Model, scope, callerAPIKey(req.Headers, req.Query, scope))
+	cfg := loadedConfig()
+	decision, err := routeModel(cfg, req.SourceFormat, req.Model, scope, callerAPIKeyForSelectedRules(cfg, req.SourceFormat, req.Headers, req.Query, scope))
 	if err != nil {
 		return nil, err
 	}
@@ -925,11 +1120,9 @@ func rewriteTopLevelModel(body []byte, model string) ([]byte, bool, error) {
 }
 
 func mightContainResponseModelField(body []byte) bool {
-	if bytes.IndexByte(body, '\\') >= 0 {
-		return true
-	}
 	return bytes.Contains(body, []byte(`"model"`)) ||
-		bytes.Contains(body, []byte(`"modelVersion"`))
+		bytes.Contains(body, []byte(`"modelVersion"`)) ||
+		bytes.Contains(body, []byte(`\u`))
 }
 
 func rewriteResponseModelFields(body []byte, model string) ([]byte, bool, error) {
@@ -1301,11 +1494,8 @@ func parseReplace(s string, captures int) ([]token, error) {
 		for j < len(s) && s[j] >= '0' && s[j] <= '9' {
 			j++
 		}
-		var n int
-		for k := i + 1; k < j; k++ {
-			n = n*10 + int(s[k]-'0')
-		}
-		if n == 0 || n > captures {
+		n, err := strconv.Atoi(s[i+1 : j])
+		if err != nil || n < 1 || n > captures {
 			return nil, fmt.Errorf("invalid reference")
 		}
 		flush()
