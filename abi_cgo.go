@@ -60,6 +60,22 @@ import (
 	pluginabi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 )
 
+const (
+	maxCIntLength          uint64 = 1<<31 - 1
+	maxPluginResponseBytes uint64 = 1 << 30
+)
+
+func cIntLength(size uint64) (C.int, bool) {
+	if size > maxCIntLength {
+		return 0, false
+	}
+	return C.int(size), true
+}
+
+func pluginResponseLength(size uint64) bool {
+	return size <= maxPluginResponseBytes
+}
+
 //export cliproxy_plugin_init
 func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
 	if host == nil || plugin == nil {
@@ -87,7 +103,11 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 		if response.ptr == nil || response.len == 0 {
 			return nil, nil
 		}
-		return C.GoBytes(response.ptr, C.int(response.len)), nil
+		responseLen, ok := cIntLength(uint64(response.len))
+		if !ok {
+			return nil, fmt.Errorf("host callback response too large: %d bytes", uint64(response.len))
+		}
+		return C.GoBytes(response.ptr, responseLen), nil
 	})
 	C.cliproxy_set_plugin_api(plugin, C.uint32_t(pluginabi.ABIVersion))
 	return 0
@@ -98,18 +118,25 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	if method == nil || response == nil {
 		return 1
 	}
+	response.ptr = nil
+	response.len = 0
+	requestLength, ok := cIntLength(uint64(requestLen))
+	if !ok {
+		return 1
+	}
 	var requestBytes []byte
-	if request != nil && requestLen > 0 {
-		requestBytes = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
+	if request != nil && requestLength > 0 {
+		requestBytes = C.GoBytes(unsafe.Pointer(request), requestLength)
 	}
 	payload, err := handleMethod(C.GoString(method), requestBytes)
 	if err != nil {
 		payload = errorEnvelope("plugin_error", err.Error())
 	}
-	response.ptr = nil
-	response.len = 0
 	if len(payload) == 0 {
 		return 0
+	}
+	if !pluginResponseLength(uint64(len(payload))) {
+		return 1
 	}
 	ptr := C.malloc(C.size_t(len(payload)))
 	if ptr == nil {
