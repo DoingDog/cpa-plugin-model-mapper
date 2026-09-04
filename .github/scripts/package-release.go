@@ -10,10 +10,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
 const pluginName = "model-mapper"
+
+var releaseVersionPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$`)
 
 type artifactSpec struct {
 	osName string
@@ -21,20 +24,29 @@ type artifactSpec struct {
 }
 
 func main() {
-	if err := run(); err != nil {
+	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	versionFlag := flag.String("version", "", "release version")
-	distDir := flag.String("dist", "dist", "artifact directory")
-	outDir := flag.String("out", filepath.Join("dist", "release"), "output directory")
-	libraryPath := flag.String("library", "", "path to one compiled plugin library")
-	archivePath := flag.String("archive", "", "path to one output zip archive")
-	checksumPath := flag.String("checksum", "", "path to one output checksum file")
-	flag.Parse()
+func run(args []string) error {
+	flags := flag.NewFlagSet("package-release", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	versionFlag := flags.String("version", "", "release version")
+	validateOnly := flags.Bool("validate-only", false, "validate the release version and exit")
+	distDir := flags.String("dist", "dist", "artifact directory")
+	outDir := flags.String("out", filepath.Join("dist", "release"), "output directory")
+	libraryPath := flags.String("library", "", "path to one compiled plugin library")
+	archivePath := flags.String("archive", "", "path to one output zip archive")
+	checksumPath := flags.String("checksum", "", "path to one output checksum file")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *validateOnly {
+		_, err := resolveVersion(*versionFlag)
+		return err
+	}
 
 	if *libraryPath != "" || *archivePath != "" || *checksumPath != "" {
 		if *libraryPath == "" || *archivePath == "" || *checksumPath == "" {
@@ -108,20 +120,26 @@ func libraryExtension(osName string) string {
 }
 
 func resolveVersion(versionFlag string) (string, error) {
-	if version := normalizeReleaseVersion(versionFlag); version != "" {
-		return version, nil
+	if strings.TrimSpace(versionFlag) != "" {
+		return parseReleaseVersion(versionFlag)
 	}
-	if version := normalizeReleaseVersion(os.Getenv("VERSION")); version != "" {
-		return version, nil
+	if strings.TrimSpace(os.Getenv("VERSION")) != "" {
+		return parseReleaseVersion(os.Getenv("VERSION"))
 	}
 	cmd := exec.Command("git", "describe", "--tags", "--exact-match")
 	output, err := cmd.Output()
-	if err == nil {
-		if version := normalizeReleaseVersion(string(output)); version != "" {
-			return version, nil
-		}
+	if err == nil && strings.TrimSpace(string(output)) != "" {
+		return parseReleaseVersion(string(output))
 	}
 	return "", fmt.Errorf("version is required: use -version, set VERSION, or run from an exact git tag")
+}
+
+func parseReleaseVersion(raw string) (string, error) {
+	version := normalizeReleaseVersion(raw)
+	if version == "" || !releaseVersionPattern.MatchString(version) {
+		return "", fmt.Errorf("invalid release version %q: expected semantic version", strings.TrimSpace(raw))
+	}
+	return version, nil
 }
 
 func normalizeReleaseVersion(version string) string {

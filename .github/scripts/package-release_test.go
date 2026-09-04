@@ -21,6 +21,48 @@ func TestResolveVersionStripsLeadingV(t *testing.T) {
 	}
 }
 
+func TestResolveVersionValidatesReleaseGrammar(t *testing.T) {
+	for _, tt := range []struct {
+		version string
+		want    string
+		valid   bool
+	}{
+		{version: "1.2.3", want: "1.2.3", valid: true},
+		{version: "v1.2.3", want: "1.2.3", valid: true},
+		{version: "0.0.0-dev", want: "0.0.0-dev", valid: true},
+		{version: "v1.2.3-rc.1", want: "1.2.3-rc.1", valid: true},
+		{version: "1.2.3+build.7", want: "1.2.3+build.7", valid: true},
+		{version: "vbeta"},
+		{version: "beta"},
+		{version: "v1"},
+		{version: "1.2"},
+		{version: "01.2.3"},
+	} {
+		t.Run(tt.version, func(t *testing.T) {
+			got, err := resolveVersion(tt.version)
+			if tt.valid {
+				if err != nil || got != tt.want {
+					t.Fatalf("resolveVersion(%q)=(%q,%v), want (%q,nil)", tt.version, got, err, tt.want)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("resolveVersion(%q)=%q, want error", tt.version, got)
+			}
+		})
+	}
+}
+
+func TestRunValidateOnly(t *testing.T) {
+	t.Setenv("VERSION", "")
+	if err := run([]string{"-validate-only", "-version", "v1.2.3"}); err != nil {
+		t.Fatalf("valid version rejected: %v", err)
+	}
+	if err := run([]string{"-validate-only", "-version", "vbeta"}); err == nil {
+		t.Fatal("invalid version accepted")
+	}
+}
+
 func TestArtifactSpecsCoverFullPlatformMatrix(t *testing.T) {
 	got := map[string]bool{}
 	for _, spec := range artifactSpecs() {
