@@ -159,6 +159,53 @@ func TestDecodeLifecycleConfigPreservesCaseOperations(t *testing.T) {
 	}
 }
 
+func TestDecodeLifecycleConfigRulesStackMode(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		want    string
+		wantErr bool
+	}{
+		{"omitted", "global_rules: old=>target\n", "off", false},
+		{"empty", "rules_stack_mode: \"\"\n", "off", false},
+		{"off", "rules_stack_mode: off\n", "off", false},
+		{"specific first", "rules_stack_mode: specific_first\n", "specific_first", false},
+		{"global first", "rules_stack_mode: global_first\n", "global_first", false},
+		{"uppercase", "rules_stack_mode: OFF\n", "", true},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			rawReq, err := json.Marshal(map[string]string{
+				"config_yaml": base64.StdEncoding.EncodeToString([]byte(tt.raw)),
+			})
+			if err != nil {
+				t.Fatalf("marshal lifecycle: %v", err)
+			}
+			cfgRaw, _, err := decodeLifecycleConfig(rawReq)
+			if err != nil {
+				t.Fatalf("decodeLifecycleConfig error = %v", err)
+			}
+			cfg, err := decodeConfig(cfgRaw)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("decodeConfig error = nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("decodeConfig error = %v", err)
+			}
+			if cfg.RulesStackMode != tt.want {
+				t.Fatalf("rules stack mode = %q, want %q", cfg.RulesStackMode, tt.want)
+			}
+			if !cfg.compiled {
+				t.Fatal("config was not compiled")
+			}
+		})
+	}
+}
+
 func TestDecodeConfigDefaultAndBadRules(t *testing.T) {
 	if _, err := decodeConfig(nil); err != nil {
 		t.Fatalf("decodeConfig nil error = %v", err)
@@ -175,6 +222,46 @@ func TestDecodeConfigDefaultAndBadRules(t *testing.T) {
 	}
 	if _, err := decodeConfig(badOperation); err == nil {
 		t.Fatalf("decodeConfig unknown operation error = nil")
+	}
+}
+
+func TestDecodeConfigRulesStackMode(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		want    string
+		wantErr bool
+	}{
+		{"omitted", `{}`, "off", false},
+		{"empty", `{"rules_stack_mode":""}`, "off", false},
+		{"off", `{"rules_stack_mode":"off"}`, "off", false},
+		{"specific first", `{"rules_stack_mode":"specific_first"}`, "specific_first", false},
+		{"global first", `{"rules_stack_mode":"global_first"}`, "global_first", false},
+		{"unknown", `{"rules_stack_mode":"both"}`, "", true},
+		{"uppercase", `{"rules_stack_mode":"OFF"}`, "", true},
+		{"hyphen", `{"rules_stack_mode":"specific-first"}`, "", true},
+		{"non string", `{"rules_stack_mode":true}`, "", true},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := decodeConfig(json.RawMessage(tt.raw))
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("decodeConfig error = nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("decodeConfig error = %v", err)
+			}
+			if cfg.RulesStackMode != tt.want {
+				t.Fatalf("rules stack mode = %q, want %q", cfg.RulesStackMode, tt.want)
+			}
+			if !cfg.compiled {
+				t.Fatal("config was not compiled")
+			}
+		})
 	}
 }
 
@@ -2089,6 +2176,32 @@ func TestReconfigureClearsCallerPatternCache(t *testing.T) {
 	}
 	if response.Handled {
 		t.Fatalf("route after reconfigure=%s, want unhandled without bound caller", responseRaw)
+	}
+}
+
+func TestReconfigureRulesStackModeIsAtomic(t *testing.T) {
+	t.Cleanup(func() { setLoadedConfigForTest(defaultConfig()) })
+
+	if _, err := handlePluginReconfigure([]byte(`{"enabled":true,"global_rules":"old=>target","rules_stack_mode":"off"}`)); err != nil {
+		t.Fatalf("initial reconfigure: %v", err)
+	}
+	if _, err := handlePluginReconfigure([]byte(`{"enabled":true,"rules_stack_mode":"OFF"}`)); err == nil {
+		t.Fatal("invalid reconfigure error = nil")
+	}
+
+	cfg := loadedConfig()
+	if cfg.RulesStackMode != "off" {
+		t.Fatalf("rules stack mode = %q, want off", cfg.RulesStackMode)
+	}
+	if !cfg.compiled {
+		t.Fatal("published config was not compiled")
+	}
+	decision, err := routeModel(cfg, "openai", "old", "", "")
+	if err != nil {
+		t.Fatalf("route old model: %v", err)
+	}
+	if !decision.Handled || decision.UpstreamModel != "target" {
+		t.Fatalf("decision = %#v, want old=>target", decision)
 	}
 }
 

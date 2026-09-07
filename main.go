@@ -679,12 +679,20 @@ func isIncompleteSSEPrefix(p []byte) bool {
 	return false
 }
 
+const (
+	rulesStackModeOff           = "off"
+	rulesStackModeSpecificFirst = "specific_first"
+	rulesStackModeGlobalFirst   = "global_first"
+)
+
 type Config struct {
 	GlobalRules            string `json:"global_rules"`
 	ClaudeMessagesRules    string `json:"claude_messages_rules"`
 	CodexResponsesRules    string `json:"codex_responses_rules"`
 	OpenAICompletionsRules string `json:"openai_completions_rules"`
+	RulesStackMode         string `json:"rules_stack_mode"`
 
+	compiled               bool
 	globalRules            []rule
 	claudeMessagesRules    []rule
 	codexResponsesRules    []rule
@@ -740,7 +748,7 @@ func pluginRegistration() registration {
 func decodeConfig(raw json.RawMessage) (Config, error) {
 	cfg := defaultConfig()
 	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("{}")) {
-		return cfg, nil
+		return compileConfig(cfg)
 	}
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return Config{}, err
@@ -749,6 +757,15 @@ func decodeConfig(raw json.RawMessage) (Config, error) {
 }
 
 func compileConfig(cfg Config) (Config, error) {
+	if cfg.RulesStackMode == "" {
+		cfg.RulesStackMode = rulesStackModeOff
+	}
+	switch cfg.RulesStackMode {
+	case rulesStackModeOff, rulesStackModeSpecificFirst, rulesStackModeGlobalFirst:
+	default:
+		return Config{}, fmt.Errorf("invalid rules_stack_mode %q", cfg.RulesStackMode)
+	}
+
 	var err error
 	if cfg.globalRules, err = compileRuleSet(cfg.GlobalRules); err != nil {
 		return Config{}, err
@@ -762,6 +779,7 @@ func compileConfig(cfg Config) (Config, error) {
 	if cfg.openAICompletionsRules, err = compileRuleSet(cfg.OpenAICompletionsRules); err != nil {
 		return Config{}, err
 	}
+	cfg.compiled = true
 	return cfg, nil
 }
 
@@ -796,16 +814,21 @@ func loadedConfig() Config {
 	return loadedCfg
 }
 
-func setLoadedConfigForTest(cfg Config) {
-	if compiled, err := compileConfig(cfg); err == nil {
-		cfg = compiled
-	}
+func publishLoadedConfig(cfg Config) {
 	loadedConfigMu.Lock()
 	callerPatternCacheMu.Lock()
 	loadedCfg = cfg
 	callerPatternCache = make(map[callerPatternCacheKey]bool)
 	callerPatternCacheMu.Unlock()
 	loadedConfigMu.Unlock()
+}
+
+func setLoadedConfigForTest(cfg Config) {
+	compiled, err := compileConfig(cfg)
+	if err != nil {
+		panic(err)
+	}
+	publishLoadedConfig(compiled)
 }
 
 func applyLifecycleConfig(raw []byte) error {
@@ -817,7 +840,7 @@ func applyLifecycleConfig(raw []byte) error {
 	if err != nil {
 		return err
 	}
-	setLoadedConfigForTest(cfg)
+	publishLoadedConfig(cfg)
 	return nil
 }
 
@@ -1245,6 +1268,7 @@ type lifecycleYAMLConfig struct {
 	ClaudeMessagesRules    string `yaml:"claude_messages_rules"`
 	CodexResponsesRules    string `yaml:"codex_responses_rules"`
 	OpenAICompletionsRules string `yaml:"openai_completions_rules"`
+	RulesStackMode         string `yaml:"rules_stack_mode"`
 }
 
 func decodeLifecycleConfig(raw []byte) (json.RawMessage, bool, error) {
@@ -1269,6 +1293,7 @@ func decodeLifecycleConfig(raw []byte) (json.RawMessage, bool, error) {
 			ClaudeMessagesRules:    yamlConfig.ClaudeMessagesRules,
 			CodexResponsesRules:    yamlConfig.CodexResponsesRules,
 			OpenAICompletionsRules: yamlConfig.OpenAICompletionsRules,
+			RulesStackMode:         yamlConfig.RulesStackMode,
 		})
 		if err != nil {
 			return nil, true, err
@@ -1640,7 +1665,7 @@ func callerAPIKey(headers http.Header, query url.Values, scope string) string {
 }
 
 func defaultConfig() Config {
-	return Config{}
+	return Config{RulesStackMode: rulesStackModeOff, compiled: true}
 }
 
 func parseRules(raw string) ([]rule, error) {
