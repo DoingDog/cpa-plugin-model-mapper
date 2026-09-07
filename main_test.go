@@ -494,6 +494,95 @@ func BenchmarkSelectedRulesCallerRecovery(b *testing.B) {
 	}
 }
 
+func TestParseRulesSkipsCommentedEntries(t *testing.T) {
+	tests := []struct {
+		raw       string
+		wantRules int
+		model     string
+		want      string
+	}{
+		{raw: `!whole entry`, wantRules: 0},
+		{raw: `a=>b!trailing`, wantRules: 0},
+		{raw: `a!middle=>b`, wantRules: 0},
+		{raw: `a=>b;! ignored ;c=>d`, wantRules: 2},
+		{raw: `\a;nihao!gpt***==>>>;*=>gpt-4`, wantRules: 2},
+		{raw: `! contains whitespace and "quotes" and '$99' and #bad##scope and trailing\`, wantRules: 0},
+		{raw: `first=>second;!bad=>=>rule;second=>third`, wantRules: 2, model: "first", want: "third"},
+		{raw: `a=>b;! ignored \; bad=>=>rule;c=>d`, wantRules: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.raw, func(t *testing.T) {
+			rules, err := parseRules(tt.raw)
+			if err != nil {
+				t.Fatalf("parseRules(%q) error = %v", tt.raw, err)
+			}
+			if len(rules) != tt.wantRules {
+				t.Fatalf("len(rules) = %d, want %d", len(rules), tt.wantRules)
+			}
+			if tt.model == "" {
+				return
+			}
+			got, matched, err := applyRules(tt.model, "", "", rules)
+			if err != nil || !matched || got != tt.want {
+				t.Fatalf("applyRules() = (%q, %v, %v), want (%q, true, nil)", got, matched, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseRulesCommentMarkerBackslashParity(t *testing.T) {
+	tests := []struct {
+		raw       string
+		model     string
+		wantRules int
+		want      string
+	}{
+		{raw: `\!=>active`, model: "!", wantRules: 1, want: "active"},
+		{raw: `\\!`, wantRules: 0},
+		{raw: `\\\!=>active`, model: `\!`, wantRules: 1, want: "active"},
+		{raw: `\\\\!`, wantRules: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.raw, func(t *testing.T) {
+			rules, err := parseRules(tt.raw)
+			if err != nil {
+				t.Fatalf("parseRules(%q) error = %v", tt.raw, err)
+			}
+			if len(rules) != tt.wantRules {
+				t.Fatalf("len(rules) = %d, want %d", len(rules), tt.wantRules)
+			}
+			if tt.model == "" {
+				return
+			}
+			got, matched, err := applyRules(tt.model, "", "", rules)
+			if err != nil || !matched || got != tt.want {
+				t.Fatalf("applyRules() = (%q, %v, %v), want (%q, true, nil)", got, matched, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestApplyRulesEscapedBang(t *testing.T) {
+	tests := []struct {
+		rules string
+		model string
+		key   string
+		want  string
+	}{
+		{`hello\!world=>mapped`, `hello!world`, "", `mapped`},
+		{`hello=>mapped\!model`, `hello`, "", `mapped!model`},
+		{`key\!*#hello=>mapped`, `hello`, `key!value`, `mapped`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.rules, func(t *testing.T) {
+			got, matched, err := applyRules(tt.model, callerScope(tt.key), tt.key, mustParseRules(t, tt.rules))
+			if err != nil || !matched || got != tt.want {
+				t.Fatalf("applyRules() = (%q, %v, %v), want (%q, true, nil)", got, matched, err, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseRulesAcceptsValidRules(t *testing.T) {
 	tests := []string{
 		"a=>b",
@@ -575,7 +664,8 @@ func TestParseRulesRejectsInvalidRules(t *testing.T) {
 		"a-b",
 		"a=>b;",
 		";a=>b",
-		"a=>b;;c=>d",
+		"a=>b;;b=>c",
+		";",
 		"a=>b=>c",
 		`a\=>b`,
 		`a=>b\`,

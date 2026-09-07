@@ -1672,18 +1672,20 @@ func parseRules(raw string) ([]rule, error) {
 	if raw == "" {
 		return nil, fmt.Errorf("empty rules")
 	}
-	for _, r := range raw {
-		if unicode.IsSpace(r) || r == '"' || r == '\'' {
-			return nil, fmt.Errorf("invalid character")
-		}
-	}
-
-	parts, err := splitEscaped(raw, ';')
-	if err != nil || len(parts) == 0 {
-		return nil, fmt.Errorf("invalid rules")
-	}
+	parts := splitRuleEntries(raw)
 	out := make([]rule, 0, len(parts))
 	for _, part := range parts {
+		if hasUnescapedCommentMarker(part) {
+			continue
+		}
+		if part == "" {
+			return nil, fmt.Errorf("invalid rules")
+		}
+		for _, r := range part {
+			if unicode.IsSpace(r) || r == '"' || r == '\'' {
+				return nil, fmt.Errorf("invalid character")
+			}
+		}
 		excludeCaller := strings.HasPrefix(part, "#")
 		if excludeCaller {
 			part = part[1:]
@@ -1743,6 +1745,39 @@ func parseRules(raw string) ([]rule, error) {
 		out = append(out, scopeRule)
 	}
 	return out, nil
+}
+
+func splitRuleEntries(raw string) []string {
+	entries := make([]string, 0, 1+strings.Count(raw, ";"))
+	start := 0
+	backslashes := 0
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == '\\' {
+			backslashes++
+			continue
+		}
+		if raw[i] == ';' && backslashes%2 == 0 {
+			entries = append(entries, raw[start:i])
+			start = i + 1
+		}
+		backslashes = 0
+	}
+	return append(entries, raw[start:])
+}
+
+func hasUnescapedCommentMarker(entry string) bool {
+	backslashes := 0
+	for i := 0; i < len(entry); i++ {
+		if entry[i] == '\\' {
+			backslashes++
+			continue
+		}
+		if entry[i] == '!' && backslashes%2 == 0 {
+			return true
+		}
+		backslashes = 0
+	}
+	return false
 }
 
 func findRuleSeparator(s string) (int, bool) {
@@ -1818,7 +1853,7 @@ func parseFind(s string) ([]token, int, error) {
 			}
 			n := s[i+1]
 			switch n {
-			case '*', ';', '$', '#', '\\':
+			case '*', ';', '$', '#', '!', '\\':
 				lit.WriteByte(n)
 				i++
 			case '=':
@@ -1857,8 +1892,8 @@ func parseReplace(s string, captures int) ([]token, error) {
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if c == '\\' {
-			if i+1 < len(s) && s[i+1] == '#' {
-				lit.WriteByte('#')
+			if i+1 < len(s) && (s[i+1] == '#' || s[i+1] == '!') {
+				lit.WriteByte(s[i+1])
 				i++
 				continue
 			}
