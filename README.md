@@ -19,9 +19,24 @@ plugins:
       claude_messages_rules: ""
       codex_responses_rules: ""
       openai_completions_rules: ""
+      rules_stack_mode: off
 ```
 
-CPA owns `plugins.enabled` and each plugin instance's `enabled` and `priority` fields. `model-mapper` itself exposes only the four rule fields below; when the selected rules field is empty, the request is skipped and CPA behaves normally.
+CPA owns `plugins.enabled` and each plugin instance's `enabled` and `priority` fields. `model-mapper` owns `global_rules`, `claude_messages_rules`, `codex_responses_rules`, `openai_completions_rules`, and `rules_stack_mode`.
+
+The plugin supports the same CPA input and output formats: `openai`, `openai-response`, `claude`, `gemini`, and `interactions`. Its registration includes Logo metadata, so Logo needs no configuration.
+
+`rules_stack_mode` accepts exactly `off`, `specific_first`, and `global_first`:
+
+| Format | `off` | `specific_first` | `global_first` |
+| --- | --- | --- | --- |
+| `claude` | `claude_messages_rules`, then `global_rules` only when the dedicated rules are absent | `claude_messages_rules`, then `global_rules` | `global_rules`, then `claude_messages_rules` |
+| `openai-response` | `codex_responses_rules`, then `global_rules` only when the dedicated rules are absent | `codex_responses_rules`, then `global_rules` | `global_rules`, then `codex_responses_rules` |
+| `openai` | `openai_completions_rules`, then `global_rules` only when the dedicated rules are absent | `openai_completions_rules`, then `global_rules` | `global_rules`, then `openai_completions_rules` |
+| `gemini` | `global_rules` | `global_rules` | `global_rules` |
+| `interactions` | `global_rules` | `global_rules` | `global_rules` |
+
+`gemini` and `interactions` always use only `global_rules`. An empty or comments-only dedicated rules field is absent: `off` falls back to `global_rules`, while either stacking mode runs only the remaining non-empty slice.
 
 ## Rule syntax
 
@@ -31,6 +46,16 @@ Each ruleset is a `;`-separated ordered list of entries. An entry is an unscoped
 entry := body | api-key-pattern#body | #api-key-pattern#body
 body := \a | \A | find=>replace
 ```
+
+An unescaped `!` comments out its entire entry before syntax validation. `\!` is a literal `!`:
+
+```text
+!ignored entry
+active=>mapped;anything!ignored;next=>result
+literal\!bang=>mapped
+```
+
+Comments-only dedicated rules fields are absent and fall back as described in the format matrix. A leading, trailing, or doubled semicolon remains invalid unless the corresponding entry itself contains an unescaped `!`.
 
 `api-key-pattern#body` applies only to authenticated inbound CPA client API keys that match the pattern. `#api-key-pattern#body` applies to authenticated keys that do not match it. These are downstream client keys, not upstream provider credentials. Missing authenticated caller metadata skips both positive and inverse scoped entries, while later entries continue.
 
@@ -47,20 +72,13 @@ Scoped rules require CPA v7.2.145 or a later compatible runtime that publishes a
 - Characters such as `@`, `/`, `[`, `]`, parentheses, dots, hyphens, and underscores are literal and need no escaping.
 - Entries are order-sensitive: the selected ruleset runs left to right exactly once, and later entries see the model produced by earlier entries.
 - Put more specific wildcard rules before broader fallback rules.
-- In `find`, `\` escapes `*`, `;`, `$`, `\`, `#`, or `=>`; escaping `$` is accepted but unnecessary. In `replace`, `\=>` and `\#` are backslash escapes. A literal model-name `#` in `find` or `replace` must be written as `\#`. Literal `\`, `;`, and `$` cannot be written directly in a replacement, but captures can carry them into the output.
+- In `find`, `\` escapes `*`, `;`, `$`, `\`, `#`, `!`, or `=>`; escaping `$` is accepted but unnecessary. In `replace`, `\=>` and `\#` are backslash escapes. A literal model-name `#` in `find` or `replace` must be written as `\#`. Literal `\`, `;`, and `$` cannot be written directly in a replacement, but captures can carry them into the output.
 
 YAML may single-quote the whole rule value. The outer quotes are removed before rule parsing and preserve backslashes; quote characters inside the decoded value remain invalid:
 
 ```yaml
 global_rules: '@cf/zai-org/glm-4.7-flash=>glm-4.7-flash;deepseek-v4-pro[1m]=>deepseek-v4-pro'
 ```
-
-Endpoint-specific rules override `global_rules` and do not stack with it:
-
-- `claude` uses `claude_messages_rules` when non-empty.
-- `openai-response` uses `codex_responses_rules` when non-empty.
-- `openai` uses `openai_completions_rules` when non-empty.
-- Other formats use `global_rules`.
 
 ### Examples
 
@@ -158,6 +176,20 @@ global_rules: '#sk-*#*=>kimi'
 ```
 
 This maps every model to `kimi` only when the authenticated key does not match `sk-*`.
+
+## Rewrite boundaries
+
+Request rewriting changes only a top-level string JSON `model` field. It does not rewrite nested request objects. The plugin removes `Content-Length` only when the rewritten request body changed.
+
+Response restoration changes only these paths:
+
+- `model`
+- `modelVersion`
+- `response.model`
+- `response.modelVersion`
+- `message.model`
+
+Opaque response content and tool text are not recursively rewritten. Before closing the plugin stream after a read error, the plugin flushes pending rewritten bytes.
 
 ## Common use cases
 

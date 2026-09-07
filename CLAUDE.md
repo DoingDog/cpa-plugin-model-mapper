@@ -8,6 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Run vet: `make vet` or `go vet ./...`
 - Run one plugin test: `go test . -run TestName`
 - Run release packager tests: `go test .github/scripts/package-release.go .github/scripts/package-release_test.go`
+- Run local smoke helper tests: `go test .github/scripts/smoke-local.go .github/scripts/smoke-local_test.go`
 - Build Windows amd64 plugin: `make build-windows-amd64`
 - Build Linux amd64 plugin from Windows with Zig: `make build-linux-amd64 LINUX_AMD64_CC="zig cc -target x86_64-linux-gnu"`
 - Build/package one platform: `make package VERSION=0.1.2 GOOS=windows GOARCH=amd64`
@@ -23,20 +24,20 @@ This is a single-package Go `c-shared` CLIProxyAPI native plugin. `abi_cgo.go` i
 
 `main.go` contains the plugin logic:
 
-- `pluginRegistration` advertises `model_router`, `executor`, and `executor.execute_stream` support for `openai`, `claude`, and `openai-response` formats.
-- `decodeLifecycleConfig` and `decodeConfig` load plugin config from CPA lifecycle payloads. Plugin-owned config fields are `global_rules`, `claude_messages_rules`, `codex_responses_rules`, and `openai_completions_rules`; CPA owns global and per-instance `enabled` plus per-instance `priority`.
-- `selectRules` chooses an endpoint-specific ruleset when non-empty; otherwise it falls back to `global_rules`. Endpoint-specific rules do not stack with global rules.
-- `parseRules` / `applyRules` implement an ordered entry DSL: entries have an optional positive authenticated caller pattern (`api-key-pattern#`) or inverse pattern (`#api-key-pattern#`), followed by a `find=>replace` mapping or exact standalone `\a` / `\A` ASCII case operation. In caller patterns, unescaped `*` is a wildcard without captures and `\*` / `\#` are literals. Model `find` wildcards alone create `$1` captures. Entries run left-to-right exactly once.
-- Exact caller scopes compare the metadata-derived `caller_scope` digest. Wildcard caller scopes recover an authenticated Principal only from a raw inbound credential whose digest equals `caller_scope`; client-controlled headers alone are not trusted. If an access provider's Principal differs from every presented credential, wildcard entries skip. Missing or unbound caller identity skips positive and inverse scopes. `handleModelRoute` caches only the boolean result for `caller_scope + pattern`, and executor paths reuse it if request interceptors changed the credential headers before execution. A route is handled only when an entry ran and the final model differs from the original.
+- `pluginRegistration` advertises `model_router`, `executor`, and `executor.execute_stream` support for `openai`, `openai-response`, `claude`, `gemini`, and `interactions`. Logo is registration metadata and has no configuration field.
+- `decodeLifecycleConfig` and `decodeConfig` load plugin config from CPA lifecycle payloads. Plugin-owned config fields are `global_rules`, `claude_messages_rules`, `codex_responses_rules`, `openai_completions_rules`, and `rules_stack_mode`; CPA owns global and per-instance `enabled` plus per-instance `priority`.
+- `selectRules` follows `rules_stack_mode`: `off` selects a non-empty dedicated `claude`, `openai-response`, or `openai` slice, otherwise `global_rules`; `specific_first` selects the dedicated slice then `global_rules`; `global_first` selects `global_rules` then the dedicated slice. Empty or comments-only dedicated slices are absent. `gemini` and `interactions` always select only `global_rules`.
+- `parseRules` / `applyRules` implement an ordered entry DSL: entries have an optional positive authenticated caller pattern (`api-key-pattern#`) or inverse pattern (`#api-key-pattern#`), followed by a `find=>replace` mapping or exact standalone `\a` / `\A` ASCII case operation. An unescaped `!` comments out its complete entry before syntax validation; `\!` is literal, and leading, trailing, or doubled semicolons remain invalid unless their corresponding entry contains an unescaped `!`. In caller patterns, unescaped `*` is a wildcard without captures and `\*` / `\#` are literals. Model `find` wildcards alone create `$1` captures. Entries run left-to-right exactly once.
+- Exact caller scopes compare the metadata-derived `caller_scope` digest. Wildcard caller scopes recover an authenticated Principal only from a raw inbound credential whose digest equals `caller_scope`; client-controlled headers alone are not trusted. Caller credential recovery covers rules in both selected slices. If an access provider's Principal differs from every presented credential, wildcard entries skip. Missing or unbound caller identity skips positive and inverse scopes. `handleModelRoute` caches only the boolean result for `caller_scope + pattern`, and executor paths reuse it if request interceptors changed the credential headers before execution. A route is handled only when an entry ran and the final model differs from the original.
 - `handleExecutorExecute` and `runStreamForward` rewrite the outbound request body to the upstream model, call CPA host execution callbacks, then restore selected response model fields to the client-requested model.
 
 Important model-rewrite invariants:
 
-- Request rewriting intentionally changes only the top-level JSON `model` field.
+- Request rewriting intentionally changes only the top-level JSON `model` field. Delete stale `Content-Length` only when that rewrite changes the request body.
 - Response restoration is deliberately whitelisted to `model`, `modelVersion`, `response.model`, `response.modelVersion`, and `message.model`. Do not replace recursively through arbitrary content/tool text.
 - Case operations change ASCII English letters only and do not make later mappings case-insensitive.
 - Streaming responses pass through `streamChunkRewriter`, which handles complete SSE events, split SSE prefixes, unterminated SSE data at flush time, raw JSON chunks, line/space-delimited JSON values, and raw JSON that must be framed as SSE for Responses SSE clients.
-- On host stream errors, pending rewritten bytes are flushed before closing the plugin stream so clients do not hang waiting for buffered output.
+- On a host stream read error, flush pending rewritten bytes before closing the plugin stream so clients do not hang waiting for buffered output.
 
 ## Release and packaging
 
