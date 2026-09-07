@@ -713,19 +713,26 @@ func pluginRegistration() registration {
 			Version:          pluginVersion,
 			Author:           "DoingDog",
 			GitHubRepository: "https://github.com/DoingDog/cpa-plugin-model-mapper",
+			Logo:             "https://raw.githubusercontent.com/DoingDog/cpa-plugin-model-mapper/refs/heads/main/logo.png",
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "global_rules", Type: pluginapi.ConfigFieldTypeString, Description: "Fallback rules used when an endpoint-specific ruleset is empty."},
 				{Name: "claude_messages_rules", Type: pluginapi.ConfigFieldTypeString, Description: "Rules for Claude Messages-compatible requests."},
 				{Name: "codex_responses_rules", Type: pluginapi.ConfigFieldTypeString, Description: "Rules for OpenAI Responses/Codex-compatible requests."},
 				{Name: "openai_completions_rules", Type: pluginapi.ConfigFieldTypeString, Description: "Rules for OpenAI Completions and Chat Completions requests."},
+				{
+					Name:        "rules_stack_mode",
+					Type:        pluginapi.ConfigFieldTypeEnum,
+					Description: "Controls global and endpoint-specific rule order; default off preserves endpoint-specific override behavior.",
+					EnumValues:  []string{"off", "specific_first", "global_first"},
+				},
 			},
 		},
 		Capabilities: registrationCapabilities{
 			ModelRouter:           true,
 			Executor:              true,
 			ExecutorModelScope:    string(pluginapi.ExecutorModelScopeStatic),
-			ExecutorInputFormats:  []string{"openai", "claude", "openai-response", "gemini"},
-			ExecutorOutputFormats: []string{"openai", "claude", "openai-response"},
+			ExecutorInputFormats:  []string{"openai", "openai-response", "claude", "gemini", "interactions"},
+			ExecutorOutputFormats: []string{"openai", "openai-response", "claude", "gemini", "interactions"},
 		},
 	}
 }

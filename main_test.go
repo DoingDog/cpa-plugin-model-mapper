@@ -19,38 +19,44 @@ import (
 )
 
 func TestPluginRegistrationMetadataAndConfigFields(t *testing.T) {
-	reg := pluginRegistration()
-	if reg.SchemaVersion != pluginabi.SchemaVersion {
-		t.Fatalf("schema version=%d, want %d", reg.SchemaVersion, pluginabi.SchemaVersion)
+	got := pluginRegistration()
+	if got.SchemaVersion != pluginabi.SchemaVersion {
+		t.Fatalf("schema version=%d, want %d", got.SchemaVersion, pluginabi.SchemaVersion)
 	}
-	if reg.Metadata.Name != "model-mapper" {
-		t.Fatalf("plugin name=%q", reg.Metadata.Name)
+	if got.Metadata.Name != "model-mapper" {
+		t.Fatalf("plugin name=%q", got.Metadata.Name)
 	}
-	if reg.Metadata.Version != pluginVersion || reg.Metadata.Author == "" || reg.Metadata.GitHubRepository == "" {
-		t.Fatalf("metadata missing CPA-required management fields: %#v", reg.Metadata)
+	if got.Metadata.Version != pluginVersion || got.Metadata.Author == "" || got.Metadata.GitHubRepository == "" {
+		t.Fatalf("metadata missing CPA-required management fields: %#v", got.Metadata)
 	}
-	if !reg.Capabilities.ModelRouter || !reg.Capabilities.Executor {
-		t.Fatalf("capabilities=%#v, want model router and executor", reg.Capabilities)
+	if !got.Capabilities.ModelRouter || !got.Capabilities.Executor {
+		t.Fatalf("capabilities=%#v, want model router and executor", got.Capabilities)
 	}
-	if reg.Capabilities.ExecutorModelScope != string(pluginapi.ExecutorModelScopeStatic) {
-		t.Fatalf("executor scope=%q", reg.Capabilities.ExecutorModelScope)
+	if got.Capabilities.ExecutorModelScope != string(pluginapi.ExecutorModelScopeStatic) {
+		t.Fatalf("executor scope=%q", got.Capabilities.ExecutorModelScope)
 	}
-	if !reflect.DeepEqual(reg.Capabilities.ExecutorInputFormats, []string{"openai", "claude", "openai-response", "gemini"}) {
-		t.Fatalf("executor input formats=%v", reg.Capabilities.ExecutorInputFormats)
+	wantFormats := []string{"openai", "openai-response", "claude", "gemini", "interactions"}
+	if !reflect.DeepEqual(got.Capabilities.ExecutorInputFormats, wantFormats) {
+		t.Fatalf("input formats = %v, want %v", got.Capabilities.ExecutorInputFormats, wantFormats)
 	}
-	if !reflect.DeepEqual(reg.Capabilities.ExecutorOutputFormats, []string{"openai", "claude", "openai-response"}) {
-		t.Fatalf("executor output formats=%v", reg.Capabilities.ExecutorOutputFormats)
+	if !reflect.DeepEqual(got.Capabilities.ExecutorOutputFormats, wantFormats) {
+		t.Fatalf("output formats = %v, want %v", got.Capabilities.ExecutorOutputFormats, wantFormats)
 	}
-	wantFields := []string{"global_rules", "claude_messages_rules", "codex_responses_rules", "openai_completions_rules"}
-	got := make([]string, 0, len(reg.Metadata.ConfigFields))
-	for _, field := range reg.Metadata.ConfigFields {
-		got = append(got, field.Name)
-		if field.Description == "" {
-			t.Fatalf("config field %q has empty description", field.Name)
-		}
+	if got.Metadata.Logo != "https://raw.githubusercontent.com/DoingDog/cpa-plugin-model-mapper/refs/heads/main/logo.png" {
+		t.Fatalf("logo = %q", got.Metadata.Logo)
 	}
-	if !reflect.DeepEqual(got, wantFields) {
-		t.Fatalf("config fields=%v, want %v", got, wantFields)
+	if len(got.Metadata.ConfigFields) != 5 {
+		t.Fatalf("config fields = %d, want 5", len(got.Metadata.ConfigFields))
+	}
+	field := got.Metadata.ConfigFields[4]
+	if field.Name != "rules_stack_mode" || field.Type != pluginapi.ConfigFieldTypeEnum {
+		t.Fatalf("stack field = %#v", field)
+	}
+	if !reflect.DeepEqual(field.EnumValues, []string{"off", "specific_first", "global_first"}) {
+		t.Fatalf("enum values = %v", field.EnumValues)
+	}
+	if !strings.Contains(field.Description, "off") || !strings.Contains(strings.ToLower(field.Description), "default") {
+		t.Fatalf("description = %q", field.Description)
 	}
 }
 
