@@ -2337,6 +2337,70 @@ func TestHandleExecutorExecuteForwardsMappedRequestAndRestoresResponse(t *testin
 	}
 }
 
+func TestHandleExecutorExecuteAllFormats(t *testing.T) {
+	const (
+		requestWithModel = `{"model":"client-model","nested":{"model":"client-model","content":"client-model in nested content"},"content":[{"text":"client-model in content"}],"tools":[{"arguments":"client-model in tool arguments"}]}`
+		rewrittenRequest = `{"content":[{"text":"client-model in content"}],"model":"upstream-model","nested":{"model":"client-model","content":"client-model in nested content"},"tools":[{"arguments":"client-model in tool arguments"}]}`
+		geminiRequest    = `{"contents":[{"parts":[{"text":"client-model in content"}]}],"generationConfig":{"toolConfig":{"arguments":"client-model in tool arguments"}},"nested":{"model":"client-model"}}`
+		upstreamResponse = `{"model":"upstream-model","modelVersion":"upstream-model","message":{"model":"upstream-model","content":"upstream-model in message content"},"response":{"model":"upstream-model","modelVersion":"upstream-model","content":"upstream-model in response content","tool":{"arguments":"upstream-model in response tool"}},"nested":{"model":"upstream-model","content":"upstream-model in nested content","tool":{"arguments":"upstream-model in nested tool"}},"content":[{"text":"upstream-model in content"}],"tools":[{"arguments":"upstream-model in tool arguments"}]}`
+		restoredResponse = `{"content":[{"text":"upstream-model in content"}],"message":{"content":"upstream-model in message content","model":"client-model"},"model":"client-model","modelVersion":"client-model","nested":{"model":"upstream-model","content":"upstream-model in nested content","tool":{"arguments":"upstream-model in nested tool"}},"response":{"content":"upstream-model in response content","model":"client-model","modelVersion":"client-model","tool":{"arguments":"upstream-model in response tool"}},"tools":[{"arguments":"upstream-model in tool arguments"}]}`
+	)
+	formats := []string{"openai", "openai-response", "claude", "gemini", "interactions"}
+	requests := map[string]struct {
+		body []byte
+		want []byte
+	}{
+		"openai":          {body: []byte(requestWithModel), want: []byte(rewrittenRequest)},
+		"openai-response": {body: []byte(requestWithModel), want: []byte(rewrittenRequest)},
+		"claude":          {body: []byte(requestWithModel), want: []byte(rewrittenRequest)},
+		"gemini":          {body: []byte(geminiRequest), want: []byte(geminiRequest)},
+		"interactions":    {body: []byte(requestWithModel), want: []byte(rewrittenRequest)},
+	}
+	setLoadedConfigForTest(Config{GlobalRules: "client-model=>upstream-model"})
+
+	for _, format := range formats {
+		t.Run(format, func(t *testing.T) {
+			request := requests[format]
+			rawReq, err := json.Marshal(rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+				Model:           "client-model",
+				Format:          format,
+				SourceFormat:    format,
+				OriginalRequest: request.body,
+			}})
+			if err != nil {
+				t.Fatalf("marshal request: %v", err)
+			}
+
+			respRaw, err := handleExecutorExecute(rawReq, func(method string, payload any) (json.RawMessage, error) {
+				if method != pluginabi.MethodHostModelExecute {
+					t.Fatalf("method=%q, want %q", method, pluginabi.MethodHostModelExecute)
+				}
+				hostReq, ok := payload.(hostModelExecutePayload)
+				if !ok {
+					t.Fatalf("payload type=%T, want hostModelExecutePayload", payload)
+				}
+				if hostReq.EntryProtocol != format || hostReq.ExitProtocol != format || hostReq.Model != "upstream-model" {
+					t.Fatalf("forwarded request=(EntryProtocol=%q, ExitProtocol=%q, Model=%q), want format=%q and upstream-model", hostReq.EntryProtocol, hostReq.ExitProtocol, hostReq.Model, format)
+				}
+				if !bytes.Equal(hostReq.Body, request.want) {
+					t.Fatalf("forwarded body=%s, want %s", hostReq.Body, request.want)
+				}
+				return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: http.StatusOK, Body: []byte(upstreamResponse)})
+			})
+			if err != nil {
+				t.Fatalf("handleExecutorExecute error = %v", err)
+			}
+			var response pluginapi.ExecutorResponse
+			if err := json.Unmarshal(respRaw, &response); err != nil {
+				t.Fatalf("decode executor response: %v", err)
+			}
+			if !bytes.Equal(response.Payload, []byte(restoredResponse)) {
+				t.Fatalf("response payload=%s, want %s", response.Payload, restoredResponse)
+			}
+		})
+	}
+}
+
 func TestHandleExecutorExecuteIgnoresUnusedPayload(t *testing.T) {
 	setLoadedConfigForTest(Config{GlobalRules: "a=>b"})
 	rawReq, err := json.Marshal(map[string]any{
@@ -2874,6 +2938,60 @@ func TestHandleExecutorExecuteStreamStartsForwarderAndRestoresChunks(t *testing.
 	}
 	if !closedHost || !closedPlugin {
 		t.Fatalf("closedHost=%v closedPlugin=%v", closedHost, closedPlugin)
+	}
+}
+
+func TestHandleExecutorExecuteStreamAllFormats(t *testing.T) {
+	const (
+		requestWithModel = `{"model":"client-model","nested":{"model":"client-model","content":"client-model in nested content"},"content":[{"text":"client-model in content"}],"tools":[{"arguments":"client-model in tool arguments"}]}`
+		rewrittenRequest = `{"content":[{"text":"client-model in content"}],"model":"upstream-model","nested":{"model":"client-model","content":"client-model in nested content"},"tools":[{"arguments":"client-model in tool arguments"}]}`
+		geminiRequest    = `{"contents":[{"parts":[{"text":"client-model in content"}]}],"generationConfig":{"toolConfig":{"arguments":"client-model in tool arguments"}},"nested":{"model":"client-model"}}`
+		upstreamResponse = `{"model":"upstream-model","modelVersion":"upstream-model","message":{"model":"upstream-model","content":"upstream-model in message content"},"response":{"model":"upstream-model","modelVersion":"upstream-model","content":"upstream-model in response content","tool":{"arguments":"upstream-model in response tool"}},"nested":{"model":"upstream-model","content":"upstream-model in nested content","tool":{"arguments":"upstream-model in nested tool"}},"content":[{"text":"upstream-model in content"}],"tools":[{"arguments":"upstream-model in tool arguments"}]}`
+		restoredResponse = `{"content":[{"text":"upstream-model in content"}],"message":{"content":"upstream-model in message content","model":"client-model"},"model":"client-model","modelVersion":"client-model","nested":{"model":"upstream-model","content":"upstream-model in nested content","tool":{"arguments":"upstream-model in nested tool"}},"response":{"content":"upstream-model in response content","model":"client-model","modelVersion":"client-model","tool":{"arguments":"upstream-model in response tool"}},"tools":[{"arguments":"upstream-model in tool arguments"}]}`
+	)
+	formats := []string{"openai", "openai-response", "claude", "gemini", "interactions"}
+	requests := map[string]struct {
+		body []byte
+		want []byte
+	}{
+		"openai":          {body: []byte(requestWithModel), want: []byte(rewrittenRequest)},
+		"openai-response": {body: []byte(requestWithModel), want: []byte(rewrittenRequest)},
+		"claude":          {body: []byte(requestWithModel), want: []byte(rewrittenRequest)},
+		"gemini":          {body: []byte(geminiRequest), want: []byte(geminiRequest)},
+		"interactions":    {body: []byte(requestWithModel), want: []byte(rewrittenRequest)},
+	}
+	setLoadedConfigForTest(Config{GlobalRules: "client-model=>upstream-model"})
+
+	for _, format := range formats {
+		t.Run(format, func(t *testing.T) {
+			request := requests[format]
+			var forwarded pluginapi.HostModelExecutionRequest
+			emitted, _, _, _, err := runExecutorStreamTestWithHostContentTypeAndForwarded(rpcExecutorRequest{
+				ExecutorRequest: pluginapi.ExecutorRequest{
+					Model:           "client-model",
+					Format:          format,
+					SourceFormat:    format,
+					Stream:          true,
+					OriginalRequest: request.body,
+				},
+				StreamID: "plugin-stream-all-formats-" + format,
+			}, []pluginapi.HostModelStreamReadResponse{
+				{Payload: []byte(upstreamResponse)},
+				{Done: true},
+			}, "application/json", &forwarded)
+			if err != nil {
+				t.Fatalf("handleExecutorExecuteStream error = %v", err)
+			}
+			if forwarded.EntryProtocol != format || forwarded.ExitProtocol != format || forwarded.Model != "upstream-model" {
+				t.Fatalf("forwarded request=(EntryProtocol=%q, ExitProtocol=%q, Model=%q), want format=%q and upstream-model", forwarded.EntryProtocol, forwarded.ExitProtocol, forwarded.Model, format)
+			}
+			if !bytes.Equal(forwarded.Body, request.want) {
+				t.Fatalf("forwarded body=%s, want %s", forwarded.Body, request.want)
+			}
+			if got := strings.Join(emitted, ""); got != restoredResponse {
+				t.Fatalf("emitted=%s, want %s", got, restoredResponse)
+			}
+		})
 	}
 }
 
