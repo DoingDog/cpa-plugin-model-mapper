@@ -222,6 +222,7 @@ func TestDecodeLifecycleConfigRulesStackMode(t *testing.T) {
 		{"off", "rules_stack_mode: off\n", "off", false},
 		{"specific first", "rules_stack_mode: specific_first\n", "specific_first", false},
 		{"global first", "rules_stack_mode: global_first\n", "global_first", false},
+		{"null", "rules_stack_mode: null\n", "", true},
 		{"uppercase", "rules_stack_mode: OFF\n", "", true},
 	}
 
@@ -234,16 +235,19 @@ func TestDecodeLifecycleConfigRulesStackMode(t *testing.T) {
 				t.Fatalf("marshal lifecycle: %v", err)
 			}
 			cfgRaw, _, err := decodeLifecycleConfig(rawReq)
+			if tt.wantErr {
+				if err == nil {
+					_, err = decodeConfig(cfgRaw)
+				}
+				if err == nil {
+					t.Fatal("null or invalid mode error = nil")
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("decodeLifecycleConfig error = %v", err)
 			}
 			cfg, err := decodeConfig(cfgRaw)
-			if tt.wantErr {
-				if err == nil {
-					t.Fatal("decodeConfig error = nil")
-				}
-				return
-			}
 			if err != nil {
 				t.Fatalf("decodeConfig error = %v", err)
 			}
@@ -288,6 +292,7 @@ func TestDecodeConfigRulesStackMode(t *testing.T) {
 		{"off", `{"rules_stack_mode":"off"}`, "off", false},
 		{"specific first", `{"rules_stack_mode":"specific_first"}`, "specific_first", false},
 		{"global first", `{"rules_stack_mode":"global_first"}`, "global_first", false},
+		{"null", `{"rules_stack_mode":null}`, "", true},
 		{"unknown", `{"rules_stack_mode":"both"}`, "", true},
 		{"uppercase", `{"rules_stack_mode":"OFF"}`, "", true},
 		{"hyphen", `{"rules_stack_mode":"specific-first"}`, "", true},
@@ -2860,11 +2865,31 @@ func TestReconfigureClearsCallerPatternCache(t *testing.T) {
 func TestReconfigureRulesStackModeIsAtomic(t *testing.T) {
 	t.Cleanup(func() { setLoadedConfigForTest(defaultConfig()) })
 
-	if _, err := handlePluginReconfigure([]byte(`{"enabled":true,"global_rules":"old=>target","rules_stack_mode":"off"}`)); err != nil {
+	const apiKey = "sk-kimi-team"
+	metadata := map[string]any{"caller_scope": callerScope(apiKey)}
+	if _, err := handlePluginReconfigure([]byte(`{"enabled":true,"global_rules":"sk-kimi-*#old=>target","rules_stack_mode":"off"}`)); err != nil {
 		t.Fatalf("initial reconfigure: %v", err)
 	}
-	if _, err := handlePluginReconfigure([]byte(`{"enabled":true,"rules_stack_mode":"OFF"}`)); err == nil {
-		t.Fatal("invalid reconfigure error = nil")
+	routeRaw, err := json.Marshal(pluginapi.ModelRouteRequest{
+		SourceFormat:   "openai",
+		RequestedModel: "old",
+		Metadata:       metadata,
+		Headers:        http.Header{"Authorization": {"Bearer " + apiKey}},
+	})
+	if err != nil {
+		t.Fatalf("marshal warm route: %v", err)
+	}
+	responseRaw, err := handleModelRoute(routeRaw)
+	if err != nil {
+		t.Fatalf("warm route: %v", err)
+	}
+	var response pluginapi.ModelRouteResponse
+	if err := json.Unmarshal(responseRaw, &response); err != nil || !response.Handled {
+		t.Fatalf("warm route response=%s err=%v, want handled", responseRaw, err)
+	}
+
+	if _, err := handlePluginReconfigure([]byte(`{"enabled":true,"rules_stack_mode":null}`)); err == nil {
+		t.Fatal("null reconfigure error = nil")
 	}
 
 	cfg := loadedConfig()
@@ -2874,12 +2899,28 @@ func TestReconfigureRulesStackModeIsAtomic(t *testing.T) {
 	if !cfg.compiled {
 		t.Fatal("published config was not compiled")
 	}
-	decision, err := routeModel(cfg, "openai", "old", "", "")
+	decision, err := routeModel(cfg, "openai", "old", callerScope(apiKey), apiKey)
 	if err != nil {
 		t.Fatalf("route old model: %v", err)
 	}
 	if !decision.Handled || decision.UpstreamModel != "target" {
 		t.Fatalf("decision = %#v, want old=>target", decision)
+	}
+
+	routeRaw, err = json.Marshal(pluginapi.ModelRouteRequest{
+		SourceFormat:   "openai",
+		RequestedModel: "old",
+		Metadata:       metadata,
+	})
+	if err != nil {
+		t.Fatalf("marshal cached route: %v", err)
+	}
+	responseRaw, err = handleModelRoute(routeRaw)
+	if err != nil {
+		t.Fatalf("cached route: %v", err)
+	}
+	if err := json.Unmarshal(responseRaw, &response); err != nil || !response.Handled {
+		t.Fatalf("cached route response=%s err=%v, want handled", responseRaw, err)
 	}
 }
 

@@ -750,6 +750,16 @@ func decodeConfig(raw json.RawMessage) (Config, error) {
 	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("{}")) {
 		return compileConfig(cfg)
 	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return Config{}, err
+	}
+	if mode, ok := fields["rules_stack_mode"]; ok {
+		mode = bytes.TrimSpace(mode)
+		if len(mode) == 0 || mode[0] != '"' {
+			return Config{}, fmt.Errorf("rules_stack_mode must be a string")
+		}
+	}
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return Config{}, err
 	}
@@ -1302,11 +1312,11 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 }
 
 type lifecycleYAMLConfig struct {
-	GlobalRules            string `yaml:"global_rules"`
-	ClaudeMessagesRules    string `yaml:"claude_messages_rules"`
-	CodexResponsesRules    string `yaml:"codex_responses_rules"`
-	OpenAICompletionsRules string `yaml:"openai_completions_rules"`
-	RulesStackMode         string `yaml:"rules_stack_mode"`
+	GlobalRules            string    `yaml:"global_rules"`
+	ClaudeMessagesRules    string    `yaml:"claude_messages_rules"`
+	CodexResponsesRules    string    `yaml:"codex_responses_rules"`
+	OpenAICompletionsRules string    `yaml:"openai_completions_rules"`
+	RulesStackMode         yaml.Node `yaml:"rules_stack_mode"`
 }
 
 func decodeLifecycleConfig(raw []byte) (json.RawMessage, bool, error) {
@@ -1326,12 +1336,19 @@ func decodeLifecycleConfig(raw []byte) (json.RawMessage, bool, error) {
 		if err := yaml.Unmarshal(decoded, &yamlConfig); err != nil {
 			return nil, true, err
 		}
+		rulesStackMode := ""
+		if node := yamlConfig.RulesStackMode; node.Kind != 0 {
+			if node.Kind != yaml.ScalarNode || node.Tag != "!!str" {
+				return nil, true, fmt.Errorf("rules_stack_mode must be a string")
+			}
+			rulesStackMode = node.Value
+		}
 		cfgRaw, err := json.Marshal(Config{
 			GlobalRules:            yamlConfig.GlobalRules,
 			ClaudeMessagesRules:    yamlConfig.ClaudeMessagesRules,
 			CodexResponsesRules:    yamlConfig.CodexResponsesRules,
 			OpenAICompletionsRules: yamlConfig.OpenAICompletionsRules,
-			RulesStackMode:         yamlConfig.RulesStackMode,
+			RulesStackMode:         rulesStackMode,
 		})
 		if err != nil {
 			return nil, true, err
