@@ -1966,6 +1966,19 @@ func parseReplace(s string, captures int) ([]token, error) {
 }
 
 func applyASCIIModelCase(model string, operation caseOperation) string {
+	needsChange := false
+	for i := 0; i < len(model); i++ {
+		c := model[i]
+		if operation == caseOperationLower && c >= 'A' && c <= 'Z' ||
+			operation == caseOperationUpper && c >= 'a' && c <= 'z' {
+			needsChange = true
+			break
+		}
+	}
+	if !needsChange {
+		return model
+	}
+
 	converted := []byte(model)
 	for i, c := range converted {
 		switch operation {

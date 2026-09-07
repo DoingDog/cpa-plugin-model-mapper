@@ -19,6 +19,8 @@ import (
 	pluginapi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
+var applyASCIIModelCaseSink string
+
 func TestPluginRegistrationMetadataAndConfigFields(t *testing.T) {
 	got := pluginRegistration()
 	if got.SchemaVersion != pluginabi.SchemaVersion {
@@ -107,6 +109,54 @@ func TestHandlePluginRegisterLoadsConfigYAML(t *testing.T) {
 	}
 	if !response.Handled {
 		t.Fatalf("route response=%s, want handled after initial register", responseRaw)
+	}
+}
+
+func TestApplyLifecycleConfigPublishesCompiledSnapshot(t *testing.T) {
+	t.Cleanup(func() { setLoadedConfigForTest(defaultConfig()) })
+
+	rawYAML := []byte("enabled: true\nglobal_rules: source=>target\n")
+	raw, err := json.Marshal(map[string]string{"config_yaml": base64.StdEncoding.EncodeToString(rawYAML)})
+	if err != nil {
+		t.Fatalf("marshal lifecycle config: %v", err)
+	}
+	if err := applyLifecycleConfig(raw); err != nil {
+		t.Fatalf("applyLifecycleConfig: %v", err)
+	}
+
+	cfg := loadedConfig()
+	if !cfg.compiled {
+		t.Fatal("published config was not compiled")
+	}
+	decision, err := routeModel(cfg, "openai", "source", "", "")
+	if err != nil {
+		t.Fatalf("route compiled config: %v", err)
+	}
+	if !decision.Handled || decision.UpstreamModel != "target" {
+		t.Fatalf("decision=%#v, want source=>target", decision)
+	}
+}
+
+func BenchmarkApplyLifecycleConfig(b *testing.B) {
+	var rules strings.Builder
+	for i := 0; i < 64; i++ {
+		if i > 0 {
+			rules.WriteByte(';')
+		}
+		fmt.Fprintf(&rules, "source-%d=>target-%d", i, i)
+	}
+	rawYAML := []byte("enabled: true\nglobal_rules: " + rules.String() + "\n")
+	raw, err := json.Marshal(map[string]string{"config_yaml": base64.StdEncoding.EncodeToString(rawYAML)})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { setLoadedConfigForTest(defaultConfig()) })
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := applyLifecycleConfig(raw); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -861,6 +911,68 @@ func TestApplyRulesCharacterSemantics(t *testing.T) {
 				t.Fatalf("mapped=%q matched=%v, want %q %v", mapped, matched, tt.want, tt.wantMatched)
 			}
 		})
+	}
+}
+
+func TestApplyASCIIModelCaseNoOpAllocations(t *testing.T) {
+	tests := []struct {
+		model string
+		op    caseOperation
+	}{
+		{"already-lower-123", caseOperationLower},
+		{"ALREADY-UPPER-123", caseOperationUpper},
+		{"模型-123", caseOperationLower},
+	}
+	for _, tt := range tests {
+		if got := testing.AllocsPerRun(1000, func() {
+			applyASCIIModelCaseSink = applyASCIIModelCase(tt.model, tt.op)
+		}); got != 0 {
+			t.Fatalf("allocations = %v, want 0", got)
+		}
+	}
+}
+
+func BenchmarkApplyASCIIModelCaseAlreadyLower(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		got := applyASCIIModelCase("already-lower-123", caseOperationLower)
+		if got != "already-lower-123" {
+			b.Fatalf("applyASCIIModelCase=%q", got)
+		}
+		applyASCIIModelCaseSink = got
+	}
+}
+
+func BenchmarkApplyASCIIModelCaseAlreadyUpper(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		got := applyASCIIModelCase("ALREADY-UPPER-123", caseOperationUpper)
+		if got != "ALREADY-UPPER-123" {
+			b.Fatalf("applyASCIIModelCase=%q", got)
+		}
+		applyASCIIModelCaseSink = got
+	}
+}
+
+func BenchmarkApplyASCIIModelCaseLowerChanged(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		got := applyASCIIModelCase("MODEL-123", caseOperationLower)
+		if got != "model-123" {
+			b.Fatalf("applyASCIIModelCase=%q", got)
+		}
+		applyASCIIModelCaseSink = got
+	}
+}
+
+func BenchmarkApplyASCIIModelCaseUpperChanged(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		got := applyASCIIModelCase("model-123", caseOperationUpper)
+		if got != "MODEL-123" {
+			b.Fatalf("applyASCIIModelCase=%q", got)
+		}
+		applyASCIIModelCaseSink = got
 	}
 }
 
@@ -1687,6 +1799,58 @@ func BenchmarkRestoreResponseWithoutModel(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		if _, _, err := restoreResponseModel(body, "client"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkSSEMarkerGuardRestore(b *testing.B) {
+	event := []byte("data: {\"model\":\"upstream\",\"id\":\"r1\"}\n\n")
+	line, _, _ := splitSSELine(event)
+	value := sseFieldValue(line)
+	want := []byte(`{"id":"r1","model":"client"}`)
+	r := newSSERewriter("client")
+	if !mightContainResponseModelField(value) {
+		b.Fatal("model marker missing")
+	}
+	got, changed, err := r.restoreResponseModel(value)
+	if err != nil || !changed || !bytes.Equal(got, want) {
+		b.Fatalf("restore=(%s,%v,%v), want %s", got, changed, err, want)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !mightContainResponseModelField(value) {
+			b.Fatal("model marker missing")
+		}
+		if _, _, err := r.restoreResponseModel(value); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkSSEMarkerGuardCandidate(b *testing.B) {
+	event := []byte("data: {\"model\":\"upstream\",\"id\":\"r1\"}\n\n")
+	line, _, _ := splitSSELine(event)
+	value := sseFieldValue(line)
+	want := []byte(`{"id":"r1","model":"client"}`)
+	r := newSSERewriter("client")
+	if !mightContainResponseModelField(value) {
+		b.Fatal("model marker missing")
+	}
+	got, changed, valid, err := r.restoreResponseModelCandidate(value)
+	if err != nil || !changed || !valid || !bytes.Equal(got, want) {
+		b.Fatalf("restore=(%s,%v,%v,%v), want %s", got, changed, valid, err, want)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !mightContainResponseModelField(value) {
+			b.Fatal("model marker missing")
+		}
+		if _, _, _, err := r.restoreResponseModelCandidate(value); err != nil {
 			b.Fatal(err)
 		}
 	}
