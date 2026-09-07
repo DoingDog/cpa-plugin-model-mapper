@@ -2337,6 +2337,89 @@ func TestHandleExecutorExecuteForwardsMappedRequestAndRestoresResponse(t *testin
 	}
 }
 
+func TestHandleExecutorExecuteRequestContentLength(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client-model=>longer-upstream-model"})
+	tests := []struct {
+		name, body, wantContentLength string
+	}{
+		{name: "changed", body: `{"model":"client-model"}`, wantContentLength: ""},
+		{name: "unchanged", body: `{"contents":[]}`, wantContentLength: "999"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rawReq, err := json.Marshal(rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+				Model:           "client-model",
+				Format:          "openai",
+				SourceFormat:    "openai",
+				Headers:         http.Header{"Content-Length": []string{"999"}},
+				OriginalRequest: []byte(tt.body),
+			}})
+			if err != nil {
+				t.Fatalf("marshal request: %v", err)
+			}
+			_, err = handleExecutorExecute(rawReq, func(method string, payload any) (json.RawMessage, error) {
+				if method != pluginabi.MethodHostModelExecute {
+					t.Fatalf("method=%q, want %q", method, pluginabi.MethodHostModelExecute)
+				}
+				hostReq, ok := payload.(hostModelExecutePayload)
+				if !ok {
+					t.Fatalf("payload type=%T, want hostModelExecutePayload", payload)
+				}
+				if got := hostReq.Headers.Get("Content-Length"); got != tt.wantContentLength {
+					t.Fatalf("forwarded Content-Length=%q, want %q", got, tt.wantContentLength)
+				}
+				return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: http.StatusOK, Body: []byte(`{"id":"response"}`)})
+			})
+			if err != nil {
+				t.Fatalf("handleExecutorExecute error = %v", err)
+			}
+		})
+	}
+}
+
+func TestHandleExecutorExecuteResponseContentLength(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client-model=>longer-upstream-model"})
+	tests := []struct {
+		name, body, wantContentLength string
+	}{
+		{name: "changed", body: `{"model":"longer-upstream-model"}`, wantContentLength: ""},
+		{name: "unchanged", body: `{"id":"response"}`, wantContentLength: "999"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rawReq, err := json.Marshal(rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+				Model:           "client-model",
+				Format:          "openai",
+				SourceFormat:    "openai",
+				OriginalRequest: []byte(`{"model":"client-model"}`),
+			}})
+			if err != nil {
+				t.Fatalf("marshal request: %v", err)
+			}
+			respRaw, err := handleExecutorExecute(rawReq, func(method string, payload any) (json.RawMessage, error) {
+				if method != pluginabi.MethodHostModelExecute {
+					t.Fatalf("method=%q, want %q", method, pluginabi.MethodHostModelExecute)
+				}
+				return json.Marshal(pluginapi.HostModelExecutionResponse{
+					StatusCode: http.StatusOK,
+					Headers:    http.Header{"Content-Length": []string{"999"}},
+					Body:       []byte(tt.body),
+				})
+			})
+			if err != nil {
+				t.Fatalf("handleExecutorExecute error = %v", err)
+			}
+			var response pluginapi.ExecutorResponse
+			if err := json.Unmarshal(respRaw, &response); err != nil {
+				t.Fatalf("decode executor response: %v", err)
+			}
+			if got := response.Headers.Get("Content-Length"); got != tt.wantContentLength {
+				t.Fatalf("response Content-Length=%q, want %q", got, tt.wantContentLength)
+			}
+		})
+	}
+}
+
 func TestHandleExecutorExecuteAllFormats(t *testing.T) {
 	const (
 		requestWithModel = `{"model":"client-model","nested":{"model":"client-model","content":"client-model in nested content"},"content":[{"text":"client-model in content"}],"tools":[{"arguments":"client-model in tool arguments"}]}`
@@ -2938,6 +3021,38 @@ func TestHandleExecutorExecuteStreamStartsForwarderAndRestoresChunks(t *testing.
 	}
 	if !closedHost || !closedPlugin {
 		t.Fatalf("closedHost=%v closedPlugin=%v", closedHost, closedPlugin)
+	}
+}
+
+func TestHandleExecutorExecuteStreamRequestContentLength(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client-model=>longer-upstream-model"})
+	tests := []struct {
+		name, body, wantContentLength string
+	}{
+		{name: "changed", body: `{"model":"client-model","stream":true}`, wantContentLength: ""},
+		{name: "unchanged", body: `{"contents":[]}`, wantContentLength: "999"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var forwarded pluginapi.HostModelExecutionRequest
+			_, _, _, _, err := runExecutorStreamTestWithForwarded(rpcExecutorRequest{
+				ExecutorRequest: pluginapi.ExecutorRequest{
+					Model:           "client-model",
+					Format:          "openai",
+					SourceFormat:    "openai",
+					Stream:          true,
+					Headers:         http.Header{"Content-Length": []string{"999"}},
+					OriginalRequest: []byte(tt.body),
+				},
+				StreamID: "content-length-" + tt.name,
+			}, []pluginapi.HostModelStreamReadResponse{{Done: true}}, &forwarded)
+			if err != nil {
+				t.Fatalf("handleExecutorExecuteStream error = %v", err)
+			}
+			if got := forwarded.Headers.Get("Content-Length"); got != tt.wantContentLength {
+				t.Fatalf("forwarded Content-Length=%q, want %q", got, tt.wantContentLength)
+			}
+		})
 	}
 }
 

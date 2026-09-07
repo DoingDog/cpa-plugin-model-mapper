@@ -1076,9 +1076,12 @@ func runStreamForward(req *executorRPCRequest, call hostCaller) error {
 	if !decision.Handled {
 		return fmt.Errorf("route stream: unhandled model route for %q", req.Model)
 	}
-	body, _, err := rewriteRequestModel(req.OriginalRequest, decision.UpstreamModel)
+	body, changed, err := rewriteRequestModel(req.OriginalRequest, decision.UpstreamModel)
 	if err != nil {
 		return fmt.Errorf("rewrite stream request: %w", err)
+	}
+	if changed {
+		req.Headers.Del("Content-Length")
 	}
 	hostRaw, err := call(pluginabi.MethodHostModelExecuteStream, hostModelExecutePayload{
 		HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
@@ -1209,9 +1212,12 @@ func handleExecutorExecute(raw []byte, call hostCaller) ([]byte, error) {
 	if !decision.Handled {
 		return nil, fmt.Errorf("unhandled model route for %q", req.Model)
 	}
-	body, _, err := rewriteRequestModel(req.OriginalRequest, decision.UpstreamModel)
+	body, changed, err := rewriteRequestModel(req.OriginalRequest, decision.UpstreamModel)
 	if err != nil {
 		return nil, err
+	}
+	if changed {
+		req.Headers.Del("Content-Length")
 	}
 	hostRaw, err := call(pluginabi.MethodHostModelExecute, hostModelExecutePayload{
 		HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
@@ -1236,9 +1242,12 @@ func handleExecutorExecute(raw []byte, call hostCaller) ([]byte, error) {
 	if hostResp.StatusCode >= 400 {
 		return nil, fmt.Errorf("host.model.execute status %d: %s", hostResp.StatusCode, string(hostResp.Body))
 	}
-	payload, _, err := restoreResponseModel(hostResp.Body, decision.OriginalModel)
+	payload, changed, err := restoreResponseModel(hostResp.Body, decision.OriginalModel)
 	if err != nil {
 		return nil, err
+	}
+	if changed {
+		hostResp.Headers.Del("Content-Length")
 	}
 	return json.Marshal(pluginapi.ExecutorResponse{Payload: payload, Headers: hostResp.Headers})
 }
