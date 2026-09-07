@@ -38,6 +38,9 @@ jobs:
       - name: Test release compatibility checker
         run: go test .github/scripts/check-release-compatibility.go .github/scripts/check-release-compatibility_test.go
 
+      - name: Test local smoke helper
+        run: go test .github/scripts/smoke-local.go .github/scripts/smoke-local_test.go
+
       - name: Vet
         run: make vet
 
