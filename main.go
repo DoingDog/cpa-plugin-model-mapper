@@ -870,37 +870,51 @@ type routeDecision struct {
 	UpstreamModel string
 }
 
-func selectRules(cfg Config, format string) (string, []rule, bool) {
+type ruleSelection struct {
+	first  []rule
+	second []rule
+}
+
+func selectRules(cfg Config, format string) ruleSelection {
+	var specific []rule
 	switch format {
 	case "claude":
-		if cfg.ClaudeMessagesRules != "" {
-			return cfg.ClaudeMessagesRules, cfg.claudeMessagesRules, true
-		}
+		specific = cfg.claudeMessagesRules
 	case "openai-response":
-		if cfg.CodexResponsesRules != "" {
-			return cfg.CodexResponsesRules, cfg.codexResponsesRules, true
-		}
+		specific = cfg.codexResponsesRules
 	case "openai":
-		if cfg.OpenAICompletionsRules != "" {
-			return cfg.OpenAICompletionsRules, cfg.openAICompletionsRules, true
-		}
+		specific = cfg.openAICompletionsRules
+	default:
+		return ruleSelection{first: cfg.globalRules}
 	}
-	if cfg.GlobalRules != "" {
-		return cfg.GlobalRules, cfg.globalRules, true
+	if len(specific) == 0 {
+		return ruleSelection{first: cfg.globalRules}
 	}
-	return "", nil, false
+
+	selection := ruleSelection{first: specific}
+	switch cfg.RulesStackMode {
+	case rulesStackModeSpecificFirst:
+		selection.second = cfg.globalRules
+	case rulesStackModeGlobalFirst:
+		selection.first = cfg.globalRules
+		selection.second = specific
+	}
+	if len(selection.first) == 0 {
+		selection.first = selection.second
+		selection.second = nil
+	}
+	return selection
 }
 
 func callerAPIKeyForSelectedRules(cfg Config, format string, headers http.Header, query url.Values, scope string) string {
-	_, rules, ok := selectRules(cfg, format)
-	if !ok {
-		return ""
+	selection := selectRules(cfg, format)
+	for i := range selection.first {
+		if len(selection.first[i].callerPattern) > 0 {
+			return callerAPIKey(headers, query, scope)
+		}
 	}
-	if rules == nil {
-		return callerAPIKey(headers, query, scope)
-	}
-	for i := range rules {
-		if len(rules[i].callerPattern) > 0 {
+	for i := range selection.second {
+		if len(selection.second[i].callerPattern) > 0 {
 			return callerAPIKey(headers, query, scope)
 		}
 	}
@@ -933,20 +947,28 @@ func handleModelRoute(raw []byte) ([]byte, error) {
 }
 
 func routeModel(cfg Config, format, model, scope, key string) (routeDecision, error) {
-	raw, rules, ok := selectRules(cfg, format)
-	if !ok {
-		return routeDecision{}, nil
-	}
-	if rules == nil {
+	if !cfg.compiled {
 		var err error
-		rules, err = parseRules(raw)
+		cfg, err = compileConfig(cfg)
 		if err != nil {
 			return routeDecision{}, err
 		}
 	}
-	mapped, matched, err := applyRules(model, scope, key, rules)
+	selection := selectRules(cfg, format)
+	if len(selection.first) == 0 {
+		return routeDecision{}, nil
+	}
+	mapped, matched, err := applyRules(model, scope, key, selection.first)
 	if err != nil {
 		return routeDecision{}, err
+	}
+	if len(selection.second) > 0 {
+		var secondMatched bool
+		mapped, secondMatched, err = applyRules(mapped, scope, key, selection.second)
+		if err != nil {
+			return routeDecision{}, err
+		}
+		matched = matched || secondMatched
 	}
 	if !matched || mapped == model {
 		return routeDecision{}, nil

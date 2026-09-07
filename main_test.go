@@ -910,35 +910,311 @@ func TestApplyRulesSinglePassNoLoop(t *testing.T) {
 	}
 }
 
-func TestSelectRulesEndpointSpecificOverridesGlobal(t *testing.T) {
-	cfg := Config{GlobalRules: "global=>x", ClaudeMessagesRules: "claude=>x", CodexResponsesRules: "codex=>x", OpenAICompletionsRules: "openai=>x"}
-	tests := map[string]string{
-		"claude":          "claude=>x",
-		"openai-response": "codex=>x",
-		"openai":          "openai=>x",
+var specificFormats = []struct {
+	format string
+	set    func(*Config, string)
+}{
+	{"openai", func(c *Config, raw string) { c.OpenAICompletionsRules = raw }},
+	{"claude", func(c *Config, raw string) { c.ClaudeMessagesRules = raw }},
+	{"openai-response", func(c *Config, raw string) { c.CodexResponsesRules = raw }},
+}
+
+func TestRuleSelectionMatrix(t *testing.T) {
+	modes := []struct {
+		name string
+		mode string
+		want string
+	}{
+		{name: "off", mode: rulesStackModeOff, want: "specific"},
+		{name: "specific first", mode: rulesStackModeSpecificFirst, want: "specific"},
+		{name: "global first", mode: rulesStackModeGlobalFirst, want: "global"},
 	}
-	for format, want := range tests {
-		raw, _, ok := selectRules(cfg, format)
-		if !ok || raw != want {
-			t.Fatalf("selectRules(%q)=(%q,%v), want %q true", format, raw, ok, want)
+	for _, format := range specificFormats {
+		for _, mode := range modes {
+			t.Run(format.format+"/"+mode.name, func(t *testing.T) {
+				cfg := Config{GlobalRules: "client=>global", RulesStackMode: mode.mode}
+				format.set(&cfg, "client=>specific")
+				compiled, err := compileConfig(cfg)
+				if err != nil {
+					t.Fatalf("compileConfig error = %v", err)
+				}
+				selection := selectRules(compiled, format.format)
+				wantSecond := 1
+				if mode.mode == rulesStackModeOff {
+					wantSecond = 0
+				}
+				if len(selection.first) != 1 || len(selection.second) != wantSecond {
+					t.Fatalf("selection lengths=(%d,%d), want (1,%d)", len(selection.first), len(selection.second), wantSecond)
+				}
+				decision, err := routeModel(compiled, format.format, "client", "", "")
+				if err != nil {
+					t.Fatalf("routeModel error = %v", err)
+				}
+				if !decision.Handled || decision.OriginalModel != "client" || decision.UpstreamModel != mode.want {
+					t.Fatalf("decision=%#v, want client=>%q", decision, mode.want)
+				}
+			})
 		}
 	}
 }
 
-func TestSelectRulesFallsBackToGlobal(t *testing.T) {
-	cfg := Config{GlobalRules: "global=>x"}
-	for _, format := range []string{"claude", "openai-response", "openai", "gemini"} {
-		raw, _, ok := selectRules(cfg, format)
-		if !ok || raw != "global=>x" {
-			t.Fatalf("selectRules(%q)=(%q,%v), want global=>x true", format, raw, ok)
+func TestRouteModelStackDedicatedThenGlobal(t *testing.T) {
+	for _, format := range specificFormats {
+		t.Run(format.format, func(t *testing.T) {
+			cfg := Config{GlobalRules: "specific=>global", RulesStackMode: rulesStackModeSpecificFirst}
+			format.set(&cfg, "client=>specific")
+			decision, err := routeModel(cfg, format.format, "client", "", "")
+			if err != nil {
+				t.Fatalf("routeModel error = %v", err)
+			}
+			if !decision.Handled || decision.UpstreamModel != "global" {
+				t.Fatalf("decision=%#v, want client=>global", decision)
+			}
+		})
+	}
+}
+
+func TestRouteModelStackGlobalThenDedicated(t *testing.T) {
+	for _, format := range specificFormats {
+		t.Run(format.format, func(t *testing.T) {
+			cfg := Config{GlobalRules: "client=>global", RulesStackMode: rulesStackModeGlobalFirst}
+			format.set(&cfg, "global=>specific")
+			decision, err := routeModel(cfg, format.format, "client", "", "")
+			if err != nil {
+				t.Fatalf("routeModel error = %v", err)
+			}
+			if !decision.Handled || decision.UpstreamModel != "specific" {
+				t.Fatalf("decision=%#v, want client=>specific", decision)
+			}
+		})
+	}
+}
+
+func TestRuleSelectionEmptySpecificFallsBack(t *testing.T) {
+	for _, format := range specificFormats {
+		for _, mode := range []string{rulesStackModeOff, rulesStackModeSpecificFirst, rulesStackModeGlobalFirst} {
+			for _, raw := range []string{"", "! disabled"} {
+				t.Run(format.format+"/"+mode+"/"+fmt.Sprintf("%q", raw), func(t *testing.T) {
+					cfg := Config{GlobalRules: "client=>global", RulesStackMode: mode}
+					format.set(&cfg, raw)
+					decision, err := routeModel(cfg, format.format, "client", "", "")
+					if err != nil {
+						t.Fatalf("routeModel error = %v", err)
+					}
+					if !decision.Handled || decision.UpstreamModel != "global" {
+						t.Fatalf("decision=%#v, want client=>global", decision)
+					}
+				})
+			}
 		}
 	}
 }
 
-func TestSelectRulesBothEmptySkips(t *testing.T) {
-	if raw, _, ok := selectRules(defaultConfig(), "claude"); ok || raw != "" {
-		t.Fatalf("selectRules empty=(%q,%v), want empty false", raw, ok)
+func TestRuleSelectionSpecificWithoutGlobal(t *testing.T) {
+	for _, format := range specificFormats {
+		for _, mode := range []string{rulesStackModeOff, rulesStackModeSpecificFirst, rulesStackModeGlobalFirst} {
+			t.Run(format.format+"/"+mode, func(t *testing.T) {
+				cfg := Config{RulesStackMode: mode}
+				format.set(&cfg, "client=>specific")
+				decision, err := routeModel(cfg, format.format, "client", "", "")
+				if err != nil {
+					t.Fatalf("routeModel error = %v", err)
+				}
+				if !decision.Handled || decision.UpstreamModel != "specific" {
+					t.Fatalf("decision=%#v, want client=>specific", decision)
+				}
+			})
+		}
 	}
+}
+
+func TestRuleSelectionGlobalOnlyFormats(t *testing.T) {
+	for _, format := range []string{"gemini", "interactions"} {
+		for _, mode := range []string{rulesStackModeOff, rulesStackModeSpecificFirst, rulesStackModeGlobalFirst} {
+			t.Run(format+"/"+mode, func(t *testing.T) {
+				cfg := Config{
+					GlobalRules:            "client=>global",
+					ClaudeMessagesRules:    "client=>claude",
+					CodexResponsesRules:    "client=>codex",
+					OpenAICompletionsRules: "client=>openai",
+					RulesStackMode:         mode,
+				}
+				decision, err := routeModel(cfg, format, "client", "", "")
+				if err != nil {
+					t.Fatalf("routeModel error = %v", err)
+				}
+				if !decision.Handled || decision.UpstreamModel != "global" {
+					t.Fatalf("decision=%#v, want client=>global", decision)
+				}
+			})
+		}
+	}
+}
+
+func TestRouteModelStackNetIdentity(t *testing.T) {
+	cfg := Config{
+		GlobalRules:            "middle=>client",
+		OpenAICompletionsRules: "client=>middle",
+		RulesStackMode:         rulesStackModeSpecificFirst,
+	}
+	decision, err := routeModel(cfg, "openai", "client", "", "")
+	if err != nil {
+		t.Fatalf("routeModel error = %v", err)
+	}
+	if decision.Handled || decision.OriginalModel != "" || decision.UpstreamModel != "" {
+		t.Fatalf("decision=%#v, want unhandled net identity", decision)
+	}
+}
+
+func TestCallerWildcardStackUsesBoundCredential(t *testing.T) {
+	tests := []struct {
+		name       string
+		mode       string
+		globalRule string
+		specific   string
+		key        string
+	}{
+		{name: "specific first global positive", mode: rulesStackModeSpecificFirst, globalRule: "sk-*#client=>target", specific: "other=>ignored", key: "sk-team"},
+		{name: "specific first global inverse", mode: rulesStackModeSpecificFirst, globalRule: "#sk-*#client=>target", specific: "other=>ignored", key: "ak-team"},
+		{name: "global first specific positive", mode: rulesStackModeGlobalFirst, globalRule: "other=>ignored", specific: "sk-*#client=>target", key: "sk-team"},
+		{name: "global first specific inverse", mode: rulesStackModeGlobalFirst, globalRule: "other=>ignored", specific: "#sk-*#client=>target", key: "ak-team"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{GlobalRules: tt.globalRule, OpenAICompletionsRules: tt.specific, RulesStackMode: tt.mode}
+			setLoadedConfigForTest(cfg)
+			compiled := loadedConfig()
+			headers := http.Header{"Authorization": {"Bearer " + tt.key}}
+			scope := callerScope(tt.key)
+			if got := callerAPIKeyForSelectedRules(compiled, "openai", headers, nil, scope); got != tt.key {
+				t.Fatalf("callerAPIKeyForSelectedRules()=%q, want bound key %q", got, tt.key)
+			}
+			route := func(headers http.Header, metadata map[string]any) bool {
+				raw, err := json.Marshal(pluginapi.ModelRouteRequest{
+					SourceFormat:   "openai",
+					RequestedModel: "client",
+					Headers:        headers,
+					Metadata:       metadata,
+				})
+				if err != nil {
+					t.Fatalf("marshal route request: %v", err)
+				}
+				responseRaw, err := handleModelRoute(raw)
+				if err != nil {
+					t.Fatalf("handleModelRoute error: %v", err)
+				}
+				var response pluginapi.ModelRouteResponse
+				if err := json.Unmarshal(responseRaw, &response); err != nil {
+					t.Fatalf("decode route response: %v", err)
+				}
+				return response.Handled
+			}
+			if route(http.Header{"Authorization": {"Bearer spoofed"}}, map[string]any{callerScopeMetadataKey: scope}) {
+				t.Fatal("spoofed credential routed")
+			}
+			if route(headers, nil) {
+				t.Fatal("missing caller_scope routed")
+			}
+			if !route(headers, map[string]any{callerScopeMetadataKey: scope}) {
+				t.Fatal("bound credential did not route")
+			}
+		})
+	}
+}
+
+func TestExecutorReusesCallerStackAfterWarmRoute(t *testing.T) {
+	tests := []struct {
+		name       string
+		mode       string
+		globalRule string
+		specific   string
+		key        string
+	}{
+		{name: "specific first global positive", mode: rulesStackModeSpecificFirst, globalRule: "sk-*#client=>target", specific: "other=>ignored", key: "sk-team"},
+		{name: "specific first global inverse", mode: rulesStackModeSpecificFirst, globalRule: "#sk-*#client=>target", specific: "other=>ignored", key: "ak-team"},
+		{name: "global first specific positive", mode: rulesStackModeGlobalFirst, globalRule: "other=>ignored", specific: "sk-*#client=>target", key: "sk-team"},
+		{name: "global first specific inverse", mode: rulesStackModeGlobalFirst, globalRule: "other=>ignored", specific: "#sk-*#client=>target", key: "ak-team"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setLoadedConfigForTest(Config{GlobalRules: tt.globalRule, OpenAICompletionsRules: tt.specific, RulesStackMode: tt.mode})
+			metadata := map[string]any{callerScopeMetadataKey: callerScope(tt.key)}
+			routeRaw, err := json.Marshal(pluginapi.ModelRouteRequest{
+				SourceFormat:   "openai",
+				RequestedModel: "client",
+				Headers:        http.Header{"Authorization": {"Bearer " + tt.key}},
+				Metadata:       metadata,
+			})
+			if err != nil {
+				t.Fatalf("marshal route request: %v", err)
+			}
+			routeResponse, err := handleModelRoute(routeRaw)
+			if err != nil {
+				t.Fatalf("warm route: %v", err)
+			}
+			var routeResult pluginapi.ModelRouteResponse
+			if err := json.Unmarshal(routeResponse, &routeResult); err != nil || !routeResult.Handled {
+				t.Fatalf("warm route response=%s err=%v, want handled", routeResponse, err)
+			}
+
+			req := rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+				Model:           "client",
+				Format:          "openai",
+				SourceFormat:    "openai",
+				Headers:         http.Header{"Authorization": {"Bearer interceptor-replacement"}},
+				Metadata:        metadata,
+				OriginalRequest: []byte(`{"model":"client"}`),
+			}}
+			rawReq, err := json.Marshal(req)
+			if err != nil {
+				t.Fatalf("marshal executor request: %v", err)
+			}
+			var captured hostModelExecutionRequest
+			_, err = handleExecutorExecute(rawReq, func(_ string, payload any) (json.RawMessage, error) {
+				raw, err := json.Marshal(payload)
+				if err != nil {
+					return nil, err
+				}
+				if err := json.Unmarshal(raw, &captured); err != nil {
+					return nil, err
+				}
+				return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: 200, Body: []byte(`{"model":"target"}`)})
+			})
+			if err != nil {
+				t.Fatalf("executor after warm route: %v", err)
+			}
+			if captured.Model != "target" {
+				t.Fatalf("forwarded model=%q, want target", captured.Model)
+			}
+		})
+	}
+}
+
+func TestSelectRulesAllocation(t *testing.T) {
+	cfg, err := compileConfig(Config{
+		GlobalRules:            "middle=>target",
+		OpenAICompletionsRules: "client=>middle",
+		RulesStackMode:         rulesStackModeSpecificFirst,
+	})
+	if err != nil {
+		t.Fatalf("compileConfig error = %v", err)
+	}
+	selectionAllocs := testing.AllocsPerRun(1000, func() {
+		selection := selectRules(cfg, "openai")
+		if len(selection.first) != 1 || len(selection.second) != 1 {
+			panic(fmt.Sprintf("selectRules=(%d,%d)", len(selection.first), len(selection.second)))
+		}
+	})
+	if selectionAllocs != 0 {
+		t.Fatalf("selection allocations=%v, want 0", selectionAllocs)
+	}
+	routeAllocs := testing.AllocsPerRun(1000, func() {
+		decision, err := routeModel(cfg, "openai", "client", "", "")
+		if err != nil || !decision.Handled || decision.UpstreamModel != "target" {
+			panic(fmt.Sprintf("routeModel=(%#v,%v)", decision, err))
+		}
+	})
+	t.Logf("selection allocations=%v; two-stage exact route allocations=%v", selectionAllocs, routeAllocs)
 }
 
 func TestRouteModelAPIKeyScopeAcrossRuleSets(t *testing.T) {
