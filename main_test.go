@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -3781,6 +3782,123 @@ func TestSplitJSONValuesKeepsDecoderOwnedPayload(t *testing.T) {
 	referenceAllocs := testing.AllocsPerRun(50, reference)
 	if productionAllocs > referenceAllocs+2 {
 		t.Fatalf("splitJSONValues allocations=%v, decoder reference allocations=%v", productionAllocs, referenceAllocs)
+	}
+}
+
+func TestRunStreamForwardFlushesPendingBytesOnReadError(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	sentinelReadError := errors.New("host stream read failed")
+	type streamState struct {
+		readCalls         int
+		emitted           []string
+		events            []string
+		hostClosed        bool
+		pluginClosed      bool
+		pluginCloseStream string
+		pluginCloseError  string
+	}
+	newRequest := func() *executorRPCRequest {
+		return &executorRPCRequest{
+			Model:           "client",
+			Format:          "openai",
+			SourceFormat:    "openai",
+			OriginalRequest: []byte(`{"model":"client","stream":true}`),
+			StreamID:        "plugin-stream-read-error-1",
+		}
+	}
+	newCall := func(state *streamState) hostCaller {
+		return func(method string, payload any) (json.RawMessage, error) {
+			switch method {
+			case pluginabi.MethodHostModelExecuteStream:
+				return json.Marshal(pluginapi.HostModelStreamResponse{
+					StatusCode: http.StatusOK,
+					Headers:    http.Header{"Content-Type": []string{"text/event-stream"}},
+					StreamID:   "host-stream-read-error-1",
+				})
+			case pluginabi.MethodHostModelStreamRead:
+				state.readCalls++
+				switch state.readCalls {
+				case 1:
+					return json.Marshal(pluginapi.HostModelStreamReadResponse{Payload: []byte(`data: {"model":"upstream"}`)})
+				case 2:
+					return nil, sentinelReadError
+				default:
+					return nil, fmt.Errorf("unexpected stream read %d", state.readCalls)
+				}
+			case pluginabi.MethodHostStreamEmit:
+				raw, err := json.Marshal(payload)
+				if err != nil {
+					return nil, err
+				}
+				var emit struct {
+					Payload []byte `json:"payload"`
+				}
+				if err := json.Unmarshal(raw, &emit); err != nil {
+					return nil, err
+				}
+				state.emitted = append(state.emitted, string(emit.Payload))
+				state.events = append(state.events, "emit")
+				return json.Marshal(map[string]any{})
+			case pluginabi.MethodHostModelStreamClose:
+				state.hostClosed = true
+				state.events = append(state.events, "host-close")
+				return json.Marshal(map[string]any{})
+			default:
+				return nil, fmt.Errorf("unexpected method %q", method)
+			}
+		}
+	}
+	assertForwarded := func(state *streamState) {
+		t.Helper()
+		if joined := strings.Join(state.emitted, ""); !strings.Contains(joined, `"model":"client"`) {
+			t.Fatalf("emitted=%q, want restored pending model", joined)
+		}
+		if !state.hostClosed {
+			t.Fatal("host stream was not closed")
+		}
+	}
+
+	directState := &streamState{}
+	directDone := make(chan error, 1)
+	go func() {
+		directDone <- runStreamForward(newRequest(), newCall(directState))
+	}()
+	select {
+	case err := <-directDone:
+		if !errors.Is(err, sentinelReadError) {
+			t.Fatalf("runStreamForward error = %v, want sentinel read error", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runStreamForward did not return after host read error")
+	}
+	assertForwarded(directState)
+	if got := strings.Join(directState.events, ","); got != "emit,host-close" {
+		t.Fatalf("direct close order = %q, want emit,host-close", got)
+	}
+
+	outerState := &streamState{}
+	pluginDone := make(chan struct{})
+	if _, err := startExecutorStream(*newRequest(), newCall(outerState), func(streamID, errText string) error {
+		outerState.pluginClosed = true
+		outerState.pluginCloseStream = streamID
+		outerState.pluginCloseError = errText
+		outerState.events = append(outerState.events, "plugin-close")
+		close(pluginDone)
+		return nil
+	}); err != nil {
+		t.Fatalf("startExecutorStream error = %v", err)
+	}
+	select {
+	case <-pluginDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("outer stream path did not close plugin stream")
+	}
+	assertForwarded(outerState)
+	if !outerState.pluginClosed || outerState.pluginCloseStream != "plugin-stream-read-error-1" || !strings.Contains(outerState.pluginCloseError, sentinelReadError.Error()) {
+		t.Fatalf("plugin close = (%v, %q, %q)", outerState.pluginClosed, outerState.pluginCloseStream, outerState.pluginCloseError)
+	}
+	if got := strings.Join(outerState.events, ","); got != "emit,host-close,plugin-close" {
+		t.Fatalf("outer close order = %q, want emit,host-close,plugin-close", got)
 	}
 }
 

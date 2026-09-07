@@ -1138,11 +1138,28 @@ func runStreamForward(req *executorRPCRequest, call hostCaller) error {
 	}
 	rewriter := newStreamChunkRewriter(decision.OriginalModel)
 	rewriter.frameRawJSONAsSSE = isEventStreamContentType(hostResp.Headers.Get("Content-Type"))
+	flushAndEmit := func() error {
+		flushed, err := rewriter.Flush()
+		if err != nil {
+			return fmt.Errorf("flush stream rewriter: %w", err)
+		}
+		if err := emitRewritten(flushed, rewriter.frameRawJSONAsSSE, emit); err != nil {
+			return fmt.Errorf("emit flushed stream chunk: %w", err)
+		}
+		return nil
+	}
 	for {
 		readRaw, err := call(pluginabi.MethodHostModelStreamRead, pluginapi.HostModelStreamReadRequest{StreamID: hostStreamID})
 		if err != nil {
-			_ = closeHost()
-			return fmt.Errorf("read host stream: %w", err)
+			readErr := fmt.Errorf("read host stream: %w", err)
+			if flushErr := flushAndEmit(); flushErr != nil {
+				_ = closeHost()
+				return fmt.Errorf("%v; %w", flushErr, readErr)
+			}
+			if closeErr := closeHost(); closeErr != nil {
+				return fmt.Errorf("close host stream: %v; %w", closeErr, readErr)
+			}
+			return readErr
 		}
 		var chunk pluginapi.HostModelStreamReadResponse
 		if err := json.Unmarshal(readRaw, &chunk); err != nil {
@@ -1150,14 +1167,9 @@ func runStreamForward(req *executorRPCRequest, call hostCaller) error {
 			return fmt.Errorf("decode host stream chunk: %w", err)
 		}
 		if chunk.Error != "" {
-			flushed, flushErr := rewriter.Flush()
-			if flushErr != nil {
+			if err := flushAndEmit(); err != nil {
 				_ = closeHost()
-				return fmt.Errorf("flush stream rewriter before error close: %w", flushErr)
-			}
-			if err := emitRewritten(flushed, rewriter.frameRawJSONAsSSE, emit); err != nil {
-				_ = closeHost()
-				return fmt.Errorf("emit flushed stream chunk before error close: %w", err)
+				return err
 			}
 			if err := closeHost(); err != nil {
 				return fmt.Errorf("close host stream: %w", err)
@@ -1180,14 +1192,9 @@ func runStreamForward(req *executorRPCRequest, call hostCaller) error {
 			return fmt.Errorf("emit stream chunk: %w", err)
 		}
 	}
-	flushed, err := rewriter.Flush()
-	if err != nil {
+	if err := flushAndEmit(); err != nil {
 		_ = closeHost()
-		return fmt.Errorf("flush stream rewriter: %w", err)
-	}
-	if err := emitRewritten(flushed, rewriter.frameRawJSONAsSSE, emit); err != nil {
-		_ = closeHost()
-		return fmt.Errorf("emit flushed stream chunk: %w", err)
+		return err
 	}
 	if err := closeHost(); err != nil {
 		return fmt.Errorf("close host stream: %w", err)
