@@ -34,7 +34,7 @@ This is a single-package Go `c-shared` CLIProxyAPI native plugin. `abi_cgo.go` i
 Important model-rewrite invariants:
 
 - Request rewriting intentionally changes only the top-level JSON `model` field. Delete stale `Content-Length` only when that rewrite changes the request body.
-- Response restoration is deliberately whitelisted to `model`, `modelVersion`, `response.model`, `response.modelVersion`, and `message.model`. Do not replace recursively through arbitrary content/tool text.
+- Response restoration is deliberately whitelisted to `model`, `modelVersion`, `response.model`, `response.modelVersion`, and `message.model`. Do not replace recursively through arbitrary content/tool text. For nonstream responses, remove `Content-Length` only when model restoration changes body bytes; preserve it when unchanged.
 - Case operations change ASCII English letters only and do not make later mappings case-insensitive.
 - Streaming responses pass through `streamChunkRewriter`, which handles complete SSE events, split SSE prefixes, unterminated SSE data at flush time, raw JSON chunks, line/space-delimited JSON values, and raw JSON that must be framed as SSE for Responses SSE clients.
 - On a host stream read error, flush pending rewritten bytes before closing the plugin stream so clients do not hang waiting for buffered output.

@@ -189,6 +189,8 @@ Response restoration changes only these paths:
 - `response.modelVersion`
 - `message.model`
 
+For nonstream responses, remove `Content-Length` only when model restoration changes body bytes; preserve it when unchanged.
+
 Opaque response content and tool text are not recursively rewritten. Before closing the plugin stream after a read error, the plugin flushes pending rewritten bytes.
 
 ## Common use cases

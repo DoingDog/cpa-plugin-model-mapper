@@ -1223,6 +1223,7 @@ Expected: no CLIProxyAPI source, module cache, `upstream/`, `.test-cpa/`, `dist/
 
 ```powershell
 git diff --check
+git diff --check v0.4.4...HEAD
 go mod verify
 go vet ./...
 ```
@@ -1332,6 +1333,7 @@ Run exactly:
 
 ```powershell
 git diff --check
+git diff --check v0.4.4...HEAD
 go mod verify
 go test ./... -count=1
 go test -race ./... -count=1
@@ -1373,7 +1375,7 @@ if ($null -eq $run) { throw "v0.5.0 tag workflow not found" }
 gh run watch $run.databaseId --exit-status
 ```
 
-Select the run whose event is `push`, head branch is `v0.5.0` and head SHA equals local `main`. If the workflow fails, diagnose the failing job, fix on a new commit, rerun the complete local gate, create a new release tag only if `v0.5.0` was never published and the existing tag can be safely deleted before any release consumer saw it. Otherwise report the immutable release blocker rather than moving a published tag.
+Select the run whose event is `push`, head branch is `v0.5.0` and head SHA equals local `main`. If the workflow fails, diagnose the failing job. A transient failure may rerun against the same `v0.5.0` tag and commit. If source changes are required after the tag push, keep `v0.5.0` immutable, stop its publication, and require a new version such as `v0.5.1`.
 
 - [ ] **Step 7: Verify release metadata and asset set**
 
