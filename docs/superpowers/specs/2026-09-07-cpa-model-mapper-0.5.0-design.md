@@ -1,7 +1,7 @@
 # CPA Model Mapper 0.5.0 Design
 
-**日期：** 2026-09-07  
-**范围：** 仅修改 `cpa-plugin-model-mapper` 插件仓库，不修改 CLIProxyAPI 本体。  
+**日期：** 2026-09-07
+**范围：** 仅修改 `cpa-plugin-model-mapper` 插件仓库，不修改 CLIProxyAPI 本体。
 **目标版本：** `v0.5.0`
 
 ## 背景
