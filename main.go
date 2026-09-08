@@ -217,7 +217,6 @@ func (r *sseRewriter) rewriteMultiDataEvent(out [][]byte, event []byte) ([][]byt
 	dataFields := 0
 	nonDataFields := 0
 	hasMarker := false
-	var markerScanner responseModelMarkerScanner
 	for remaining := event; len(remaining) > 0; {
 		line, _, next := splitSSELine(remaining)
 		remaining = next
@@ -228,18 +227,10 @@ func (r *sseRewriter) rewriteMultiDataEvent(out [][]byte, event []byte) ([][]byt
 		value := sseFieldValue(line)
 		if dataFields > 0 {
 			joinedLen++
-			if !hasMarker {
-				hasMarker = markerScanner.feed('\n')
-			}
 		}
 		joinedLen += len(value)
-		if !hasMarker {
-			for _, b := range value {
-				if markerScanner.feed(b) {
-					hasMarker = true
-					break
-				}
-			}
+		if !hasMarker && mightContainResponseModelField(value) {
+			hasMarker = true
 		}
 		dataFields++
 	}
@@ -261,7 +252,7 @@ func (r *sseRewriter) rewriteMultiDataEvent(out [][]byte, event []byte) ([][]byt
 		joined = append(joined, sseFieldValue(line)...)
 		seenData++
 	}
-	restored, changed, err := r.restoreResponseModel(joined)
+	restored, changed, _, err := r.restoreResponseModelCandidate(joined)
 	if err != nil {
 		return nil, err
 	}
@@ -317,7 +308,7 @@ func (r *sseRewriter) rewriteEvent(out [][]byte, event []byte) ([][]byte, error)
 				out = append(out, append(append([]byte(nil), line...), lineBreak...))
 				continue
 			}
-			restored, changed, err := r.restoreResponseModel(value)
+			restored, changed, _, err := r.restoreResponseModelCandidate(value)
 			if err != nil {
 				return nil, err
 			}
@@ -1812,8 +1803,6 @@ func escapedResponseModelKey(raw []byte) bool {
 }
 
 type responseModelMarkerScanner struct {
-	tail        [14]byte
-	tailLen     int
 	inString    bool
 	escaped     bool
 	hadEscape   bool
@@ -1824,18 +1813,6 @@ type responseModelMarkerScanner struct {
 }
 
 func (s *responseModelMarkerScanner) feed(b byte) bool {
-	if s.tailLen < len(s.tail) {
-		s.tail[s.tailLen] = b
-		s.tailLen++
-	} else {
-		copy(s.tail[:], s.tail[1:])
-		s.tail[len(s.tail)-1] = b
-	}
-	tail := s.tail[:s.tailLen]
-	if b == '"' && (bytes.HasSuffix(tail, []byte(`"model"`)) || bytes.HasSuffix(tail, []byte(`"modelVersion"`))) {
-		return true
-	}
-
 	if s.afterString {
 		switch b {
 		case ' ', '\t', '\r', '\n':
@@ -1884,6 +1861,12 @@ func (s *responseModelMarkerScanner) feed(b byte) bool {
 }
 
 func mightContainResponseModelField(body []byte) bool {
+	if bytes.Contains(body, []byte(`"model"`)) || bytes.Contains(body, []byte(`"modelVersion"`)) {
+		return true
+	}
+	if !bytes.Contains(body, []byte{'\\'}) {
+		return false
+	}
 	var scanner responseModelMarkerScanner
 	for _, b := range body {
 		if scanner.feed(b) {

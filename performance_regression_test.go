@@ -41,9 +41,75 @@ func BenchmarkCallerPatternCacheRetention(b *testing.B) {
 }
 
 var (
-	benchmarkRewriteTopLevelModelOutput  []byte
-	benchmarkRewriteTopLevelModelChanged bool
+	benchmarkRewriteTopLevelModelOutput    []byte
+	benchmarkRewriteTopLevelModelChanged   bool
+	benchmarkResponseModelMarkerScanResult bool
 )
+
+func BenchmarkResponseModelMarkerScan(b *testing.B) {
+	for _, size := range []struct {
+		name  string
+		bytes int
+	}{
+		{name: "4KiB", bytes: 4 << 10},
+		{name: "64KiB", bytes: 64 << 10},
+		{name: "1MiB", bytes: 1 << 20},
+	} {
+		for _, payload := range []struct {
+			name    string
+			marker  bool
+			changed bool
+		}{
+			{name: "no-marker", marker: false, changed: false},
+			{name: "literal-marker-near-end", marker: true, changed: true},
+			{name: "escaped-key-near-end", marker: true, changed: true},
+		} {
+			b.Run(size.name+"/"+payload.name, func(b *testing.B) {
+				body := responseModelMarkerScanBenchmarkFixture(size.bytes, payload.name)
+				if got := mightContainResponseModelField(body); got != payload.marker {
+					b.Fatalf("mightContainResponseModelField=%v, want %v", got, payload.marker)
+				}
+				restored, changed, err := restoreResponseModel(body, "client")
+				if err != nil {
+					b.Fatal(err)
+				}
+				if changed != payload.changed {
+					b.Fatalf("restoreResponseModel changed=%v, want %v", changed, payload.changed)
+				}
+				if !changed && !bytes.Equal(restored, body) {
+					b.Fatalf("restoreResponseModel=%q, want %q", restored, body)
+				}
+				if changed && !bytes.Contains(restored, []byte(`"model":"client"`)) {
+					b.Fatalf("restoreResponseModel=%q, want restored model", restored)
+				}
+
+				b.ReportAllocs()
+				b.SetBytes(int64(len(body)))
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					benchmarkResponseModelMarkerScanResult = mightContainResponseModelField(body)
+				}
+			})
+		}
+	}
+}
+
+func responseModelMarkerScanBenchmarkFixture(size int, payload string) []byte {
+	prefix := []byte(`{"opaque":"line\nquoted:\"value\"\\`)
+	var suffix []byte
+	switch payload {
+	case "no-marker":
+		suffix = []byte(`","id":"response"}`)
+	case "literal-marker-near-end":
+		suffix = []byte(`","model":"upstream"}`)
+	case "escaped-key-near-end":
+		suffix = append([]byte{'"', ',', '"', '\\'}, []byte(`u006dodel":"upstream"}`)...)
+	}
+	body := make([]byte, 0, size)
+	body = append(body, prefix...)
+	body = append(body, bytes.Repeat([]byte("x"), size-len(prefix)-len(suffix))...)
+	return append(body, suffix...)
+}
 
 func BenchmarkRewriteTopLevelModel(b *testing.B) {
 	for _, benchmark := range []struct {
