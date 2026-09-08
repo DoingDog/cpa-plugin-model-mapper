@@ -3466,25 +3466,56 @@ func TestHandleExecutorExecuteStreamAllFormats(t *testing.T) {
 	}
 }
 
-func TestStreamChunkRewriterSeparatesKnownResponseEventAndDataChunks(t *testing.T) {
-	r := newStreamChunkRewriter("client")
-	first, err := r.Write([]byte("event: response.completed"))
-	if err != nil || len(first) != 0 {
-		t.Fatalf("first write = (%q, %v), want buffered", first, err)
+func TestStreamChunkRewriterDoesNotTreatReadBoundaryAsLineEnding(t *testing.T) {
+	for _, input := range []string{
+		"event: responsedata: continuation\n\n",
+		"data: {\"model\":\"upstream\"}data: continuation\n\n",
+	} {
+		t.Run(input, func(t *testing.T) {
+			var want string
+			for split := 0; split <= len(input); split++ {
+			r := newStreamChunkRewriter("client")
+			first, err := r.Write([]byte(input[:split]))
+			if err != nil {
+				t.Fatalf("split %d first write: %v", split, err)
+			}
+			second, err := r.Write([]byte(input[split:]))
+			if err != nil {
+				t.Fatalf("split %d second write: %v", split, err)
+			}
+			flushed, err := r.Flush()
+			if err != nil {
+				t.Fatalf("split %d flush: %v", split, err)
+			}
+				got := flattenChunks(append(append(first, second...), flushed...))
+				if split == 0 {
+					want = got
+				}
+				if got != want {
+					t.Fatalf("split %d output=%q, want %q", split, got, want)
+				}
+			}
+		})
 	}
-	second, err := r.Write([]byte(`data: {"response":{"model":"upstream"}}`))
-	if err != nil {
-		t.Fatalf("second write error = %v", err)
+}
+
+func TestFrameSSEDataSupportsAllSSELineEndings(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{`{"a":1}` + "\n" + `{"b":2}`, "data: {\"a\":1}\ndata: {\"b\":2}\n\n"},
+		{`{"a":1}` + "\r\n" + `{"b":2}`, "data: {\"a\":1}\ndata: {\"b\":2}\n\n"},
+		{`{"a":1}` + "\r" + `{"b":2}`, "data: {\"a\":1}\ndata: {\"b\":2}\n\n"},
+		{`{"a":1}` + "\r\n", "data: {\"a\":1}\ndata: \n\n"},
 	}
-	flushed, err := r.Flush()
-	if err != nil {
-		t.Fatalf("flush error = %v", err)
-	}
-	second = append(second, flushed...)
-	got := flattenChunks(second)
-	want := "event: response.completed\n" + `data: {"response":{"model":"client"}}`
-	if got != want {
-		t.Fatalf("output = %q, want %q", got, want)
+	for _, tt := range cases {
+		got := string(frameSSEData([]byte(tt.input)))
+		if got != tt.want {
+			t.Fatalf("frameSSEData(%q)=%q, want %q", tt.input, got, tt.want)
+		}
+		for _, line := range strings.Split(strings.TrimSuffix(got, "\n\n"), "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				t.Fatalf("framed output has unprefixed line %q", line)
+			}
+		}
 	}
 }
 

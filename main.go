@@ -384,44 +384,6 @@ func sseEventDelimiter(buf []byte, start int) (eventLen, delimLen, next int) {
 	return findSSEEventDelimiter(buf, start, false)
 }
 
-func isSSEFieldStart(p []byte) bool {
-	trimmed := bytes.TrimLeft(p, " \t\r\n")
-	for _, prefix := range [][]byte{[]byte("data:"), []byte("event:"), []byte("id:"), []byte("retry:"), []byte(":")} {
-		if bytes.HasPrefix(trimmed, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-func lastSSELine(p []byte) []byte {
-	for i := len(p) - 1; i >= 0; i-- {
-		if p[i] == '\n' || p[i] == '\r' {
-			return p[i+1:]
-		}
-	}
-	return p
-}
-
-func knownSSELogicalBoundary(pending, next []byte) bool {
-	if len(pending) == 0 || bytes.HasSuffix(pending, []byte("\n")) || bytes.HasSuffix(pending, []byte("\r")) {
-		return false
-	}
-	if !isSSEFieldStart(next) {
-		return false
-	}
-	line := lastSSELine(pending)
-	switch {
-	case bytes.HasPrefix(line, []byte("event:")):
-		return len(bytes.TrimSpace(line[len("event:"):])) > 0
-	case bytes.HasPrefix(line, []byte("data:")):
-		value := sseFieldValue(line)
-		return len(value) > 0 && json.Valid(bytes.TrimSpace(value))
-	default:
-		return false
-	}
-}
-
 func isColonlessSSEChunk(p []byte) bool {
 	trimmed := bytes.TrimLeft(p, " \t\r\n")
 	if len(trimmed) == 0 || trimmed[0] == '{' || trimmed[0] == '[' {
@@ -473,9 +435,6 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 		owned = true
 	}
 	if len(r.sse.buf) > 0 {
-		if knownSSELogicalBoundary(r.sse.buf, p) {
-			r.sse.buf = append(r.sse.buf, '\n')
-		}
 		return r.sse.Write(p)
 	}
 	if r.frameRawJSONAsSSE && !couldStartJSONValue(p) && completeSSEEvents(p) && !mightContainResponseModelField(p) {
@@ -639,10 +598,22 @@ func (r *streamChunkRewriter) Flush() ([][]byte, error) {
 
 func frameSSEData(p []byte) []byte {
 	var out bytes.Buffer
-	for _, line := range bytes.Split(p, []byte("\n")) {
+	start := 0
+	for {
+		position, length, _ := sseLineEnding(p, start, true)
 		out.WriteString("data: ")
-		out.Write(line)
+		if length == 0 {
+			out.Write(p[start:])
+			out.WriteByte('\n')
+			break
+		}
+		out.Write(p[start:position])
 		out.WriteByte('\n')
+		start = position + length
+		if start == len(p) {
+			out.WriteString("data: \n")
+			break
+		}
 	}
 	out.WriteByte('\n')
 	return out.Bytes()
