@@ -1773,6 +1773,39 @@ func TestRewriteRequestModelCanonicalizesDuplicateSemanticModelKeys(t *testing.T
 	}
 }
 
+func TestRewriteTopLevelModelCanonicalizesDuplicateWhenLastValueIsTarget(t *testing.T) {
+	const upstreamModel = "upstream-model"
+	for _, tt := range []struct {
+		name string
+		body []byte
+	}{
+		{name: "literal duplicate", body: []byte(`{"model":"client","model":"upstream-model","opaque":{"model":"opaque"}}`)},
+		{name: "literal and escaped duplicate", body: []byte(`{"model":"client","` + string(rune(92)) + `u006dodel":"upstream-model","opaque":{"model":"opaque"}}`)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, changed, err := rewriteTopLevelModel(tt.body, upstreamModel)
+			if err != nil || !changed {
+				t.Fatalf("rewriteTopLevelModel=(%s,%v,%v), want canonical changed upstream model", got, changed, err)
+			}
+			models := topLevelSemanticModelValues(t, got)
+			if len(models) != 1 || models[0] != upstreamModel {
+				t.Fatalf("top-level semantic model values=%q, want one %q", models, upstreamModel)
+			}
+			var doc struct {
+				Opaque struct {
+					Model string `json:"model"`
+				} `json:"opaque"`
+			}
+			if err := json.Unmarshal(got, &doc); err != nil {
+				t.Fatalf("decode rewritten body: %v", err)
+			}
+			if doc.Opaque.Model != "opaque" {
+				t.Fatalf("opaque.model=%q, want unchanged opaque", doc.Opaque.Model)
+			}
+		})
+	}
+}
+
 func topLevelSemanticModelValues(t *testing.T, body []byte) []string {
 	t.Helper()
 	decoder := json.NewDecoder(bytes.NewReader(body))
@@ -3635,6 +3668,30 @@ func TestStreamChunkRewriterPreservesColonlessJSONScalarSSE(t *testing.T) {
 	}
 }
 
+func TestStreamChunkRewriterPreservesColonlessJSONScalarSSEAcrossPartitions(t *testing.T) {
+	for _, input := range [][]byte{[]byte("null\n\n"), []byte("true\n\n"), []byte("false\n\n"), []byte("\"scalar\"\n\n"), []byte("123\n\n"), []byte("-1\n\n")} {
+		for split := 0; split <= len(input); split++ {
+			r := newStreamChunkRewriter("client")
+			r.frameRawJSONAsSSE = true
+			first, err := r.Write(input[:split])
+			if err != nil {
+				t.Fatalf("input %q split %d first write error = %v", input, split, err)
+			}
+			second, err := r.Write(input[split:])
+			if err != nil {
+				t.Fatalf("input %q split %d second write error = %v", input, split, err)
+			}
+			flushed, err := r.Flush()
+			if err != nil {
+				t.Fatalf("input %q split %d flush error = %v", input, split, err)
+			}
+			if got := flattenChunks(append(append(first, second...), flushed...)); got != string(input) {
+				t.Fatalf("input %q split %d output = %q, want unchanged colonless field", input, split, got)
+			}
+		}
+	}
+}
+
 func TestStreamChunkRewriterBOMPartitionInvariant(t *testing.T) {
 	input := append([]byte{0xef, 0xbb, 0xbf}, []byte("data: {\"model\":\"upstream\"}\n\n")...)
 	var want string
@@ -5107,8 +5164,11 @@ func TestRunStreamForwardClosesHostStreamOnHTTPError(t *testing.T) {
 			}
 
 			_, _, err := prepareExecutorStream(&req, call)
-			if err == nil || err.Error() != "execute stream status 503: upstream failed" {
+			if err == nil || !strings.Contains(err.Error(), "execute stream status 503: upstream failed") {
 				t.Fatalf("prepareExecutorStream error = %v, want original status error", err)
+			}
+			if tt.closeErr != nil && !errors.Is(err, tt.closeErr) {
+				t.Fatalf("prepareExecutorStream error = %v, want close error %v", err, tt.closeErr)
 			}
 			if closeCalls != tt.wantClose {
 				t.Fatalf("host close calls = %d, want %d", closeCalls, tt.wantClose)
@@ -5496,6 +5556,7 @@ func TestShutdownExecutorStreamsWaitsForPreparingStreamCleanup(t *testing.T) {
 		return json.Marshal(pluginabi.Envelope{OK: true, Result: raw})
 	}
 	release := func() { releaseOnce.Do(func() { close(releaseSetup) }) }
+	closeErr := errors.New("prepared host stream close failed")
 	result := make(chan struct {
 		response []byte
 		err      error
@@ -5533,7 +5594,7 @@ func TestShutdownExecutorStreamsWaitsForPreparingStreamCleanup(t *testing.T) {
 				return nil, fmt.Errorf("closed stream %q", closeReq.StreamID)
 			}
 			hostCloseOnce.Do(func() { close(hostStreamClosed) })
-			return respond(map[string]any{})
+			return nil, closeErr
 		case "test.ping":
 			return respond(map[string]any{})
 		default:
@@ -5609,6 +5670,9 @@ func TestShutdownExecutorStreamsWaitsForPreparingStreamCleanup(t *testing.T) {
 	}
 	if envelope.OK {
 		t.Fatal("prepared stream was admitted during shutdown")
+	}
+	if envelope.Error == nil || !strings.Contains(envelope.Error.Message, "executor stream lifecycle is stopping") || !strings.Contains(envelope.Error.Message, closeErr.Error()) {
+		t.Fatalf("shutdown rejection error = %#v, want lifecycle and close errors", envelope.Error)
 	}
 	select {
 	case <-shutdownReturned:

@@ -447,6 +447,15 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 	if r.frameRawJSONAsSSE && isColonlessSSEChunk(p) {
 		return r.sse.Write(p)
 	}
+	trimmed := bytes.TrimSpace(p)
+	if r.frameRawJSONAsSSE && len(trimmed) > 0 && trimmed[0] != '{' && trimmed[0] != '[' && json.Valid(trimmed) {
+		if owned {
+			r.pending = p
+		} else {
+			r.pending = append(r.pending, p...)
+		}
+		return nil, nil
+	}
 	if couldStartJSONValue(p) {
 		chunks, consumed, ok, incomplete, err := r.tryRawJSONChunks(p)
 		if err != nil {
@@ -1278,10 +1287,13 @@ func prepareExecutorStream(req *executorRPCRequest, call hostCaller) (*executorS
 		call:           call,
 	}
 	if hostResp.StatusCode >= http.StatusBadRequest {
+		statusErr := fmt.Errorf("execute stream status %d: %s", hostResp.StatusCode, string(hostResp.Body))
 		if stream.hostStreamID != "" {
-			_ = stream.closeHost()
+			if closeErr := stream.closeHost(); closeErr != nil {
+				return nil, nil, errors.Join(statusErr, fmt.Errorf("close host stream: %w", closeErr))
+			}
 		}
-		return nil, nil, fmt.Errorf("execute stream status %d: %s", hostResp.StatusCode, string(hostResp.Body))
+		return nil, nil, statusErr
 	}
 	if stream.hostStreamID == "" {
 		return nil, nil, fmt.Errorf("missing host stream id")
@@ -1319,9 +1331,12 @@ func startExecutorStream(req executorRPCRequest, call hostCaller, closeStream fu
 		return nil, err
 	}
 	if !admitExecutorStream(stream) {
-		_ = stream.closeHost()
+		lifecycleErr := fmt.Errorf("executor stream lifecycle is stopping")
+		if closeErr := stream.closeHost(); closeErr != nil {
+			lifecycleErr = errors.Join(lifecycleErr, fmt.Errorf("close host stream: %w", closeErr))
+		}
 		finishExecutorStreamPreparation()
-		return nil, fmt.Errorf("executor stream lifecycle is stopping")
+		return nil, lifecycleErr
 	}
 	go func() {
 		defer unregisterExecutorStream(stream)
@@ -1639,7 +1654,7 @@ func rewriteTopLevelModelCanonical(body []byte, model string) ([]byte, bool, err
 		return bytes.Clone(body), false, nil
 	}
 	var current string
-	if err := json.Unmarshal(rawValue, &current); err != nil || current == model {
+	if err := json.Unmarshal(rawValue, &current); err != nil {
 		return bytes.Clone(body), false, nil
 	}
 	replacement, err := json.Marshal(model)
