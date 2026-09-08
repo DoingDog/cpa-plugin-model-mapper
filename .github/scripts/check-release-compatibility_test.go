@@ -39,6 +39,62 @@ func TestCheckGLIBCCompatibility(t *testing.T) {
 	}
 }
 
+func TestMakeDryRunNormalizesReleaseVersion(t *testing.T) {
+	makePath, err := exec.LookPath("make")
+	if err != nil {
+		t.Skip("make is not available")
+	}
+
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoRoot := wd
+	if _, err := os.Stat(filepath.Join(repoRoot, "Makefile")); err != nil {
+		repoRoot = filepath.Clean(filepath.Join(wd, "..", ".."))
+	}
+	if _, err := os.Stat(filepath.Join(repoRoot, "Makefile")); err != nil {
+		t.Fatalf("locate repository Makefile: %v", err)
+	}
+
+	for _, tt := range []struct {
+		target string
+		wants  []string
+	}{
+		{
+			target: "build-platform",
+			wants: []string{
+				"-X main.pluginVersion=0.5.2",
+				"printf '%s\\n' \"0.5.2\" > \"$out.version\"",
+			},
+		},
+		{
+			target: "package-platform",
+			wants: []string{
+				"-X main.pluginVersion=0.5.2",
+				"model-mapper_0.5.2_windows_amd64.zip",
+			},
+		},
+	} {
+		t.Run(tt.target, func(t *testing.T) {
+			cmd := exec.Command(makePath, "-n", tt.target, "VERSION=v0.5.2", "GOOS=windows", "GOARCH=amd64")
+			cmd.Dir = repoRoot
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("make -n %s: %v\n%s", tt.target, err, output)
+			}
+			for _, want := range tt.wants {
+				if !strings.Contains(string(output), want) {
+					t.Fatalf("make -n %s output missing %q:\n%s", tt.target, want, output)
+				}
+			}
+			if strings.Contains(string(output), "pluginVersion=v0.5.2") || strings.Contains(string(output), "model-mapper_v0.5.2_") {
+				t.Fatalf("make -n %s did not normalize version:\n%s", tt.target, output)
+			}
+		})
+	}
+}
+
 func TestPackagePlatformStopsAfterCompatibilityFailure(t *testing.T) {
 	makePath, err := exec.LookPath("make")
 	if err != nil {
@@ -63,7 +119,11 @@ func TestPackagePlatformStopsAfterCompatibilityFailure(t *testing.T) {
 	if err := os.MkdirAll(libraryDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(libraryDir, "model-mapper.so"), []byte("test library"), 0o644); err != nil {
+	libraryPath := filepath.Join(libraryDir, "model-mapper.so")
+	if err := os.WriteFile(libraryPath, []byte("test library"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(libraryPath+".version", []byte("0.5.1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	readelf := filepath.Join(tempDir, "readelf")

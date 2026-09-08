@@ -6,7 +6,9 @@ GOARCH ?=
 BUILD_CC ?=
 VERSION ?=
 LDFLAGS ?= -s -w
-VERSION_LDFLAGS := $(if $(VERSION),-X main.pluginVersion=$(VERSION),)
+RELEASE_VERSION := $(patsubst v%,%,$(VERSION))
+BUILD_VERSION := $(if $(RELEASE_VERSION),$(RELEASE_VERSION),0.0.0-dev)
+VERSION_LDFLAGS := $(if $(VERSION),-X main.pluginVersion=$(RELEASE_VERSION),)
 WINDOWS_AMD64_OUT := $(DIST_DIR)/windows_amd64/$(PLUGIN_NAME).dll
 LINUX_AMD64_OUT := $(DIST_DIR)/linux_amd64/$(PLUGIN_NAME).so
 LINUX_AMD64_CC ?=
@@ -31,7 +33,7 @@ build-platform:
 	mkdir -p "$$(dirname "$$out")"; \
 	if [ -n "$(BUILD_CC)" ]; then export CC="$(BUILD_CC)"; fi; \
 	if [ "$(GOOS)" = "darwin" ]; then export MACOSX_DEPLOYMENT_TARGET="$(MACOSX_DEPLOYMENT_TARGET)"; fi; \
-	CGO_ENABLED=1 GOOS="$(GOOS)" GOARCH="$(GOARCH)" $(GO) build -trimpath -buildmode=c-shared -ldflags='$(LDFLAGS) $(VERSION_LDFLAGS)' -o "$$out" .
+	CGO_ENABLED=1 GOOS="$(GOOS)" GOARCH="$(GOARCH)" $(GO) build -trimpath -buildmode=c-shared -ldflags='$(LDFLAGS) $(VERSION_LDFLAGS)' -o "$$out" . && printf '%s\n' "$(BUILD_VERSION)" > "$$out.version"
 
 build-windows-amd64:
 	$(MAKE) --no-print-directory build-platform GOOS=windows GOARCH=amd64 GO="$(GO)" DIST_DIR="$(DIST_DIR)" PLUGIN_NAME="$(PLUGIN_NAME)"
@@ -58,12 +60,12 @@ package-platform:
 			if ! command -v "$(OTOOL)" >/dev/null 2>&1; then echo "otool is required for macOS release checks"; exit 1; fi; \
 			"$(OTOOL)" -l "$$library" | GOOS= GOARCH= CGO_ENABLED= $(GO) run .github/scripts/check-release-compatibility.go -format macos -max "$(MACOSX_DEPLOYMENT_TARGET)" ;; \
 	esac; \
-	archive="$(DIST_DIR)/$(PLUGIN_NAME)_$(VERSION)_$(GOOS)_$(GOARCH).zip"; \
+	archive="$(DIST_DIR)/$(PLUGIN_NAME)_$(RELEASE_VERSION)_$(GOOS)_$(GOARCH).zip"; \
 	GOOS= GOARCH= CGO_ENABLED= $(GO) run .github/scripts/package-release.go -library "$$library" -archive "$$archive" -checksum "$$archive.sha256"
 
 package:
 	@if [ -n "$(GOOS)" ] || [ -n "$(GOARCH)" ]; then \
-		$(MAKE) --no-print-directory package-platform VERSION="$(VERSION)" GOOS="$(GOOS)" GOARCH="$(GOARCH)" GO="$(GO)" DIST_DIR="$(DIST_DIR)" PLUGIN_NAME="$(PLUGIN_NAME)" BUILD_CC="$(BUILD_CC)" LDFLAGS="$(LDFLAGS)" VERSION_LDFLAGS="$(VERSION_LDFLAGS)"; \
+		$(MAKE) --no-print-directory package-platform VERSION="$(VERSION)" GOOS="$(GOOS)" GOARCH="$(GOARCH)" GO="$(GO)" DIST_DIR="$(DIST_DIR)" PLUGIN_NAME="$(PLUGIN_NAME)" BUILD_CC="$(BUILD_CC)" LDFLAGS="$(LDFLAGS)"; \
 	else \
 		$(GO) run .github/scripts/package-release.go -version "$(VERSION)" -dist "$(DIST_DIR)" -out "$(DIST_DIR)/release"; \
 	fi

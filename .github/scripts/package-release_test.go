@@ -35,6 +35,8 @@ func TestResolveVersionValidatesReleaseGrammar(t *testing.T) {
 		{version: "vbeta"},
 		{version: "beta"},
 		{version: "v1"},
+		{version: "vv1.2.3"},
+		{version: "vv0.5.2"},
 		{version: "1.2"},
 		{version: "01.2.3"},
 	} {
