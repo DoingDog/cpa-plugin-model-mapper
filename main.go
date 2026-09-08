@@ -1120,20 +1120,40 @@ type executorStream struct {
 }
 
 var executorStreamLifecycle = struct {
-	mu       sync.Mutex
-	stopping bool
-	active   map[*executorStream]struct{}
-	wg       sync.WaitGroup
+	mu        sync.Mutex
+	stopping  bool
+	preparing int
+	shutdowns int
+	active    map[*executorStream]struct{}
+	wg        sync.WaitGroup
 }{active: make(map[*executorStream]struct{})}
 
 func resetExecutorStreamLifecycle() {
 	executorStreamLifecycle.mu.Lock()
 	defer executorStreamLifecycle.mu.Unlock()
-	if len(executorStreamLifecycle.active) != 0 {
+	if len(executorStreamLifecycle.active) != 0 || executorStreamLifecycle.preparing != 0 || executorStreamLifecycle.shutdowns != 0 {
 		return
 	}
 	executorStreamLifecycle.stopping = false
 	executorStreamLifecycle.active = make(map[*executorStream]struct{})
+}
+
+func beginExecutorStreamPreparation() bool {
+	executorStreamLifecycle.mu.Lock()
+	defer executorStreamLifecycle.mu.Unlock()
+	if executorStreamLifecycle.stopping {
+		return false
+	}
+	executorStreamLifecycle.preparing++
+	executorStreamLifecycle.wg.Add(1)
+	return true
+}
+
+func finishExecutorStreamPreparation() {
+	executorStreamLifecycle.mu.Lock()
+	executorStreamLifecycle.preparing--
+	executorStreamLifecycle.mu.Unlock()
+	executorStreamLifecycle.wg.Done()
 }
 
 func admitExecutorStream(stream *executorStream) bool {
@@ -1142,8 +1162,8 @@ func admitExecutorStream(stream *executorStream) bool {
 	if executorStreamLifecycle.stopping {
 		return false
 	}
+	executorStreamLifecycle.preparing--
 	executorStreamLifecycle.active[stream] = struct{}{}
-	executorStreamLifecycle.wg.Add(1)
 	return true
 }
 
@@ -1157,6 +1177,7 @@ func unregisterExecutorStream(stream *executorStream) {
 func shutdownExecutorStreams() {
 	executorStreamLifecycle.mu.Lock()
 	executorStreamLifecycle.stopping = true
+	executorStreamLifecycle.shutdowns++
 	streams := make([]*executorStream, 0, len(executorStreamLifecycle.active))
 	for stream := range executorStreamLifecycle.active {
 		streams = append(streams, stream)
@@ -1166,6 +1187,9 @@ func shutdownExecutorStreams() {
 		_ = stream.closeHost()
 	}
 	executorStreamLifecycle.wg.Wait()
+	executorStreamLifecycle.mu.Lock()
+	executorStreamLifecycle.shutdowns--
+	executorStreamLifecycle.mu.Unlock()
 }
 
 func (s *executorStream) closeHost() error {
@@ -1274,8 +1298,12 @@ func prepareExecutorStream(req *executorRPCRequest, call hostCaller) (*executorS
 }
 
 func startExecutorStream(req executorRPCRequest, call hostCaller, closeStream func(string, string) error) ([]byte, error) {
+	if !beginExecutorStreamPreparation() {
+		return nil, fmt.Errorf("executor stream lifecycle is stopping")
+	}
 	stream, headers, err := prepareExecutorStream(&req, call)
 	if err != nil {
+		finishExecutorStreamPreparation()
 		return nil, err
 	}
 	setup := pluginapi.ExecutorStreamResponse{Headers: headers}
@@ -1284,10 +1312,12 @@ func startExecutorStream(req executorRPCRequest, call hostCaller, closeStream fu
 	}{Headers: setup.Headers})
 	if err != nil {
 		_ = stream.closeHost()
+		finishExecutorStreamPreparation()
 		return nil, err
 	}
 	if !admitExecutorStream(stream) {
 		_ = stream.closeHost()
+		finishExecutorStreamPreparation()
 		return nil, fmt.Errorf("executor stream lifecycle is stopping")
 	}
 	go func() {
