@@ -965,11 +965,23 @@ type modelRouteRPCRequest struct {
 	Metadata       map[string]any
 }
 
+func canonicalizeHeaders(headers http.Header) {
+	for key, values := range headers {
+		canonical := http.CanonicalHeaderKey(key)
+		if canonical == key {
+			continue
+		}
+		headers[canonical] = append(headers[canonical], values...)
+		delete(headers, key)
+	}
+}
+
 func handleModelRoute(raw []byte) ([]byte, error) {
 	var req modelRouteRPCRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	canonicalizeHeaders(req.Headers)
 	scope := callerScopeFromMetadata(req.Metadata)
 	cfg := loadedConfig()
 	decision, err := routeModel(cfg, req.SourceFormat, req.RequestedModel, scope, callerAPIKeyForSelectedRules(cfg, req.SourceFormat, req.Headers, req.Query, scope))
@@ -1086,6 +1098,7 @@ func handleExecutorExecuteStream(raw []byte, call hostCaller) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	canonicalizeHeaders(req.Headers)
 	if req.StreamID == "" {
 		return nil, fmt.Errorf("missing plugin stream id")
 	}
@@ -1252,6 +1265,7 @@ func handleExecutorExecute(raw []byte, call hostCaller) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	canonicalizeHeaders(req.Headers)
 	scope := callerScopeFromMetadata(req.Metadata)
 	cfg := loadedConfig()
 	decision, err := routeModel(cfg, req.SourceFormat, req.Model, scope, callerAPIKeyForSelectedRules(cfg, req.SourceFormat, req.Headers, req.Query, scope))
@@ -1288,6 +1302,7 @@ func handleExecutorExecute(raw []byte, call hostCaller) ([]byte, error) {
 	if err := json.Unmarshal(hostRaw, &hostResp); err != nil {
 		return nil, err
 	}
+	canonicalizeHeaders(hostResp.Headers)
 	if hostResp.StatusCode >= 400 {
 		return nil, fmt.Errorf("host.model.execute status %d: %s", hostResp.StatusCode, string(hostResp.Body))
 	}

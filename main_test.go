@@ -1571,6 +1571,23 @@ func TestHandleModelRouteIgnoresUnusedBody(t *testing.T) {
 	}
 }
 
+func TestCanonicalizeHeadersMergesCaseVariants(t *testing.T) {
+	headers := http.Header{
+		"content-length": {"10"},
+		"Content-Length": {"11"},
+		"x-test":         {"lower"},
+		"X-Test":         {"canonical"},
+	}
+	canonicalizeHeaders(headers)
+
+	if len(headers) != 2 {
+		t.Fatalf("headers=%#v, want two canonical keys", headers)
+	}
+	if len(headers["Content-Length"]) != 2 || len(headers["X-Test"]) != 2 {
+		t.Fatalf("headers=%#v, want merged values", headers)
+	}
+}
+
 func TestHandleModelRouteUsesCallerScope(t *testing.T) {
 	scopedRules := "sk-test#a=>b"
 	tests := []struct {
@@ -1588,6 +1605,7 @@ func TestHandleModelRouteUsesCallerScope(t *testing.T) {
 		{name: "fallback for missing metadata", rules: scopedRules + ";a=>c", handled: true},
 		{name: "fallback for wrong scope", rules: scopedRules + ";a=>c", metadata: map[string]any{"caller_scope": callerScope("sk-other")}, handled: true},
 		{name: "wildcard scope", rules: "sk-kimi-*#a=>b", metadata: map[string]any{"caller_scope": callerScope("sk-kimi-team")}, headers: http.Header{"Authorization": {"Bearer sk-kimi-team"}}, handled: true},
+		{name: "wildcard scope from lowercase authorization", rules: "sk-kimi-*#a=>b", metadata: map[string]any{"caller_scope": callerScope("sk-kimi-lowercase")}, headers: http.Header{"authorization": {"Bearer sk-kimi-lowercase"}}, handled: true},
 		{name: "wildcard scope from query", rules: "sk-kimi-*#a=>b", metadata: map[string]any{"caller_scope": callerScope("sk-kimi-query")}, query: url.Values{"key": {"sk-kimi-query"}}, handled: true},
 		{name: "spoofed wildcard header", rules: "sk-kimi-*#a=>b", metadata: map[string]any{"caller_scope": callerScope("sk-other")}, headers: http.Header{"Authorization": {"Bearer sk-kimi-spoofed"}}, handled: false},
 		{name: "inverse exact other key", rules: "#sk-test#a=>b", metadata: map[string]any{"caller_scope": callerScope("sk-other")}, handled: true},
@@ -2572,6 +2590,57 @@ func TestHandleExecutorExecuteForwardsMappedRequestAndRestoresResponse(t *testin
 	}
 	if !strings.Contains(string(resp.Payload), `"model":"deepseek-v4-pro"`) {
 		t.Fatalf("payload=%s", resp.Payload)
+	}
+}
+
+func TestHandleExecutorExecuteCanonicalizesRequestAndResponseHeaders(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client-model=>upstream-model"})
+	for _, tt := range []struct {
+		name, responseBody, wantContentLength string
+	}{
+		{name: "changed response", responseBody: `{"model":"upstream-model"}`, wantContentLength: ""},
+		{name: "unchanged response", responseBody: `{"id":"response"}`, wantContentLength: "999"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rawReq, err := json.Marshal(rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+				Model:           "client-model",
+				Format:          "openai",
+				SourceFormat:    "openai",
+				Headers:         http.Header{"Content-Length": {"999"}},
+				OriginalRequest: []byte(`{"model":"client-model"}`),
+			}})
+			if err != nil {
+				t.Fatalf("marshal request: %v", err)
+			}
+			rawReq = bytes.Replace(rawReq, []byte(`"Content-Length"`), []byte(`"content-length"`), 1)
+			respRaw, err := handleExecutorExecute(rawReq, func(method string, payload any) (json.RawMessage, error) {
+				if method != pluginabi.MethodHostModelExecute {
+					t.Fatalf("method=%q, want %q", method, pluginabi.MethodHostModelExecute)
+				}
+				hostReq := payload.(hostModelExecutePayload)
+				if len(hostReq.Headers["Content-Length"]) != 0 || len(hostReq.Headers["content-length"]) != 0 {
+					t.Fatalf("forwarded headers=%#v, want no Content-Length", hostReq.Headers)
+				}
+				return json.Marshal(pluginapi.HostModelExecutionResponse{
+					StatusCode: http.StatusOK,
+					Headers:    http.Header{"content-length": {"999"}, "x-request-id": {"request-1"}},
+					Body:       []byte(tt.responseBody),
+				})
+			})
+			if err != nil {
+				t.Fatalf("handleExecutorExecute error = %v", err)
+			}
+			var response pluginapi.ExecutorResponse
+			if err := json.Unmarshal(respRaw, &response); err != nil {
+				t.Fatalf("decode executor response: %v", err)
+			}
+			if got := response.Headers.Get("Content-Length"); got != tt.wantContentLength {
+				t.Fatalf("response Content-Length=%q, want %q", got, tt.wantContentLength)
+			}
+			if got := response.Headers.Get("X-Request-Id"); got != "request-1" {
+				t.Fatalf("response X-Request-Id=%q, want request-1", got)
+			}
+		})
 	}
 }
 
