@@ -918,8 +918,10 @@ func selectRules(cfg Config, format string) ruleSelection {
 		specific = cfg.codexResponsesRules
 	case "openai":
 		specific = cfg.openAICompletionsRules
-	default:
+	case "gemini", "interactions":
 		return ruleSelection{first: cfg.globalRules}
+	default:
+		return ruleSelection{}
 	}
 	if len(specific) == 0 {
 		return ruleSelection{first: cfg.globalRules}
@@ -1354,38 +1356,47 @@ func decodeLifecycleConfig(raw []byte) (json.RawMessage, bool, error) {
 	if len(trimmed) == 0 {
 		return nil, false, nil
 	}
-	var lifecycle struct {
-		ConfigYAML string `json:"config_yaml"`
+	var lifecycle map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &lifecycle); err != nil {
+		return append(json.RawMessage(nil), trimmed...), false, nil
 	}
-	if err := json.Unmarshal(trimmed, &lifecycle); err == nil && lifecycle.ConfigYAML != "" {
-		decoded, err := base64.StdEncoding.DecodeString(lifecycle.ConfigYAML)
-		if err != nil {
-			return nil, true, err
-		}
-		var yamlConfig lifecycleYAMLConfig
-		if err := yaml.Unmarshal(decoded, &yamlConfig); err != nil {
-			return nil, true, err
-		}
-		rulesStackMode := ""
-		if node := yamlConfig.RulesStackMode; node.Kind != 0 {
-			if node.Kind != yaml.ScalarNode || node.Tag != "!!str" {
-				return nil, true, fmt.Errorf("rules_stack_mode must be a string")
-			}
-			rulesStackMode = node.Value
-		}
-		cfgRaw, err := json.Marshal(Config{
-			GlobalRules:            yamlConfig.GlobalRules,
-			ClaudeMessagesRules:    yamlConfig.ClaudeMessagesRules,
-			CodexResponsesRules:    yamlConfig.CodexResponsesRules,
-			OpenAICompletionsRules: yamlConfig.OpenAICompletionsRules,
-			RulesStackMode:         rulesStackMode,
-		})
-		if err != nil {
-			return nil, true, err
-		}
-		return cfgRaw, true, nil
+	encoded, ok := lifecycle["config_yaml"]
+	if !ok {
+		return append(json.RawMessage(nil), trimmed...), false, nil
 	}
-	return append(json.RawMessage(nil), trimmed...), false, nil
+	var configYAML *string
+	if err := json.Unmarshal(encoded, &configYAML); err != nil || configYAML == nil {
+		if err != nil {
+			return nil, true, fmt.Errorf("config_yaml must be a string: %w", err)
+		}
+		return nil, true, fmt.Errorf("config_yaml must be a string")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(*configYAML)
+	if err != nil {
+		return nil, true, err
+	}
+	var yamlConfig lifecycleYAMLConfig
+	if err := yaml.Unmarshal(decoded, &yamlConfig); err != nil {
+		return nil, true, err
+	}
+	rulesStackMode := ""
+	if node := yamlConfig.RulesStackMode; node.Kind != 0 {
+		if node.Kind != yaml.ScalarNode || node.Tag != "!!str" {
+			return nil, true, fmt.Errorf("rules_stack_mode must be a string")
+		}
+		rulesStackMode = node.Value
+	}
+	cfgRaw, err := json.Marshal(Config{
+		GlobalRules:            yamlConfig.GlobalRules,
+		ClaudeMessagesRules:    yamlConfig.ClaudeMessagesRules,
+		CodexResponsesRules:    yamlConfig.CodexResponsesRules,
+		OpenAICompletionsRules: yamlConfig.OpenAICompletionsRules,
+		RulesStackMode:         rulesStackMode,
+	})
+	if err != nil {
+		return nil, true, err
+	}
+	return cfgRaw, true, nil
 }
 
 func callHost(method string, payload any) (json.RawMessage, error) {

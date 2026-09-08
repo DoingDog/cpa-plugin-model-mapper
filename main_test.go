@@ -137,6 +137,64 @@ func TestApplyLifecycleConfigPublishesCompiledSnapshot(t *testing.T) {
 	}
 }
 
+func TestApplyLifecycleConfigRejectsNonStringConfigYAMLAtomically(t *testing.T) {
+	t.Cleanup(func() { setLoadedConfigForTest(defaultConfig()) })
+
+	for _, raw := range []string{
+		`{"config_yaml":123}`,
+		`{"config_yaml":null}`,
+		`{"config_yaml":{}}`,
+		`{"config_yaml":[]}`,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			setLoadedConfigForTest(Config{GlobalRules: "old=>target"})
+			err := applyLifecycleConfig([]byte(raw))
+			if err == nil || !strings.Contains(err.Error(), "config_yaml must be a string") {
+				t.Fatalf("applyLifecycleConfig error = %v", err)
+			}
+			decision, err := routeModel(loadedConfig(), "openai", "old", "", "")
+			if err != nil {
+				t.Fatalf("routeModel error = %v", err)
+			}
+			if !decision.Handled || decision.UpstreamModel != "target" {
+				t.Fatalf("decision=%#v, want old=>target", decision)
+			}
+		})
+	}
+}
+
+func TestDecodeLifecycleConfigDistinguishesDirectAndEmptyLifecycleConfig(t *testing.T) {
+	direct, lifecycle, err := decodeLifecycleConfig([]byte(`{"global_rules":"a=>b"}`))
+	if err != nil {
+		t.Fatalf("decode direct config: %v", err)
+	}
+	if lifecycle {
+		t.Fatal("direct config reported as lifecycle config")
+	}
+	cfg, err := decodeConfig(direct)
+	if err != nil {
+		t.Fatalf("decode direct config: %v", err)
+	}
+	if cfg.GlobalRules != "a=>b" {
+		t.Fatalf("global rules = %q, want a=>b", cfg.GlobalRules)
+	}
+
+	empty, lifecycle, err := decodeLifecycleConfig([]byte(`{"config_yaml":""}`))
+	if err != nil {
+		t.Fatalf("decode empty lifecycle config: %v", err)
+	}
+	if !lifecycle {
+		t.Fatal("empty lifecycle config reported as direct config")
+	}
+	cfg, err = decodeConfig(empty)
+	if err != nil {
+		t.Fatalf("decode empty lifecycle config: %v", err)
+	}
+	if cfg.GlobalRules != "" {
+		t.Fatalf("global rules = %q, want empty", cfg.GlobalRules)
+	}
+}
+
 func BenchmarkApplyLifecycleConfig(b *testing.B) {
 	var rules strings.Builder
 	for i := 0; i < 64; i++ {
@@ -1166,6 +1224,16 @@ func TestRuleSelectionGlobalOnlyFormats(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestRuleSelectionRejectsUnknownFormat(t *testing.T) {
+	decision, err := routeModel(Config{GlobalRules: "client=>global"}, "unknown", "client", "", "")
+	if err != nil {
+		t.Fatalf("routeModel error = %v", err)
+	}
+	if decision.Handled {
+		t.Fatalf("decision=%#v, want unhandled", decision)
 	}
 }
 
