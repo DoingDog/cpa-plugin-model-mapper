@@ -1597,22 +1597,140 @@ func callHost(method string, payload any) (json.RawMessage, error) {
 }
 
 func rewriteTopLevelModel(body []byte, model string) ([]byte, bool, error) {
-	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(body, &doc); err != nil {
+	if !json.Valid(body) {
+		return bytes.Clone(body), false, nil
+	}
+	start, end, found := findTopLevelModelValue(body)
+	if !found {
+		return bytes.Clone(body), false, nil
+	}
+	var current string
+	if err := json.Unmarshal(body[start:end], &current); err != nil || current == model {
 		return bytes.Clone(body), false, nil
 	}
 	replacement, err := json.Marshal(model)
 	if err != nil {
 		return nil, false, err
 	}
-	if !rewriteRawStringField(doc, "model", model, replacement) {
-		return bytes.Clone(body), false, nil
-	}
-	out, err := json.Marshal(doc)
-	if err != nil {
-		return nil, false, err
-	}
+	out := make([]byte, len(body)-end+start+len(replacement))
+	n := copy(out, body[:start])
+	n += copy(out[n:], replacement)
+	copy(out[n:], body[end:])
 	return out, true, nil
+}
+
+func findTopLevelModelValue(body []byte) (int, int, bool) {
+	i := skipTopLevelModelJSONSpace(body, 0)
+	if i == len(body) || body[i] != '{' {
+		return 0, 0, false
+	}
+	i++
+	start, end, found := 0, 0, false
+	for {
+		i = skipTopLevelModelJSONSpace(body, i)
+		if i == len(body) || body[i] == '}' {
+			return start, end, found
+		}
+		keyStart := i
+		i = skipTopLevelModelJSONString(body, i)
+		keyMatches := topLevelModelKey(body[keyStart:i])
+		i = skipTopLevelModelJSONSpace(body, i)
+		if i == len(body) || body[i] != ':' {
+			return 0, 0, false
+		}
+		i = skipTopLevelModelJSONSpace(body, i+1)
+		if i == len(body) {
+			return 0, 0, false
+		}
+		valueStart := i
+		i = skipTopLevelModelJSONValue(body, i)
+		if keyMatches {
+			start, end, found = valueStart, i, true
+		}
+		i = skipTopLevelModelJSONSpace(body, i)
+		if i == len(body) || body[i] == '}' {
+			return start, end, found
+		}
+		if body[i] != ',' {
+			return 0, 0, false
+		}
+		i++
+	}
+}
+
+func topLevelModelKey(raw []byte) bool {
+	if bytes.Equal(raw, []byte(`"model"`)) {
+		return true
+	}
+	if bytes.IndexByte(raw, '\\') < 0 {
+		return false
+	}
+	var key string
+	return json.Unmarshal(raw, &key) == nil && key == "model"
+}
+
+func skipTopLevelModelJSONSpace(body []byte, i int) int {
+	for i < len(body) {
+		switch body[i] {
+		case ' ', '\t', '\r', '\n':
+			i++
+		default:
+			return i
+		}
+	}
+	return i
+}
+
+func skipTopLevelModelJSONString(body []byte, i int) int {
+	escaped := false
+	for i++; i < len(body); i++ {
+		if escaped {
+			escaped = false
+			continue
+		}
+		switch body[i] {
+		case '\\':
+			escaped = true
+		case '"':
+			return i + 1
+		}
+	}
+	return i
+}
+
+func skipTopLevelModelJSONValue(body []byte, i int) int {
+	switch body[i] {
+	case '"':
+		return skipTopLevelModelJSONString(body, i)
+	case '{', '[':
+		depth := 0
+		inString, escaped := false, false
+		for ; i < len(body); i++ {
+			switch {
+			case inString && escaped:
+				escaped = false
+			case inString && body[i] == '\\':
+				escaped = true
+			case inString && body[i] == '"':
+				inString = false
+			case !inString && body[i] == '"':
+				inString = true
+			case !inString && (body[i] == '{' || body[i] == '['):
+				depth++
+			case !inString && (body[i] == '}' || body[i] == ']'):
+				depth--
+				if depth == 0 {
+					return i + 1
+				}
+			}
+		}
+		return i
+	default:
+		for i < len(body) && body[i] != ',' && body[i] != '}' && body[i] != ']' && body[i] != ' ' && body[i] != '\t' && body[i] != '\r' && body[i] != '\n' {
+			i++
+		}
+		return i
+	}
 }
 
 func hexNibble(c byte) (byte, bool) {

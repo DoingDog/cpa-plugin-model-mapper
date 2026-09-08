@@ -2,8 +2,8 @@ package main
 
 import (
 	"bytes"
-	"fmt"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -35,6 +35,157 @@ func BenchmarkCallerPatternCacheRetention(b *testing.B) {
 				retained := len(callerPatternCache.current) + len(callerPatternCache.previous)
 				callerPatternCacheMu.RUnlock()
 				b.ReportMetric(float64(retained), "retained-entries")
+			}
+		})
+	}
+}
+
+var (
+	benchmarkRewriteTopLevelModelOutput  []byte
+	benchmarkRewriteTopLevelModelChanged bool
+)
+
+func BenchmarkRewriteTopLevelModel(b *testing.B) {
+	for _, benchmark := range []struct {
+		name string
+		size int
+	}{
+		{name: "1KiB", size: 1 << 10},
+		{name: "64KiB", size: 64 << 10},
+		{name: "1MiB", size: 1 << 20},
+		{name: "8MiB", size: 8 << 20},
+	} {
+		b.Run(benchmark.name, func(b *testing.B) {
+			body := rewriteTopLevelModelBenchmarkFixture(benchmark.size)
+			out, changed, err := rewriteTopLevelModel(body, "client")
+			if err != nil {
+				b.Fatal(err)
+			}
+			if !changed {
+				b.Fatal("changed=false, want true")
+			}
+			var decoded struct {
+				Model  string `json:"model"`
+				Opaque []struct {
+					Model string `json:"model"`
+				} `json:"opaque"`
+			}
+			if err := json.Unmarshal(out, &decoded); err != nil {
+				b.Fatalf("decode output: %v", err)
+			}
+			if decoded.Model != "client" || len(decoded.Opaque) != 1 || decoded.Opaque[0].Model != "opaque" {
+				b.Fatalf("decoded=%#v, want top-level client and opaque nested model", decoded)
+			}
+			benchmarkRewriteTopLevelModelOutput = out
+			benchmarkRewriteTopLevelModelChanged = changed
+
+			b.ReportAllocs()
+			b.SetBytes(int64(len(body)))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				out, changed, err = rewriteTopLevelModel(body, "client")
+				if err != nil {
+					b.Fatal(err)
+				}
+				benchmarkRewriteTopLevelModelOutput = out
+				benchmarkRewriteTopLevelModelChanged = changed
+			}
+		})
+	}
+}
+
+func rewriteTopLevelModelBenchmarkFixture(size int) []byte {
+	prefix := []byte(`{"model":"upstream","opaque":[{"model":"opaque","payload":"`)
+	suffix := []byte(`"}]}`)
+	body := make([]byte, 0, size)
+	body = append(body, prefix...)
+	body = append(body, bytes.Repeat([]byte("x"), size-len(prefix)-len(suffix))...)
+	return append(body, suffix...)
+}
+
+func TestRewriteTopLevelModelPreservesValidatedOpaqueBytes(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    []byte
+		changed bool
+	}{
+		{
+			name: "normal whitespace and nested tool content",
+			body: []byte(`{
+  "model" : "upstream",
+  "opaque" : {"model":"opaque","tool":{"model":"tool-opaque"},"content":[{"model":"content-opaque"}]}
+}`),
+			changed: true,
+		},
+		{
+			name:    "escaped top-level key",
+			body:    []byte(fmt.Sprintf(`{"%cu006dodel":"upstream","opaque":{"model":"opaque","tool":{"model":"tool-opaque"},"content":[{"model":"content-opaque"}]}}`, 92)),
+			changed: true,
+		},
+		{
+			name:    "escaped current model string",
+			body:    []byte(fmt.Sprintf(`{"model":"up%cu0073tream","opaque":{"model":"opaque","tool":{"model":"tool-opaque"},"content":[{"model":"content-opaque"}]}}`, 92)),
+			changed: true,
+		},
+		{
+			name:    "last duplicate model wins",
+			body:    []byte(`{"model":"earlier","opaque":{"model":"opaque","tool":{"model":"tool-opaque"},"content":[{"model":"content-opaque"}]},"model":"upstream"}`),
+			changed: true,
+		},
+		{
+			name:    "last model is non-string",
+			body:    []byte(`{"model":"upstream","opaque":{"model":"opaque","tool":{"model":"tool-opaque"},"content":[{"model":"content-opaque"}]},"model":123}`),
+			changed: false,
+		},
+		{
+			name:    "missing model",
+			body:    []byte(`{"opaque":{"model":"opaque","tool":{"model":"tool-opaque"},"content":[{"model":"content-opaque"}]}}`),
+			changed: false,
+		},
+		{
+			name:    "invalid JSON after valid prefix",
+			body:    []byte(`{"model":"upstream","opaque":{"model":"opaque","tool":{"model":"tool-opaque"},"content":[{"model":"content-opaque"}]},"broken":`),
+			changed: false,
+		},
+		{
+			name:    "requested model already equal",
+			body:    []byte(fmt.Sprintf(`{"model":"cl%cu0069ent","opaque":{"model":"opaque","tool":{"model":"tool-opaque"},"content":[{"model":"content-opaque"}]}}`, 92)),
+			changed: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, changed, err := rewriteTopLevelModel(tt.body, "client")
+			if err != nil {
+				t.Fatalf("rewriteTopLevelModel error = %v", err)
+			}
+			if changed != tt.changed {
+				t.Fatalf("changed=%v, want %v", changed, tt.changed)
+			}
+			if !tt.changed {
+				if !bytes.Equal(got, tt.body) {
+					t.Fatalf("body=%q, want byte-identical clone %q", got, tt.body)
+				}
+				return
+			}
+
+			var decoded struct {
+				Model  string `json:"model"`
+				Opaque struct {
+					Model string `json:"model"`
+					Tool  struct {
+						Model string `json:"model"`
+					} `json:"tool"`
+					Content []struct {
+						Model string `json:"model"`
+					} `json:"content"`
+				} `json:"opaque"`
+			}
+			if err := json.Unmarshal(got, &decoded); err != nil {
+				t.Fatalf("decode output: %v", err)
+			}
+			if decoded.Model != "client" || decoded.Opaque.Model != "opaque" || decoded.Opaque.Tool.Model != "tool-opaque" || len(decoded.Opaque.Content) != 1 || decoded.Opaque.Content[0].Model != "content-opaque" {
+				t.Fatalf("rewritten document=%s, opaque values changed", got)
 			}
 		})
 	}

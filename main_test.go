@@ -2734,6 +2734,26 @@ func TestHandleExecutorExecuteResponseContentLength(t *testing.T) {
 	}
 }
 
+func requireMatchingTopLevelRawJSON(t *testing.T, got, want []byte) {
+	t.Helper()
+	var gotFields, wantFields map[string]json.RawMessage
+	if err := json.Unmarshal(got, &gotFields); err != nil {
+		t.Fatalf("decode forwarded body: %v", err)
+	}
+	if err := json.Unmarshal(want, &wantFields); err != nil {
+		t.Fatalf("decode expected body: %v", err)
+	}
+	if len(gotFields) != len(wantFields) {
+		t.Fatalf("forwarded top-level field count=%d, want %d", len(gotFields), len(wantFields))
+	}
+	for key, wantValue := range wantFields {
+		gotValue, ok := gotFields[key]
+		if !ok || !bytes.Equal(gotValue, wantValue) {
+			t.Fatalf("forwarded %s=%s, want %s", key, gotValue, wantValue)
+		}
+	}
+}
+
 func TestHandleExecutorExecuteAllFormats(t *testing.T) {
 	const (
 		requestWithModel = `{"model":"client-model","nested":{"model":"client-model","content":"client-model in nested content"},"content":[{"text":"client-model in content"}],"tools":[{"arguments":"client-model in tool arguments"}]}`
@@ -2779,9 +2799,7 @@ func TestHandleExecutorExecuteAllFormats(t *testing.T) {
 				if hostReq.EntryProtocol != format || hostReq.ExitProtocol != format || hostReq.Model != "upstream-model" {
 					t.Fatalf("forwarded request=(EntryProtocol=%q, ExitProtocol=%q, Model=%q), want format=%q and upstream-model", hostReq.EntryProtocol, hostReq.ExitProtocol, hostReq.Model, format)
 				}
-				if !bytes.Equal(hostReq.Body, request.want) {
-					t.Fatalf("forwarded body=%s, want %s", hostReq.Body, request.want)
-				}
+				requireMatchingTopLevelRawJSON(t, hostReq.Body, request.want)
 				return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: http.StatusOK, Body: []byte(upstreamResponse)})
 			})
 			if err != nil {
@@ -3457,9 +3475,7 @@ func TestHandleExecutorExecuteStreamAllFormats(t *testing.T) {
 			if forwarded.EntryProtocol != format || forwarded.ExitProtocol != format || forwarded.Model != "upstream-model" {
 				t.Fatalf("forwarded request=(EntryProtocol=%q, ExitProtocol=%q, Model=%q), want format=%q and upstream-model", forwarded.EntryProtocol, forwarded.ExitProtocol, forwarded.Model, format)
 			}
-			if !bytes.Equal(forwarded.Body, request.want) {
-				t.Fatalf("forwarded body=%s, want %s", forwarded.Body, request.want)
-			}
+			requireMatchingTopLevelRawJSON(t, forwarded.Body, request.want)
 			if got := strings.Join(emitted, ""); got != restoredResponse {
 				t.Fatalf("emitted=%s, want %s", got, restoredResponse)
 			}
