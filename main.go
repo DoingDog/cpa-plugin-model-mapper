@@ -217,6 +217,7 @@ func (r *sseRewriter) rewriteMultiDataEvent(out [][]byte, event []byte) ([][]byt
 	dataFields := 0
 	nonDataFields := 0
 	hasMarker := false
+	var markerScanner responseModelMarkerScanner
 	for remaining := event; len(remaining) > 0; {
 		line, _, next := splitSSELine(remaining)
 		remaining = next
@@ -227,10 +228,21 @@ func (r *sseRewriter) rewriteMultiDataEvent(out [][]byte, event []byte) ([][]byt
 		value := sseFieldValue(line)
 		if dataFields > 0 {
 			joinedLen++
+			if !hasMarker {
+				hasMarker = markerScanner.feed('\n')
+			}
 		}
 		joinedLen += len(value)
 		if !hasMarker && mightContainResponseModelField(value) {
 			hasMarker = true
+		}
+		if !hasMarker {
+			for _, b := range value {
+				if markerScanner.feed(b) {
+					hasMarker = true
+					break
+				}
+			}
 		}
 		dataFields++
 	}

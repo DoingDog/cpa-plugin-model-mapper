@@ -2376,6 +2376,18 @@ func TestSSERewriterJoinsMultiDataJSONBeforeRestoring(t *testing.T) {
 	}
 }
 
+func TestSSERewriterRestoresEscapedKeyAcrossDataFields(t *testing.T) {
+	backslash := string(rune(92))
+	lf := string([]byte{10})
+	input := `data: {"` + backslash + `u006dodel"` + lf + `data: :"upstream"}` + lf + lf
+
+	chunks, err := newSSERewriter("client").Write([]byte(input))
+	want := `data: {"model":"client"}` + lf + lf
+	if err != nil || flattenChunks(chunks) != want {
+		t.Fatalf("Write=(%q,%v), want %q", chunks, err, want)
+	}
+}
+
 func TestSSERewriterPreservesMultilineEventBoundaries(t *testing.T) {
 	r := newSSERewriter("A")
 	out, err := r.Write([]byte("event: message\ndata: {\"model\":\"B\"}\nid: 1\n\n"))
