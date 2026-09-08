@@ -191,6 +191,39 @@ func TestRewriteTopLevelModelPreservesValidatedOpaqueBytes(t *testing.T) {
 	}
 }
 
+func TestRewriteTopLevelModelLeavesNullModelUnchanged(t *testing.T) {
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{
+			name: "top-level model null",
+			body: []byte(`{"model":null,"opaque":{"model":"opaque"}}`),
+		},
+		{
+			name: "last duplicate model null",
+			body: []byte(`{"model":"upstream","opaque":{"model":"opaque"},"model":null}`),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, changed, err := rewriteTopLevelModel(tt.body, "client")
+			if err != nil {
+				t.Fatalf("rewriteTopLevelModel error = %v", err)
+			}
+			if changed {
+				t.Fatal("changed=true, want false")
+			}
+			if !bytes.Equal(got, tt.body) {
+				t.Fatalf("body=%q, want byte-identical clone %q", got, tt.body)
+			}
+			if len(got) > 0 && &got[0] == &tt.body[0] {
+				t.Fatal("body aliases input, want clone")
+			}
+		})
+	}
+}
+
 func TestMightContainResponseModelFieldIgnoresEscapedTextMarker(t *testing.T) {
 	body := append([]byte(`{"text":"`), bytes.Repeat([]byte{0x5c, 'u', '0', '0', '6', '1'}, 4096)...)
 	body = append(body, []byte(`"}`)...)

@@ -1604,8 +1604,12 @@ func rewriteTopLevelModel(body []byte, model string) ([]byte, bool, error) {
 	if !found {
 		return bytes.Clone(body), false, nil
 	}
+	rawValue := body[start:end]
+	if len(rawValue) < 2 || rawValue[0] != '"' || rawValue[len(rawValue)-1] != '"' {
+		return bytes.Clone(body), false, nil
+	}
 	var current string
-	if err := json.Unmarshal(body[start:end], &current); err != nil || current == model {
+	if err := json.Unmarshal(rawValue, &current); err != nil || current == model {
 		return bytes.Clone(body), false, nil
 	}
 	replacement, err := json.Marshal(model)
