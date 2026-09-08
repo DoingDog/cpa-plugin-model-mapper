@@ -66,11 +66,7 @@ func run(args []string) error {
 }
 
 func packageExistingArtifacts(version, distDir, outDir string) error {
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		return fmt.Errorf("create output dir %s: %w", outDir, err)
-	}
-
-	zipPaths := make([]string, 0, len(artifactSpecs()))
+	artifacts := make([]artifactSpec, 0, len(artifactSpecs()))
 	for _, artifact := range artifactSpecs() {
 		binaryPath := artifact.binaryPath(distDir)
 		if _, err := os.Stat(binaryPath); err != nil {
@@ -79,15 +75,33 @@ func packageExistingArtifacts(version, distDir, outDir string) error {
 			}
 			return fmt.Errorf("stat artifact %s: %w", filepath.ToSlash(binaryPath), err)
 		}
+		versionPath := binaryPath + ".version"
+		versionBytes, err := os.ReadFile(versionPath)
+		if err != nil {
+			return fmt.Errorf("read artifact version %s: want %q: %w", filepath.ToSlash(versionPath), version, err)
+		}
+		builtVersion := strings.TrimSpace(string(versionBytes))
+		if builtVersion != version {
+			return fmt.Errorf("artifact %s was built as %q, want %q", filepath.ToSlash(binaryPath), builtVersion, version)
+		}
+		artifacts = append(artifacts, artifact)
+	}
+	if len(artifacts) == 0 {
+		return fmt.Errorf("no supported artifacts found under %s", filepath.ToSlash(distDir))
+	}
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return fmt.Errorf("create output dir %s: %w", outDir, err)
+	}
+
+	zipPaths := make([]string, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		binaryPath := artifact.binaryPath(distDir)
 		zipName := fmt.Sprintf("%s_%s_%s_%s.zip", pluginName, version, artifact.osName, artifact.arch)
 		zipPath := filepath.Join(outDir, zipName)
 		if err := packageLibrary(binaryPath, zipPath); err != nil {
 			return err
 		}
 		zipPaths = append(zipPaths, zipPath)
-	}
-	if len(zipPaths) == 0 {
-		return fmt.Errorf("no supported artifacts found under %s", filepath.ToSlash(distDir))
 	}
 	return writeChecksums(filepath.Join(outDir, "checksums.txt"), zipPaths)
 }

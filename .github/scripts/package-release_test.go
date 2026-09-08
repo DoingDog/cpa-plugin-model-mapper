@@ -144,6 +144,58 @@ func TestPackageLibraryWritesRootLibraryEntryAndChecksum(t *testing.T) {
 	}
 }
 
+func TestPackageExistingArtifactsRejectsUnverifiedVersionsBeforeWriting(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		version      string
+		writeSidecar bool
+	}{
+		{name: "missing sidecar"},
+		{name: "empty sidecar", writeSidecar: true},
+		{name: "development version", version: "0.0.0-dev\n", writeSidecar: true},
+		{name: "different release version", version: "0.5.1\n", writeSidecar: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			dist := filepath.Join(dir, "dist")
+			out := filepath.Join(dir, "release")
+			validPath := filepath.Join(dist, "linux_amd64", "model-mapper.so")
+			invalidPath := filepath.Join(dist, "windows_amd64", "model-mapper.dll")
+			for _, path := range []string{validPath, invalidPath} {
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("plugin"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(validPath+".version", []byte("0.5.2\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if tt.writeSidecar {
+				if err := os.WriteFile(invalidPath+".version", []byte(tt.version), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			err := packageExistingArtifacts("0.5.2", dist, out)
+			if err == nil {
+				t.Fatal("packageExistingArtifacts error = nil, want unverified artifact error")
+			}
+			if !strings.Contains(err.Error(), filepath.ToSlash(invalidPath)) || !strings.Contains(err.Error(), "0.5.2") {
+				t.Fatalf("packageExistingArtifacts error = %q, want offending artifact and expected version", err)
+			}
+			entries, readErr := os.ReadDir(out)
+			if readErr != nil && !os.IsNotExist(readErr) {
+				t.Fatal(readErr)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("output directory contains files: %v", entries)
+			}
+		})
+	}
+}
+
 func TestPackageExistingArtifactsUsesSha256sumFormat(t *testing.T) {
 	dir := t.TempDir()
 	dist := filepath.Join(dir, "dist")
@@ -156,10 +208,18 @@ func TestPackageExistingArtifactsUsesSha256sumFormat(t *testing.T) {
 	if err := os.MkdirAll(windowsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(linuxDir, "model-mapper.so"), []byte("linux"), 0o644); err != nil {
+	linuxPath := filepath.Join(linuxDir, "model-mapper.so")
+	if err := os.WriteFile(linuxPath, []byte("linux"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(windowsDir, "model-mapper.dll"), []byte("windows"), 0o644); err != nil {
+	if err := os.WriteFile(linuxPath+".version", []byte("0.1.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	windowsPath := filepath.Join(windowsDir, "model-mapper.dll")
+	if err := os.WriteFile(windowsPath, []byte("windows"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(windowsPath+".version", []byte("0.1.0\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
