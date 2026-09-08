@@ -1734,6 +1734,76 @@ func TestRewriteRequestModelTopLevelOnly(t *testing.T) {
 	}
 }
 
+func TestRewriteRequestModelCanonicalizesDuplicateSemanticModelKeys(t *testing.T) {
+	const upstreamModel = "upstream-model"
+	for _, tt := range []struct {
+		name string
+		body []byte
+	}{
+		{name: "literal duplicate", body: []byte(`{"model":"client-earlier","model":"client-later","opaque":{"model":"opaque"}}`)},
+		{name: "literal and escaped duplicate", body: []byte(`{"model":"client-earlier","` + string(rune(92)) + `u006dodel":"client-later","opaque":{"model":"opaque"}}`)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, changed, err := rewriteRequestModel(tt.body, upstreamModel)
+			if err != nil || !changed {
+				t.Fatalf("rewriteRequestModel=(%s,%v,%v), want changed upstream model", got, changed, err)
+			}
+			models := topLevelSemanticModelValues(t, got)
+			if len(models) != 1 {
+				t.Fatalf("top-level semantic model values=%q, want exactly one", models)
+			}
+			if models[0] != upstreamModel {
+				t.Fatalf("first-wins model=%q, want %q", models[0], upstreamModel)
+			}
+			if models[len(models)-1] != upstreamModel {
+				t.Fatalf("last-wins model=%q, want %q", models[len(models)-1], upstreamModel)
+			}
+			var doc struct {
+				Opaque struct {
+					Model string `json:"model"`
+				} `json:"opaque"`
+			}
+			if err := json.Unmarshal(got, &doc); err != nil {
+				t.Fatalf("decode rewritten body: %v", err)
+			}
+			if doc.Opaque.Model != "opaque" {
+				t.Fatalf("opaque.model=%q, want unchanged opaque", doc.Opaque.Model)
+			}
+		})
+	}
+}
+
+func topLevelSemanticModelValues(t *testing.T, body []byte) []string {
+	t.Helper()
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		t.Fatalf("read object start=(%v,%v), want {", token, err)
+	}
+	var models []string
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			t.Fatalf("read key: %v", err)
+		}
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
+			t.Fatalf("read value for %q: %v", key, err)
+		}
+		if key != "model" {
+			continue
+		}
+		var model string
+		if err := json.Unmarshal(raw, &model); err != nil {
+			t.Fatalf("decode model value %s: %v", raw, err)
+		}
+		models = append(models, model)
+	}
+	if token, err := decoder.Token(); err != nil || token != json.Delim('}') {
+		t.Fatalf("read object end=(%v,%v), want }", token, err)
+	}
+	return models
+}
+
 func TestRewriteRequestModelLeavesUnsupportedBodiesUnchanged(t *testing.T) {
 	tests := [][]byte{
 		[]byte(`{"payload":{"model":"A"}}`),

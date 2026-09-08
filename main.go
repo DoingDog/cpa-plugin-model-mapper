@@ -1603,9 +1603,12 @@ func rewriteTopLevelModel(body []byte, model string) ([]byte, bool, error) {
 	if !json.Valid(body) {
 		return bytes.Clone(body), false, nil
 	}
-	start, end, found := findTopLevelModelValue(body)
+	start, end, found, duplicate := findTopLevelModelValue(body)
 	if !found {
 		return bytes.Clone(body), false, nil
+	}
+	if duplicate {
+		return rewriteTopLevelModelCanonical(body, model)
 	}
 	rawValue := body[start:end]
 	if len(rawValue) < 2 || rawValue[0] != '"' || rawValue[len(rawValue)-1] != '"' {
@@ -1626,40 +1629,66 @@ func rewriteTopLevelModel(body []byte, model string) ([]byte, bool, error) {
 	return out, true, nil
 }
 
-func findTopLevelModelValue(body []byte) (int, int, bool) {
+func rewriteTopLevelModelCanonical(body []byte, model string) ([]byte, bool, error) {
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return bytes.Clone(body), false, nil
+	}
+	rawValue, ok := doc["model"]
+	if !ok || len(rawValue) < 2 || rawValue[0] != '"' || rawValue[len(rawValue)-1] != '"' {
+		return bytes.Clone(body), false, nil
+	}
+	var current string
+	if err := json.Unmarshal(rawValue, &current); err != nil || current == model {
+		return bytes.Clone(body), false, nil
+	}
+	replacement, err := json.Marshal(model)
+	if err != nil {
+		return nil, false, err
+	}
+	doc["model"] = replacement
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return nil, false, err
+	}
+	return out, true, nil
+}
+
+func findTopLevelModelValue(body []byte) (int, int, bool, bool) {
 	i := skipTopLevelModelJSONSpace(body, 0)
 	if i == len(body) || body[i] != '{' {
-		return 0, 0, false
+		return 0, 0, false, false
 	}
 	i++
-	start, end, found := 0, 0, false
+	start, end, found, duplicate := 0, 0, false, false
 	for {
 		i = skipTopLevelModelJSONSpace(body, i)
 		if i == len(body) || body[i] == '}' {
-			return start, end, found
+			return start, end, found, duplicate
 		}
 		keyStart := i
 		i = skipTopLevelModelJSONString(body, i)
 		keyMatches := topLevelModelKey(body[keyStart:i])
 		i = skipTopLevelModelJSONSpace(body, i)
 		if i == len(body) || body[i] != ':' {
-			return 0, 0, false
+			return 0, 0, false, false
 		}
 		i = skipTopLevelModelJSONSpace(body, i+1)
 		if i == len(body) {
-			return 0, 0, false
+			return 0, 0, false, false
 		}
 		valueStart := i
 		i = skipTopLevelModelJSONValue(body, i)
 		if keyMatches {
+			duplicate = duplicate || found
 			start, end, found = valueStart, i, true
 		}
 		i = skipTopLevelModelJSONSpace(body, i)
 		if i == len(body) || body[i] == '}' {
-			return start, end, found
+			return start, end, found, duplicate
 		}
 		if body[i] != ',' {
-			return 0, 0, false
+			return 0, 0, false, false
 		}
 		i++
 	}
