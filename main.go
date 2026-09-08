@@ -444,9 +444,15 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 		return r.sse.Write(p)
 	}
 	if couldStartJSONValue(p) {
-		chunks, ok, incomplete, err := r.tryRawJSONChunks(p)
-		if ok || err != nil {
-			return chunks, err
+		chunks, consumed, ok, incomplete, err := r.tryRawJSONChunks(p)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			if incomplete {
+				r.pending = append([]byte(nil), p[consumed:]...)
+			}
+			return chunks, nil
 		}
 		if incomplete {
 			if owned {
@@ -468,27 +474,34 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 }
 
 func (r *streamChunkRewriter) rawJSONChunks(p []byte) ([][]byte, error) {
-	chunks, ok, _, err := r.tryRawJSONChunks(p)
+	chunks, _, ok, incomplete, err := r.tryRawJSONChunks(p)
 	if err != nil {
 		return nil, err
 	}
-	if !ok {
+	if !ok && !incomplete {
 		return [][]byte{bytes.Clone(p)}, nil
+	}
+	if incomplete {
+		fallback := bytes.Clone(p)
+		if r.frameRawJSONAsSSE {
+			fallback = frameSSEData(fallback)
+		}
+		return [][]byte{fallback}, nil
 	}
 	return chunks, nil
 }
 
-func (r *streamChunkRewriter) tryRawJSONChunks(p []byte) ([][]byte, bool, bool, error) {
+func (r *streamChunkRewriter) tryRawJSONChunks(p []byte) ([][]byte, int, bool, bool, error) {
 	trimmed := bytes.Trim(p, " \t\r\n")
 	if len(trimmed) > 0 {
 		switch trimmed[0] {
 		case '{':
 			if bytes.IndexByte(trimmed, '}') < 0 {
-				return nil, false, true, nil
+				return nil, 0, false, true, nil
 			}
 		case '[':
 			if bytes.IndexByte(trimmed, ']') < 0 {
-				return nil, false, true, nil
+				return nil, 0, false, true, nil
 			}
 		}
 	}
@@ -510,7 +523,7 @@ func (r *streamChunkRewriter) tryRawJSONChunks(p []byte) ([][]byte, bool, bool, 
 			var err error
 			restored, _, valid, err = r.sse.restoreResponseModelCandidate(trimmed)
 			if err != nil {
-				return nil, false, false, err
+				return nil, 0, false, false, err
 			}
 		} else if json.Valid(trimmed) {
 			restored = bytes.Clone(trimmed)
@@ -518,26 +531,23 @@ func (r *streamChunkRewriter) tryRawJSONChunks(p []byte) ([][]byte, bool, bool, 
 		}
 		if valid {
 			if r.frameRawJSONAsSSE {
-				return [][]byte{frameSSEData(restored)}, true, false, nil
+				return [][]byte{frameSSEData(restored)}, len(p), true, false, nil
 			}
-			return [][]byte{restored}, true, false, nil
+			return [][]byte{restored}, len(p), true, false, nil
 		}
 	}
-	values, ok, incomplete := splitJSONValues(p)
-	if incomplete {
-		return nil, false, true, nil
-	}
+	values, consumed, ok, incomplete := splitJSONValues(p)
 	if !ok {
-		return nil, false, false, nil
+		return nil, 0, false, incomplete, nil
 	}
 	if len(values) == 0 {
-		return nil, true, false, nil
+		return nil, consumed, true, incomplete, nil
 	}
 	out := make([][]byte, 0, len(values))
 	for _, value := range values {
 		restored, _, err := r.sse.restoreResponseModel(value)
 		if err != nil {
-			return nil, false, false, err
+			return nil, 0, false, false, err
 		}
 		if r.frameRawJSONAsSSE {
 			out = append(out, frameSSEData(restored))
@@ -545,27 +555,31 @@ func (r *streamChunkRewriter) tryRawJSONChunks(p []byte) ([][]byte, bool, bool, 
 		}
 		out = append(out, restored)
 	}
-	return out, true, false, nil
+	return out, consumed, true, incomplete, nil
 }
 
-func splitJSONValues(p []byte) ([][]byte, bool, bool) {
+func splitJSONValues(p []byte) ([][]byte, int, bool, bool) {
 	if len(bytes.TrimSpace(p)) == 0 {
-		return nil, true, false
+		return nil, len(p), true, false
 	}
 	dec := json.NewDecoder(bytes.NewReader(p))
 	values := make([][]byte, 0, 1)
+	consumed := 0
 	for {
 		var raw json.RawMessage
 		err := dec.Decode(&raw)
 		if err == io.EOF {
-			break
+			return values, consumed, len(values) > 0, false
 		}
 		if err != nil {
-			return nil, false, err == io.ErrUnexpectedEOF
+			if err == io.ErrUnexpectedEOF {
+				return values, consumed, len(values) > 0, true
+			}
+			return nil, 0, false, false
 		}
 		values = append(values, raw)
+		consumed = int(dec.InputOffset())
 	}
-	return values, len(values) > 0, false
 }
 
 func (r *streamChunkRewriter) Flush() ([][]byte, error) {

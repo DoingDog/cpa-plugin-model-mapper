@@ -3989,7 +3989,7 @@ func TestStreamChunkRewriterRawJSONUsesOneRestorePass(t *testing.T) {
 }
 
 func legacyRawJSONChunksForTest(r *streamChunkRewriter, p []byte) ([][]byte, error) {
-	values, ok, _ := splitJSONValues(p)
+	values, _, ok, _ := splitJSONValues(p)
 	if !ok {
 		return [][]byte{bytes.Clone(p)}, nil
 	}
@@ -4062,6 +4062,70 @@ func TestStreamChunkRewriterBuffersSplitRawJSON(t *testing.T) {
 	chunks, err = passthrough.Write([]byte("not-json"))
 	if err != nil || len(chunks) != 1 || string(chunks[0]) != "not-json" {
 		t.Fatalf("non-JSON Write = (%q, %v)", chunks, err)
+	}
+}
+
+func TestStreamChunkRewriterEmitsCompleteJSONPrefixBeforeIncompleteTail(t *testing.T) {
+	for _, framed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("framed=%v", framed), func(t *testing.T) {
+			r := newStreamChunkRewriter("client")
+			r.frameRawJSONAsSSE = framed
+			first, err := r.Write([]byte("{\"model\":\"upstream\",\"id\":1}\n{\"model\":\"up"))
+			if err != nil {
+				t.Fatalf("first Write: %v", err)
+			}
+			if len(first) != 1 {
+				t.Fatalf("first chunks=%q, want one complete prefix", first)
+			}
+			payload := first[0]
+			if framed {
+				if !bytes.HasPrefix(payload, []byte("data: ")) || !bytes.HasSuffix(payload, []byte("\n\n")) {
+					t.Fatalf("framed first chunk=%q", payload)
+				}
+				payload = bytes.TrimSuffix(bytes.TrimPrefix(payload, []byte("data: ")), []byte("\n\n"))
+			}
+			var firstValue map[string]any
+			if err := json.Unmarshal(payload, &firstValue); err != nil || firstValue["model"] != "client" || firstValue["id"] != float64(1) {
+				t.Fatalf("first payload=%q value=%#v err=%v", payload, firstValue, err)
+			}
+
+			second, err := r.Write([]byte(`stream","id":2}`))
+			if err != nil {
+				t.Fatalf("second Write: %v", err)
+			}
+			if len(second) != 1 {
+				t.Fatalf("second chunks=%q, want one completed tail", second)
+			}
+			payload = second[0]
+			if framed {
+				payload = bytes.TrimSuffix(bytes.TrimPrefix(payload, []byte("data: ")), []byte("\n\n"))
+			}
+			var secondValue map[string]any
+			if err := json.Unmarshal(payload, &secondValue); err != nil || secondValue["model"] != "client" || secondValue["id"] != float64(2) {
+				t.Fatalf("second payload=%q value=%#v err=%v", payload, secondValue, err)
+			}
+		})
+	}
+}
+
+func TestStreamChunkRewriterFlushFramesIncompleteJSONTailWhenSSE(t *testing.T) {
+	r := newStreamChunkRewriter("client")
+	r.frameRawJSONAsSSE = true
+	if chunks, err := r.Write([]byte(`{"model":"upstream"`)); err != nil || len(chunks) != 0 {
+		t.Fatalf("Write=(%q,%v), want no output", chunks, err)
+	}
+	chunks, err := r.Flush()
+	if err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	got := flattenChunks(chunks)
+	if !strings.Contains(got, `{"model":"upstream"`) {
+		t.Fatalf("Flush output=%q, want incomplete bytes", got)
+	}
+	for _, line := range strings.Split(strings.TrimSuffix(got, "\n\n"), "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			t.Fatalf("Flush output has unframed line %q", line)
+		}
 	}
 }
 
@@ -4216,7 +4280,7 @@ func TestSplitJSONValuesKeepsDecoderOwnedPayload(t *testing.T) {
 		}
 	}
 	productionAllocs := testing.AllocsPerRun(50, func() {
-		values, ok, _ := splitJSONValues(input)
+		values, _, ok, _ := splitJSONValues(input)
 		if !ok || len(values) != 64 {
 			panic(fmt.Sprintf("splitJSONValues=(%d,%v)", len(values), ok))
 		}
