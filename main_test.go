@@ -3669,7 +3669,7 @@ func TestStreamChunkRewriterPreservesColonlessJSONScalarSSE(t *testing.T) {
 }
 
 func TestStreamChunkRewriterPreservesColonlessJSONScalarSSEAcrossPartitions(t *testing.T) {
-	for _, input := range [][]byte{[]byte("null\n\n"), []byte("true\n\n"), []byte("false\n\n"), []byte("\"scalar\"\n\n"), []byte("123\n\n"), []byte("-1\n\n")} {
+	for _, input := range [][]byte{[]byte("null\n\n"), []byte("true\n\n"), []byte("false\n\n"), []byte("\"scalar\"\n\n"), []byte("123\n\n"), []byte("-1\n\n"), []byte("null true\n\n")} {
 		for split := 0; split <= len(input); split++ {
 			r := newStreamChunkRewriter("client")
 			r.frameRawJSONAsSSE = true

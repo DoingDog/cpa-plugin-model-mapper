@@ -448,7 +448,7 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 		return r.sse.Write(p)
 	}
 	trimmed := bytes.TrimSpace(p)
-	if r.frameRawJSONAsSSE && len(trimmed) > 0 && trimmed[0] != '{' && trimmed[0] != '[' && json.Valid(trimmed) {
+	if r.frameRawJSONAsSSE && len(trimmed) > 0 && trimmed[0] != '{' && trimmed[0] != '[' && couldStartJSONValue(p) && !isSSEChunk(p) {
 		if owned {
 			r.pending = p
 		} else {
