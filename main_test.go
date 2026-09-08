@@ -4767,6 +4767,77 @@ func TestRunStreamForwardPreservesInBandErrorAcrossCleanupFailures(t *testing.T)
 	}
 }
 
+func TestRunStreamForwardSendsCleanupErrorsOnFirstPluginClose(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	sentinelHostClose := errors.New("host close failed")
+	directPluginCloseCalls := 0
+	firstPluginError := ""
+	directPluginClosed := make(chan struct{})
+	outerClose := make(chan struct{})
+	call := func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostModelExecuteStream:
+			return json.Marshal(pluginapi.HostModelStreamResponse{
+				StatusCode: http.StatusOK,
+				StreamID:   "host-stream",
+				Headers:    http.Header{"Content-Type": {"text/event-stream"}},
+			})
+		case pluginabi.MethodHostModelStreamRead:
+			return json.Marshal(pluginapi.HostModelStreamReadResponse{Error: "primary upstream error", Done: true})
+		case pluginabi.MethodHostModelStreamClose:
+			return nil, sentinelHostClose
+		case pluginabi.MethodHostStreamClose:
+			directPluginCloseCalls++
+			var closePayload struct {
+				Error string `json:"error"`
+			}
+			raw, err := json.Marshal(payload)
+			if err != nil {
+				return nil, err
+			}
+			if err := json.Unmarshal(raw, &closePayload); err != nil {
+				return nil, err
+			}
+			firstPluginError = closePayload.Error
+			close(directPluginClosed)
+			return json.Marshal(map[string]any{})
+		default:
+			return nil, fmt.Errorf("unexpected method %q", method)
+		}
+	}
+	req := executorRPCRequest{
+		Model:           "client",
+		Format:          "openai",
+		SourceFormat:    "openai",
+		OriginalRequest: []byte(`{"model":"client","stream":true}`),
+		StreamID:        "plugin-stream",
+	}
+	if _, err := startExecutorStream(req, call, func(string, string) error {
+		close(outerClose)
+		return nil
+	}); err != nil {
+		t.Fatalf("startExecutorStream error = %v", err)
+	}
+	select {
+	case <-directPluginClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not close plugin stream")
+	}
+	if directPluginCloseCalls != 1 {
+		t.Errorf("plugin close calls = %d, want 1", directPluginCloseCalls)
+	}
+	for _, want := range []string{"primary upstream error", sentinelHostClose.Error()} {
+		if !strings.Contains(firstPluginError, want) {
+			t.Errorf("first plugin close error = %q, missing %q", firstPluginError, want)
+		}
+	}
+	select {
+	case <-outerClose:
+		t.Error("outer wrapper retried plugin close after a successful first close")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 func TestRunStreamForwardFlushesPendingBytesOnReadError(t *testing.T) {
 	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
 	sentinelReadError := errors.New("host stream read failed")

@@ -1283,8 +1283,8 @@ func (s *executorStream) flushAndEmit(rewriter *streamChunkRewriter) error {
 	return nil
 }
 
-func (s *executorStream) finish(rewriter *streamChunkRewriter, primary error, payloadErr error, pluginError string, closePlugin bool) error {
-	cleanup := make([]error, 0, 3)
+func (s *executorStream) finish(rewriter *streamChunkRewriter, primary error, payloadErr error, closePlugin bool) error {
+	cleanup := make([]error, 0, 2)
 	if payloadErr != nil {
 		cleanup = append(cleanup, payloadErr)
 	}
@@ -1294,15 +1294,18 @@ func (s *executorStream) finish(rewriter *streamChunkRewriter, primary error, pa
 	if err := s.closeHost(); err != nil {
 		cleanup = append(cleanup, fmt.Errorf("close host stream: %w", err))
 	}
-	if closePlugin {
-		if err := s.closePlugin(pluginError); err != nil {
-			cleanup = append(cleanup, fmt.Errorf("close plugin stream: %w", err))
-		}
+	firstErr := joinStreamErrors(primary, cleanup...)
+	if !closePlugin {
+		return firstErr
 	}
-	if primary != nil && pluginError != "" && len(cleanup) == 0 {
-		return nil
+	errText := ""
+	if firstErr != nil {
+		errText = firstErr.Error()
 	}
-	return joinStreamErrors(primary, cleanup...)
+	if err := s.closePlugin(errText); err != nil {
+		return joinStreamErrors(firstErr, fmt.Errorf("close plugin stream: %w", err))
+	}
+	return nil
 }
 
 func runStreamForward(stream *executorStream) error {
@@ -1311,22 +1314,18 @@ func runStreamForward(stream *executorStream) error {
 	for {
 		readRaw, err := stream.call(pluginabi.MethodHostModelStreamRead, pluginapi.HostModelStreamReadRequest{StreamID: stream.hostStreamID})
 		if err != nil {
-			return stream.finish(rewriter, fmt.Errorf("read host stream: %w", err), nil, "", false)
+			return stream.finish(rewriter, fmt.Errorf("read host stream: %w", err), nil, false)
 		}
 		var chunk pluginapi.HostModelStreamReadResponse
 		if err := json.Unmarshal(readRaw, &chunk); err != nil {
-			return stream.finish(rewriter, fmt.Errorf("decode host stream chunk: %w", err), nil, "", false)
+			return stream.finish(rewriter, fmt.Errorf("decode host stream chunk: %w", err), nil, false)
 		}
 		payloadErr := stream.processPayload(rewriter, chunk.Payload)
 		if chunk.Error != "" {
-			return stream.finish(rewriter, errors.New(chunk.Error), payloadErr, chunk.Error, true)
+			return stream.finish(rewriter, errors.New(chunk.Error), payloadErr, true)
 		}
 		if payloadErr != nil || chunk.Done {
-			pluginError := ""
-			if payloadErr != nil {
-				pluginError = payloadErr.Error()
-			}
-			return stream.finish(rewriter, payloadErr, nil, pluginError, true)
+			return stream.finish(rewriter, payloadErr, nil, true)
 		}
 	}
 }
