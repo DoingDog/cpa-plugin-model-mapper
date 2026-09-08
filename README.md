@@ -61,7 +61,7 @@ Comments-only dedicated rules fields are absent and fall back as described in th
 
 Exact scope text is hashed and compared with CPA's irreversible `caller_scope`, which CPA derives from the authenticated principal. For wildcard matching, the plugin tries CPA's supported inbound credential sources (`Authorization`, `X-Goog-Api-Key`, `X-Api-Key`, `?key=`, or `?auth_token=`) and accepts a candidate only when its digest equals `caller_scope`; this recovers the authenticated principal without trusting client-controlled headers alone. The plugin caches only the boolean result for `caller_scope + pattern`, not the principal, so request interceptors may change headers between routing and execution; reconfiguration clears this cache. An access provider whose Principal differs from every presented credential cannot use key wildcards, so those entries safely skip. Invalid credentials are rejected by CPA before the plugin runs, and scoped rules do not alter CPA's authentication response. Configured keys and patterns remain plaintext, so protect the plugin configuration. Whitespace and quotes are invalid inside the decoded rule value.
 
-Scoped rules require CPA v7.2.145 or a later compatible runtime that publishes authenticated `caller_scope`; when metadata is missing, scoped entries skip and unscoped fallback can continue. This release assigns wildcard meaning to an unescaped `*` in an API-key scope; an existing literal key containing `*` must escape it as `\*` before upgrading.
+Scoped rules require CPA v7.2.101 or a later compatible runtime that publishes authenticated `caller_scope`; older runtimes or missing metadata fail closed for scoped entries, while unscoped fallback can continue. This release assigns wildcard meaning to an unescaped `*` in an API-key scope; an existing literal key containing `*` must escape it as `\*` before upgrading.
 
 - Mappings remain case-sensitive and apply to the complete current model name; later mappings see the value produced by every earlier entry.
 - `\a` changes only `A` through `Z` to `a` through `z`; `\A` changes only `a` through `z` to `A` through `Z`. Non-ASCII bytes, digits, punctuation, and separators are unchanged.
@@ -188,6 +188,7 @@ Response restoration changes only these paths:
 - `response.model`
 - `response.modelVersion`
 - `message.model`
+- `interaction.model`
 
 For nonstream responses, remove `Content-Length` only when model restoration changes body bytes; preserve it when unchanged.
 
@@ -212,10 +213,12 @@ Add a scoped mapping for that inbound client API key before an unscoped mapping.
 ```powershell
 make test
 make vet
-make build-windows-amd64
-make build-linux-amd64 LINUX_AMD64_CC=<cross-compiler>
-make package VERSION=0.1.0
+make build-windows-amd64 VERSION=0.5.2
+make build-linux-amd64 VERSION=0.5.2 LINUX_AMD64_CC="zig cc -target x86_64-linux-gnu"
+make package VERSION=0.5.2
 ```
+
+Aggregate packaging verifies each discovered binary's adjacent `.version` sidecar and fails if the built version differs from the requested release version.
 
 Full-platform release builds run in GitHub Actions for:
 
