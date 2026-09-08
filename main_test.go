@@ -2879,48 +2879,6 @@ func TestExecutorReusesCallerPatternAfterHeadersChange(t *testing.T) {
 	}
 }
 
-func TestSetLoadedConfigPublishesWithCallerCacheReset(t *testing.T) {
-	setLoadedConfigForTest(Config{GlobalRules: "old=>target"})
-	callerPatternCacheMu.Lock()
-	loadedConfigMu.RLock()
-	done := make(chan struct{})
-	go func() {
-		setLoadedConfigForTest(Config{GlobalRules: "new=>target"})
-		close(done)
-	}()
-
-	deadline := time.Now().Add(time.Second)
-	for loadedConfigMu.TryRLock() {
-		loadedConfigMu.RUnlock()
-		if time.Now().After(deadline) {
-			loadedConfigMu.RUnlock()
-			callerPatternCacheMu.Unlock()
-			t.Fatal("reconfigure did not wait for the config write lock")
-		}
-		runtime.Gosched()
-	}
-	loadedConfigMu.RUnlock()
-
-	observed := make(chan Config, 1)
-	go func() { observed <- loadedConfig() }()
-	select {
-	case cfg := <-observed:
-		callerPatternCacheMu.Unlock()
-		<-done
-		if cfg.GlobalRules == "new=>target" {
-			t.Fatal("new config became visible before the caller cache reset")
-		}
-		t.Fatalf("observed unexpected config before reset: %#v", cfg)
-	case <-time.After(100 * time.Millisecond):
-		callerPatternCacheMu.Unlock()
-		<-done
-		cfg := <-observed
-		if cfg.GlobalRules != "new=>target" {
-			t.Fatalf("config after reset=%#v, want new rules", cfg)
-		}
-	}
-}
-
 func TestHandleModelRouteWarmCallerPatternHitDoesNotRequireConfigWriteLock(t *testing.T) {
 	setLoadedConfigForTest(Config{GlobalRules: "sk-kimi-*#client-model=>wildcard-target"})
 	raw, err := json.Marshal(pluginapi.ModelRouteRequest{
@@ -2958,15 +2916,18 @@ func TestHandleModelRouteWarmCallerPatternHitDoesNotRequireConfigWriteLock(t *te
 	}
 }
 
-func TestReconfigureClearsCallerPatternCache(t *testing.T) {
-	const rules = "sk-kimi-*#client-model=>wildcard-target"
+func TestEquivalentReconfigurePreservesCallerPatternDecisionForExecutor(t *testing.T) {
+	const (
+		rules = "sk-kimi-*#client-model=>wildcard-target"
+		key   = "sk-kimi-team"
+	)
 	setLoadedConfigForTest(Config{GlobalRules: rules})
-	metadata := map[string]any{"caller_scope": callerScope("sk-kimi-team")}
+	metadata := map[string]any{"caller_scope": callerScope(key)}
 	routeRaw, err := json.Marshal(pluginapi.ModelRouteRequest{
 		SourceFormat:   "openai",
 		RequestedModel: "client-model",
 		Metadata:       metadata,
-		Headers:        http.Header{"Authorization": {"Bearer sk-kimi-team"}},
+		Headers:        http.Header{"Authorization": {"Bearer " + key}},
 	})
 	if err != nil {
 		t.Fatalf("marshal route request: %v", err)
@@ -2979,23 +2940,65 @@ func TestReconfigureClearsCallerPatternCache(t *testing.T) {
 	if err := json.Unmarshal(responseRaw, &response); err != nil || !response.Handled {
 		t.Fatalf("warm route response=%s err=%v, want handled", responseRaw, err)
 	}
-
 	if _, err := handlePluginReconfigure([]byte(`{"enabled":true,"global_rules":"sk-kimi-*#client-model=>wildcard-target"}`)); err != nil {
 		t.Fatalf("reconfigure: %v", err)
 	}
-	routeRaw, err = json.Marshal(pluginapi.ModelRouteRequest{SourceFormat: "openai", RequestedModel: "client-model", Metadata: metadata})
+
+	rawReq, err := json.Marshal(rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+		Model:           "client-model",
+		Format:          "openai",
+		SourceFormat:    "openai",
+		Metadata:        metadata,
+		Headers:         http.Header{"Authorization": {"Bearer interceptor-replacement"}},
+		OriginalRequest: []byte(`{"model":"client-model"}`),
+	}})
 	if err != nil {
-		t.Fatalf("marshal route without credential: %v", err)
+		t.Fatalf("marshal executor request: %v", err)
 	}
-	responseRaw, err = handleModelRoute(routeRaw)
+	var captured hostModelExecutionRequest
+	_, err = handleExecutorExecute(rawReq, func(method string, payload any) (json.RawMessage, error) {
+		if method != pluginabi.MethodHostModelExecute {
+			t.Fatalf("method=%q, want %q", method, pluginabi.MethodHostModelExecute)
+		}
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(raw, &captured); err != nil {
+			return nil, err
+		}
+		return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: http.StatusOK, Body: []byte(`{"model":"wildcard-target"}`)})
+	})
 	if err != nil {
-		t.Fatalf("route after reconfigure: %v", err)
+		t.Fatalf("handleExecutorExecute error = %v", err)
 	}
-	if err := json.Unmarshal(responseRaw, &response); err != nil {
-		t.Fatalf("decode route after reconfigure: %v", err)
+	if captured.Model != "wildcard-target" {
+		t.Fatalf("forwarded model=%q, want wildcard-target", captured.Model)
 	}
-	if response.Handled {
-		t.Fatalf("route after reconfigure=%s, want unhandled without bound caller", responseRaw)
+}
+
+func TestCallerPatternCacheIsBounded(t *testing.T) {
+	resetCallerPatternCache()
+	rules := mustParseRules(t, "sk-*#client=>target")
+	rule := &rules[0]
+	firstKey := "sk-0"
+	firstScope := callerScope(firstKey)
+	for i := 0; i < 100000; i++ {
+		key := fmt.Sprintf("sk-%d", i)
+		matched, authenticated := callerPatternMatch(rule, callerScope(key), key)
+		if !matched || !authenticated {
+			t.Fatalf("match=(%v,%v), want (true,true)", matched, authenticated)
+		}
+	}
+	callerPatternCacheMu.RLock()
+	entries := len(callerPatternCache.current) + len(callerPatternCache.previous)
+	callerPatternCacheMu.RUnlock()
+	if entries > 2*callerPatternCacheGenerationSize {
+		t.Fatalf("cache entries=%d, want <=%d", entries, 2*callerPatternCacheGenerationSize)
+	}
+	matched, authenticated := callerPatternMatch(rule, firstScope, "")
+	if matched || authenticated {
+		t.Fatalf("evicted match=(%v,%v), want (false,false)", matched, authenticated)
 	}
 }
 

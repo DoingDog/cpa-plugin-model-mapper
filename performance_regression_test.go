@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -11,6 +12,33 @@ import (
 	pluginabi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	pluginapi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
+
+func BenchmarkCallerPatternCacheRetention(b *testing.B) {
+	rules, err := parseRules("sk-*#client=>target")
+	if err != nil {
+		b.Fatal(err)
+	}
+	rule := &rules[0]
+	for _, count := range []int{1000, 10000, 100000} {
+		b.Run(fmt.Sprintf("N=%d", count), func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				resetCallerPatternCache()
+				for j := 0; j < count; j++ {
+					key := fmt.Sprintf("sk-%d", j)
+					matched, authenticated := callerPatternMatch(rule, callerScope(key), key)
+					if !matched || !authenticated {
+						b.Fatalf("match=(%v,%v), want (true,true)", matched, authenticated)
+					}
+				}
+				callerPatternCacheMu.RLock()
+				retained := len(callerPatternCache.current) + len(callerPatternCache.previous)
+				callerPatternCacheMu.RUnlock()
+				b.ReportMetric(float64(retained), "retained-entries")
+			}
+		})
+	}
+}
 
 func TestMightContainResponseModelFieldIgnoresEscapedTextMarker(t *testing.T) {
 	body := append([]byte(`{"text":"`), bytes.Repeat([]byte{0x5c, 'u', '0', '0', '6', '1'}, 4096)...)

@@ -829,12 +829,20 @@ type callerPatternCacheKey struct {
 	pattern string
 }
 
+const callerPatternCacheGenerationSize = 16 << 10
+
+type callerPatternCacheState struct {
+	current  map[callerPatternCacheKey]bool
+	previous map[callerPatternCacheKey]bool
+}
+
 var (
 	loadedConfigMu sync.RWMutex
 	loadedCfg      = defaultConfig()
 
+	// ponytail: two fixed generations cap cross-RPC caller state; remove this cache when CPA carries route decisions into executor calls.
 	callerPatternCacheMu sync.RWMutex
-	callerPatternCache   = make(map[callerPatternCacheKey]bool)
+	callerPatternCache   = callerPatternCacheState{current: make(map[callerPatternCacheKey]bool, callerPatternCacheGenerationSize)}
 
 	hostAPIMu      sync.RWMutex
 	hostCallbackFn hostCallback
@@ -848,12 +856,15 @@ func loadedConfig() Config {
 	return loadedCfg
 }
 
+func resetCallerPatternCache() {
+	callerPatternCacheMu.Lock()
+	callerPatternCache = callerPatternCacheState{current: make(map[callerPatternCacheKey]bool, callerPatternCacheGenerationSize)}
+	callerPatternCacheMu.Unlock()
+}
+
 func publishLoadedConfig(cfg Config) {
 	loadedConfigMu.Lock()
-	callerPatternCacheMu.Lock()
 	loadedCfg = cfg
-	callerPatternCache = make(map[callerPatternCacheKey]bool)
-	callerPatternCacheMu.Unlock()
 	loadedConfigMu.Unlock()
 }
 
@@ -862,6 +873,7 @@ func setLoadedConfigForTest(cfg Config) {
 	if err != nil {
 		panic(err)
 	}
+	resetCallerPatternCache()
 	publishLoadedConfig(compiled)
 }
 
@@ -2071,7 +2083,10 @@ func applyASCIIModelCase(model string, operation caseOperation) string {
 func callerPatternMatch(r *rule, scope, key string) (bool, bool) {
 	cacheKey := callerPatternCacheKey{scope: scope, pattern: r.callerPatternText}
 	callerPatternCacheMu.RLock()
-	matched, ok := callerPatternCache[cacheKey]
+	matched, ok := callerPatternCache.current[cacheKey]
+	if !ok {
+		matched, ok = callerPatternCache.previous[cacheKey]
+	}
 	callerPatternCacheMu.RUnlock()
 	if ok {
 		return matched, true
@@ -2081,10 +2096,16 @@ func callerPatternMatch(r *rule, scope, key string) (bool, bool) {
 	}
 	_, matched = matchTokens(key, r.callerPattern)
 	callerPatternCacheMu.Lock()
-	if cached, exists := callerPatternCache[cacheKey]; exists {
+	if cached, exists := callerPatternCache.current[cacheKey]; exists {
+		matched = cached
+	} else if cached, exists := callerPatternCache.previous[cacheKey]; exists {
 		matched = cached
 	} else {
-		callerPatternCache[cacheKey] = matched
+		if len(callerPatternCache.current) >= callerPatternCacheGenerationSize {
+			callerPatternCache.previous = callerPatternCache.current
+			callerPatternCache.current = make(map[callerPatternCacheKey]bool, callerPatternCacheGenerationSize)
+		}
+		callerPatternCache.current[cacheKey] = matched
 	}
 	callerPatternCacheMu.Unlock()
 	return matched, true
