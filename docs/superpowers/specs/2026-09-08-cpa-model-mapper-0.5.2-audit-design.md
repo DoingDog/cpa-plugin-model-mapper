@@ -47,16 +47,16 @@
 
 ### 1. Stream setup、headers与framing使用不同事实来源
 
-当前 `startExecutorStream` 在 host setup 前固定返回 `Content-Type: text/event-stream`，worker随后只在 host header自报 SSE 时 framing raw JSON。CPA允许 host返回空 header或 `application/json` 加bare JSON，所以 client会收到 SSE header加裸 JSON。host的其他 response headers也在异步 worker中到达，无法写入 plugin setup response。
+当前 `startExecutorStream` 在 host setup 前固定返回 `Content-Type: text/event-stream`，worker随后却按 host `Content-Type` 决定是否 framing raw JSON。CPA不要求五种format都返回SSE，也允许host返回空header或非SSE媒体类型，因此outer header与实际payload framing可能矛盾。host的其他response headers也在异步worker中到达，无法写入plugin setup response。
 
 设计：
 
 1. 把 route、request rewrite和 `host.model.execute_stream` setup移到同步 prepare 阶段。
 2. validate host status、decode response并取得 `StreamID` 后，再启动只负责 read/rewrite/emit/close 的 goroutine。
 3. 以 host response headers为基础返回 plugin stream headers，canonicalize并合并大小写重复键。
-4. 删除 `Content-Length` 与 `Transfer-Encoding`，强制 `Content-Type: text/event-stream`。
-5. worker对bare JSON一律执行 SSE framing，不依赖 host `Content-Type`；完整 SSE由现有 parser识别并保留。
-6. 保留 custom headers，例如 request ID和rate-limit headers。CPA是否最终向 client透传仍由 CPA配置和interceptor决定。
+4. 删除 `Content-Length` 与 `Transfer-Encoding`。host明确返回 `Content-Type` 时保留该值；缺失时使用兼容fallback `text/event-stream`。
+5. worker根据最终返回的 `Content-Type` 决定raw JSON framing。最终类型为 `text/event-stream` 时生成合法SSE event；非SSE类型时保持raw JSON value分块。完整SSE继续由现有parser识别并保留。
+6. 保留custom headers，例如request ID和rate-limit headers。CPA是否最终向client透传仍由CPA配置和interceptor决定。
 
 ### 2. SSE parser根据 transport chunk boundary补换行
 
@@ -217,7 +217,7 @@ packager validator将 `v0.5.2` normalized为 `0.5.2`，Make仍把原始值用于
 必需regression coverage：
 
 - arbitrary split位于 `event:`、`data:` field value和JSON key/value任意位置，拼接结果partition-invariant。
-- empty header、`application/json`、`text/event-stream` host setup都产生与outer `text/event-stream` 一致的payload framing。
+- empty header使用 `text/event-stream` fallback并framing raw JSON；`application/json`保持raw JSON；`text/event-stream` framing raw JSON。每种payload都与outer `Content-Type` 一致。
 - host custom stream header保留，`Content-Length`、`Transfer-Encoding`删除。
 - complete JSON prefix加incomplete tail，包括正常补全、Done和read error。
 - `Payload + Done`、`Payload + Error + Done`，先emit payload后close。
