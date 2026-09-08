@@ -60,6 +60,61 @@ func TestEmitRewrittenBatchesSSEChunks(t *testing.T) {
 	}
 }
 
+func BenchmarkEmitRewrittenSingleChunkBatch(b *testing.B) {
+	chunk := bytes.Repeat([]byte("x"), 64<<10)
+	chunks := [][]byte{chunk}
+	var emitted []byte
+	emit := func(p []byte) error {
+		emitted = p
+		return nil
+	}
+	b.SetBytes(int64(len(chunk)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := emitRewritten(chunks, true, emit); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	if len(emitted) != len(chunk) {
+		b.Fatalf("emitted length=%d, want %d", len(emitted), len(chunk))
+	}
+}
+
+func BenchmarkStreamChunkRewriterFragmentedRawJSON(b *testing.B) {
+	payload := append([]byte(`{"model":"upstream","id":"`), bytes.Repeat([]byte("x"), 64<<10)...)
+	payload = append(payload, `"}`...)
+	const fragments = 32
+	chunkSize := (len(payload) + fragments - 1) / fragments
+	chunks := make([][]byte, 0, fragments)
+	for start := 0; start < len(payload); start += chunkSize {
+		end := start + chunkSize
+		if end > len(payload) {
+			end = len(payload)
+		}
+		chunks = append(chunks, payload[start:end])
+	}
+
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		r := newStreamChunkRewriter("client")
+		outputs := 0
+		for _, chunk := range chunks {
+			out, err := r.Write(chunk)
+			if err != nil {
+				b.Fatal(err)
+			}
+			outputs += len(out)
+		}
+		if outputs != 1 {
+			b.Fatalf("outputs=%d, want 1", outputs)
+		}
+	}
+}
+
 func TestReleaseExecutorStreamSetupClearsLargeFields(t *testing.T) {
 	req := &executorRPCRequest{
 		OriginalRequest: []byte("request"),

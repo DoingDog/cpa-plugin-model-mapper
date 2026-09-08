@@ -47,7 +47,8 @@ package-platform:
 	@if [ -z "$(VERSION)" ]; then echo "VERSION is required"; exit 1; fi
 	@GOOS= GOARCH= CGO_ENABLED= $(GO) run .github/scripts/package-release.go -validate-only -version "$(VERSION)"
 	@$(MAKE) --no-print-directory build-platform
-	@case "$(GOOS)" in windows) ext=".dll" ;; darwin) ext=".dylib" ;; *) ext=".so" ;; esac; \
+	@set -e; \
+	case "$(GOOS)" in windows) ext=".dll" ;; darwin) ext=".dylib" ;; *) ext=".so" ;; esac; \
 	library="$(DIST_DIR)/$(GOOS)_$(GOARCH)/$(PLUGIN_NAME)$$ext"; \
 	case "$(GOOS)" in \
 		linux) \

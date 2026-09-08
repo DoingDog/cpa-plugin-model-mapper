@@ -466,10 +466,11 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 			return nil, nil
 		}
 	}
+	owned := false
 	if len(r.pending) > 0 {
-		r.pending = append(r.pending, p...)
-		p = append([]byte(nil), r.pending...)
+		p = append(r.pending, p...)
 		r.pending = nil
+		owned = true
 	}
 	if len(r.sse.buf) > 0 {
 		if knownSSELogicalBoundary(r.sse.buf, p) {
@@ -484,8 +485,17 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 		return r.sse.Write(p)
 	}
 	if couldStartJSONValue(p) {
-		if chunks, ok, err := r.tryRawJSONChunks(p); ok || err != nil {
+		chunks, ok, incomplete, err := r.tryRawJSONChunks(p)
+		if ok || err != nil {
 			return chunks, err
+		}
+		if incomplete {
+			if owned {
+				r.pending = p
+			} else {
+				r.pending = append(r.pending, p...)
+			}
+			return nil, nil
 		}
 	}
 	if isSSEChunk(p) {
@@ -499,7 +509,7 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 }
 
 func (r *streamChunkRewriter) rawJSONChunks(p []byte) ([][]byte, error) {
-	chunks, ok, err := r.tryRawJSONChunks(p)
+	chunks, ok, _, err := r.tryRawJSONChunks(p)
 	if err != nil {
 		return nil, err
 	}
@@ -509,17 +519,17 @@ func (r *streamChunkRewriter) rawJSONChunks(p []byte) ([][]byte, error) {
 	return chunks, nil
 }
 
-func (r *streamChunkRewriter) tryRawJSONChunks(p []byte) ([][]byte, bool, error) {
+func (r *streamChunkRewriter) tryRawJSONChunks(p []byte) ([][]byte, bool, bool, error) {
 	trimmed := bytes.Trim(p, " \t\r\n")
 	if len(trimmed) > 0 {
 		switch trimmed[0] {
 		case '{':
 			if bytes.IndexByte(trimmed, '}') < 0 {
-				return [][]byte{bytes.Clone(p)}, true, nil
+				return nil, false, true, nil
 			}
 		case '[':
 			if bytes.IndexByte(trimmed, ']') < 0 {
-				return [][]byte{bytes.Clone(p)}, true, nil
+				return nil, false, true, nil
 			}
 		}
 	}
@@ -541,7 +551,7 @@ func (r *streamChunkRewriter) tryRawJSONChunks(p []byte) ([][]byte, bool, error)
 			var err error
 			restored, _, valid, err = r.sse.restoreResponseModelCandidate(trimmed)
 			if err != nil {
-				return nil, false, err
+				return nil, false, false, err
 			}
 		} else if json.Valid(trimmed) {
 			restored = bytes.Clone(trimmed)
@@ -549,23 +559,26 @@ func (r *streamChunkRewriter) tryRawJSONChunks(p []byte) ([][]byte, bool, error)
 		}
 		if valid {
 			if r.frameRawJSONAsSSE {
-				return [][]byte{frameSSEData(restored)}, true, nil
+				return [][]byte{frameSSEData(restored)}, true, false, nil
 			}
-			return [][]byte{restored}, true, nil
+			return [][]byte{restored}, true, false, nil
 		}
 	}
-	values, ok := splitJSONValues(p)
+	values, ok, incomplete := splitJSONValues(p)
+	if incomplete {
+		return nil, false, true, nil
+	}
 	if !ok {
-		return nil, false, nil
+		return nil, false, false, nil
 	}
 	if len(values) == 0 {
-		return nil, true, nil
+		return nil, true, false, nil
 	}
 	out := make([][]byte, 0, len(values))
 	for _, value := range values {
 		restored, _, err := r.sse.restoreResponseModel(value)
 		if err != nil {
-			return nil, false, err
+			return nil, false, false, err
 		}
 		if r.frameRawJSONAsSSE {
 			out = append(out, frameSSEData(restored))
@@ -573,12 +586,12 @@ func (r *streamChunkRewriter) tryRawJSONChunks(p []byte) ([][]byte, bool, error)
 		}
 		out = append(out, restored)
 	}
-	return out, true, nil
+	return out, true, false, nil
 }
 
-func splitJSONValues(p []byte) ([][]byte, bool) {
+func splitJSONValues(p []byte) ([][]byte, bool, bool) {
 	if len(bytes.TrimSpace(p)) == 0 {
-		return nil, true
+		return nil, true, false
 	}
 	dec := json.NewDecoder(bytes.NewReader(p))
 	values := make([][]byte, 0, 1)
@@ -589,17 +602,28 @@ func splitJSONValues(p []byte) ([][]byte, bool) {
 			break
 		}
 		if err != nil {
-			return nil, false
+			return nil, false, err == io.ErrUnexpectedEOF
 		}
 		values = append(values, raw)
 	}
-	return values, len(values) > 0
+	return values, len(values) > 0, false
 }
 
 func (r *streamChunkRewriter) Flush() ([][]byte, error) {
 	if len(r.pending) > 0 {
 		pending := append([]byte(nil), r.pending...)
 		r.pending = nil
+		if couldStartJSONValue(pending) {
+			chunks, err := r.rawJSONChunks(pending)
+			if err != nil {
+				return nil, err
+			}
+			flushed, err := r.sse.Flush()
+			if err != nil {
+				return nil, err
+			}
+			return append(chunks, flushed...), nil
+		}
 		chunks, err := r.sse.Write(pending)
 		if err != nil {
 			return nil, err
@@ -1034,6 +1058,12 @@ func emitRewritten(chunks [][]byte, batch bool, emit func([]byte) error) error {
 			}
 		}
 		return nil
+	}
+	if len(chunks) == 1 {
+		if len(chunks[0]) == 0 {
+			return nil
+		}
+		return emit(chunks[0])
 	}
 	total := 0
 	for _, chunk := range chunks {
@@ -1500,7 +1530,7 @@ func (s *responseModelMarkerScanner) feed(b byte) bool {
 		s.tail[len(s.tail)-1] = b
 	}
 	tail := s.tail[:s.tailLen]
-	if bytes.HasSuffix(tail, []byte(`"model"`)) || bytes.HasSuffix(tail, []byte(`"modelVersion"`)) {
+	if b == '"' && (bytes.HasSuffix(tail, []byte(`"model"`)) || bytes.HasSuffix(tail, []byte(`"modelVersion"`))) {
 		return true
 	}
 

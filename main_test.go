@@ -3808,7 +3808,7 @@ func TestStreamChunkRewriterRawJSONUsesOneRestorePass(t *testing.T) {
 }
 
 func legacyRawJSONChunksForTest(r *streamChunkRewriter, p []byte) ([][]byte, error) {
-	values, ok := splitJSONValues(p)
+	values, ok, _ := splitJSONValues(p)
 	if !ok {
 		return [][]byte{bytes.Clone(p)}, nil
 	}
@@ -3830,7 +3830,61 @@ func legacyRawJSONChunksForTest(r *streamChunkRewriter, p []byte) ([][]byte, err
 	return out, nil
 }
 
-func TestRawJSONClearlyIncompleteContainerUsesCloneOnly(t *testing.T) {
+func TestStreamChunkRewriterBuffersSplitRawJSON(t *testing.T) {
+	for _, framed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("framed=%v", framed), func(t *testing.T) {
+			first := []byte(`{"model":"up`)
+			second := []byte(`stream","id":"r`)
+			r := newStreamChunkRewriter("client")
+			r.frameRawJSONAsSSE = framed
+
+			chunks, err := r.Write(first)
+			if err != nil || len(chunks) != 0 {
+				t.Fatalf("first Write = (%q, %v), want no output", chunks, err)
+			}
+			first[0] = 'x'
+
+			chunks, err = r.Write(second)
+			if err != nil || len(chunks) != 0 {
+				t.Fatalf("second Write = (%q, %v), want no output", chunks, err)
+			}
+			second[len(second)-1] = 'x'
+
+			chunks, err = r.Write([]byte(`1"}`))
+			if err != nil || len(chunks) != 1 {
+				t.Fatalf("third Write = (%q, %v), want one output", chunks, err)
+			}
+			got := chunks[0]
+			if framed {
+				if !bytes.HasPrefix(got, []byte("data: ")) || !bytes.HasSuffix(got, []byte("\n\n")) {
+					t.Fatalf("framed output = %q", got)
+				}
+				got = bytes.TrimSuffix(bytes.TrimPrefix(got, []byte("data: ")), []byte("\n\n"))
+			}
+			if !json.Valid(got) || bytes.Contains(got, []byte(`"upstream"`)) || !bytes.Contains(got, []byte(`"client"`)) || !bytes.Contains(got, []byte(`"id":"r1"`)) {
+				t.Fatalf("rewritten output = %q", got)
+			}
+		})
+	}
+
+	arrayRewriter := newStreamChunkRewriter("client")
+	chunks, err := arrayRewriter.Write([]byte(`["partial`))
+	if err != nil || len(chunks) != 0 {
+		t.Fatalf("array first Write = (%q, %v), want no output", chunks, err)
+	}
+	chunks, err = arrayRewriter.Write([]byte(`"]`))
+	if err != nil || len(chunks) != 1 || !json.Valid(chunks[0]) || string(chunks[0]) != `["partial"]` {
+		t.Fatalf("array second Write = (%q, %v)", chunks, err)
+	}
+
+	passthrough := newStreamChunkRewriter("client")
+	chunks, err = passthrough.Write([]byte("not-json"))
+	if err != nil || len(chunks) != 1 || string(chunks[0]) != "not-json" {
+		t.Fatalf("non-JSON Write = (%q, %v)", chunks, err)
+	}
+}
+
+func TestRawJSONIncompleteContainerFlushesUnchangedOwnedChunk(t *testing.T) {
 	tests := []struct {
 		name  string
 		input []byte
@@ -3840,15 +3894,17 @@ func TestRawJSONClearlyIncompleteContainerUsesCloneOnly(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			input := bytes.Clone(tt.input)
+			original := bytes.Clone(tt.input)
+			input := bytes.Clone(original)
 			r := newStreamChunkRewriter("client")
 			chunks, err := r.Write(input)
-			if err != nil || len(chunks) != 1 || !bytes.Equal(chunks[0], input) {
-				t.Fatalf("Write = (%q, %v), want one unchanged chunk", chunks, err)
+			if err != nil || len(chunks) != 0 {
+				t.Fatalf("Write = (%q, %v), want no output", chunks, err)
 			}
 			input[0] ^= 1
-			if bytes.Equal(chunks[0], input) {
-				t.Fatal("output aliases caller input")
+			chunks, err = r.Flush()
+			if err != nil || len(chunks) != 1 || !bytes.Equal(chunks[0], original) {
+				t.Fatalf("Flush = (%q, %v), want one unchanged owned chunk", chunks, err)
 			}
 
 			r = newStreamChunkRewriter("client")
@@ -3979,7 +4035,7 @@ func TestSplitJSONValuesKeepsDecoderOwnedPayload(t *testing.T) {
 		}
 	}
 	productionAllocs := testing.AllocsPerRun(50, func() {
-		values, ok := splitJSONValues(input)
+		values, ok, _ := splitJSONValues(input)
 		if !ok || len(values) != 64 {
 			panic(fmt.Sprintf("splitJSONValues=(%d,%v)", len(values), ok))
 		}
