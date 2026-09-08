@@ -3475,19 +3475,19 @@ func TestStreamChunkRewriterDoesNotTreatReadBoundaryAsLineEnding(t *testing.T) {
 		t.Run(input, func(t *testing.T) {
 			var want string
 			for split := 0; split <= len(input); split++ {
-			r := newStreamChunkRewriter("client")
-			first, err := r.Write([]byte(input[:split]))
-			if err != nil {
-				t.Fatalf("split %d first write: %v", split, err)
-			}
-			second, err := r.Write([]byte(input[split:]))
-			if err != nil {
-				t.Fatalf("split %d second write: %v", split, err)
-			}
-			flushed, err := r.Flush()
-			if err != nil {
-				t.Fatalf("split %d flush: %v", split, err)
-			}
+				r := newStreamChunkRewriter("client")
+				first, err := r.Write([]byte(input[:split]))
+				if err != nil {
+					t.Fatalf("split %d first write: %v", split, err)
+				}
+				second, err := r.Write([]byte(input[split:]))
+				if err != nil {
+					t.Fatalf("split %d second write: %v", split, err)
+				}
+				flushed, err := r.Flush()
+				if err != nil {
+					t.Fatalf("split %d flush: %v", split, err)
+				}
 				got := flattenChunks(append(append(first, second...), flushed...))
 				if split == 0 {
 					want = got
@@ -5132,6 +5132,253 @@ func TestHandleExecutorExecuteStreamClosesPluginOnChunkErrorAfterPendingPrefix(t
 	}
 	if strings.Join(emitted, "") != "event" {
 		t.Fatalf("emitted=%q, want pending bytes flushed before error close", emitted)
+	}
+}
+
+func executorStreamLifecycleRequest(t *testing.T, streamID string) []byte {
+	t.Helper()
+	raw, err := json.Marshal(rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "client",
+			Format:          "openai",
+			SourceFormat:    "openai",
+			Stream:          true,
+			OriginalRequest: []byte(`{"model":"client","stream":true}`),
+		},
+		StreamID: streamID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func TestShutdownExecutorStreamsClosesAndWaitsForWorkers(t *testing.T) {
+	resetExecutorStreamLifecycle()
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+
+	readStarted := make(chan struct{})
+	hostClosed := make(chan struct{})
+	allowReadReturn := make(chan struct{})
+	pluginCloseAttempted := make(chan struct{})
+	var readOnce, hostCloseOnce, allowReadOnce, pluginCloseOnce sync.Once
+	var callbackMu sync.Mutex
+	callbacks := 0
+	hostCloseCalls := 0
+	callbackCount := func() int {
+		callbackMu.Lock()
+		defer callbackMu.Unlock()
+		return callbacks
+	}
+	releaseRead := func() { allowReadOnce.Do(func() { close(allowReadReturn) }) }
+	t.Cleanup(func() {
+		releaseRead()
+		shutdownExecutorStreams()
+		resetExecutorStreamLifecycle()
+		setLoadedConfigForTest(defaultConfig())
+	})
+
+	call := func(method string, payload any) (json.RawMessage, error) {
+		callbackMu.Lock()
+		callbacks++
+		callbackMu.Unlock()
+		switch method {
+		case pluginabi.MethodHostModelExecuteStream:
+			return json.Marshal(pluginapi.HostModelStreamResponse{
+				StatusCode: http.StatusOK,
+				StreamID:   "host-stream",
+				Headers:    http.Header{"Content-Type": {"application/json"}},
+			})
+		case pluginabi.MethodHostModelStreamRead:
+			readOnce.Do(func() { close(readStarted) })
+			<-hostClosed
+			<-allowReadReturn
+			return json.Marshal(pluginapi.HostModelStreamReadResponse{Done: true})
+		case pluginabi.MethodHostModelStreamClose:
+			callbackMu.Lock()
+			hostCloseCalls++
+			callbackMu.Unlock()
+			hostCloseOnce.Do(func() { close(hostClosed) })
+			return json.Marshal(map[string]any{})
+		case pluginabi.MethodHostStreamClose:
+			pluginCloseOnce.Do(func() { close(pluginCloseAttempted) })
+			return json.Marshal(map[string]any{})
+		default:
+			return nil, fmt.Errorf("unexpected method %q", method)
+		}
+	}
+
+	if _, err := handleExecutorExecuteStream(executorStreamLifecycleRequest(t, "plugin-stream"), call); err != nil {
+		t.Fatalf("handleExecutorExecuteStream error = %v", err)
+	}
+	select {
+	case <-readStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not start reading")
+	}
+
+	shutdownReturned := make(chan struct{})
+	go func() {
+		shutdownExecutorStreams()
+		close(shutdownReturned)
+	}()
+	select {
+	case <-hostClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not close host stream")
+	}
+	select {
+	case <-shutdownReturned:
+		t.Fatal("shutdown returned before worker exited")
+	default:
+	}
+
+	releaseRead()
+	select {
+	case <-shutdownReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not wait for worker")
+	}
+	select {
+	case <-pluginCloseAttempted:
+	default:
+		t.Fatal("shutdown returned before plugin close was attempted")
+	}
+	callbackMu.Lock()
+	gotHostCloseCalls := hostCloseCalls
+	callbackMu.Unlock()
+	if gotHostCloseCalls != 1 {
+		t.Fatalf("host close calls = %d, want 1", gotHostCloseCalls)
+	}
+	callbacksAfterShutdown := callbackCount()
+	callbacksChecked := make(chan struct{})
+	go func() {
+		callbackMu.Lock()
+		callbackMu.Unlock()
+		close(callbacksChecked)
+	}()
+	select {
+	case <-callbacksChecked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback count did not settle")
+	}
+	if got := callbackCount(); got != callbacksAfterShutdown {
+		t.Fatalf("host callbacks after shutdown = %d, want %d", got, callbacksAfterShutdown)
+	}
+}
+
+func TestExecutorStreamLifecycleRejectsDuringShutdownAndResets(t *testing.T) {
+	resetExecutorStreamLifecycle()
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+
+	oldReadStarted := make(chan struct{})
+	oldHostClosed := make(chan struct{})
+	allowOldReadReturn := make(chan struct{})
+	rejectedHostClosed := make(chan struct{})
+	freshPluginClosed := make(chan struct{})
+	var oldReadOnce, oldHostCloseOnce, allowOldReadOnce, rejectedCloseOnce, freshPluginCloseOnce sync.Once
+	var callbackMu sync.Mutex
+	executeCalls := 0
+	releaseOldRead := func() { allowOldReadOnce.Do(func() { close(allowOldReadReturn) }) }
+	t.Cleanup(func() {
+		releaseOldRead()
+		shutdownExecutorStreams()
+		resetExecutorStreamLifecycle()
+		setLoadedConfigForTest(defaultConfig())
+	})
+
+	call := func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostModelExecuteStream:
+			callbackMu.Lock()
+			executeCalls++
+			streamID := []string{"old-host", "rejected-host", "fresh-host"}[executeCalls-1]
+			callbackMu.Unlock()
+			return json.Marshal(pluginapi.HostModelStreamResponse{
+				StatusCode: http.StatusOK,
+				StreamID:   streamID,
+				Headers:    http.Header{"Content-Type": {"application/json"}},
+			})
+		case pluginabi.MethodHostModelStreamRead:
+			streamID := payload.(pluginapi.HostModelStreamReadRequest).StreamID
+			switch streamID {
+			case "old-host":
+				oldReadOnce.Do(func() { close(oldReadStarted) })
+				<-oldHostClosed
+				<-allowOldReadReturn
+				return json.Marshal(pluginapi.HostModelStreamReadResponse{Done: true})
+			case "fresh-host":
+				return json.Marshal(pluginapi.HostModelStreamReadResponse{Done: true})
+			default:
+				return nil, fmt.Errorf("unexpected read stream %q", streamID)
+			}
+		case pluginabi.MethodHostModelStreamClose:
+			streamID := payload.(pluginapi.HostModelStreamCloseRequest).StreamID
+			switch streamID {
+			case "old-host":
+				oldHostCloseOnce.Do(func() { close(oldHostClosed) })
+			case "rejected-host":
+				rejectedCloseOnce.Do(func() { close(rejectedHostClosed) })
+			}
+			return json.Marshal(map[string]any{})
+		case pluginabi.MethodHostStreamClose:
+			streamID := payload.(struct {
+				StreamID string `json:"stream_id"`
+				Error    string `json:"error,omitempty"`
+			}).StreamID
+			if streamID == "fresh-plugin" {
+				freshPluginCloseOnce.Do(func() { close(freshPluginClosed) })
+			}
+			return json.Marshal(map[string]any{})
+		default:
+			return nil, fmt.Errorf("unexpected method %q", method)
+		}
+	}
+
+	if _, err := handleExecutorExecuteStream(executorStreamLifecycleRequest(t, "old-plugin"), call); err != nil {
+		t.Fatalf("start old stream: %v", err)
+	}
+	select {
+	case <-oldReadStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("old worker did not start reading")
+	}
+
+	shutdownReturned := make(chan struct{})
+	go func() {
+		shutdownExecutorStreams()
+		close(shutdownReturned)
+	}()
+	select {
+	case <-oldHostClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not close old host stream")
+	}
+
+	if _, err := handleExecutorExecuteStream(executorStreamLifecycleRequest(t, "rejected-plugin"), call); err == nil {
+		t.Fatal("prepared stream was admitted during shutdown")
+	}
+	select {
+	case <-rejectedHostClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("rejected prepared stream did not close its host stream")
+	}
+
+	releaseOldRead()
+	select {
+	case <-shutdownReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not finish after old worker exited")
+	}
+
+	resetExecutorStreamLifecycle()
+	if _, err := handleExecutorExecuteStream(executorStreamLifecycleRequest(t, "fresh-plugin"), call); err != nil {
+		t.Fatalf("start fresh stream after reset: %v", err)
+	}
+	select {
+	case <-freshPluginClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fresh stream did not complete after reset")
 	}
 }
 

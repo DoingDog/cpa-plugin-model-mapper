@@ -1119,6 +1119,55 @@ type executorStream struct {
 	closeHostErr      error
 }
 
+var executorStreamLifecycle = struct {
+	mu       sync.Mutex
+	stopping bool
+	active   map[*executorStream]struct{}
+	wg       sync.WaitGroup
+}{active: make(map[*executorStream]struct{})}
+
+func resetExecutorStreamLifecycle() {
+	executorStreamLifecycle.mu.Lock()
+	defer executorStreamLifecycle.mu.Unlock()
+	if len(executorStreamLifecycle.active) != 0 {
+		return
+	}
+	executorStreamLifecycle.stopping = false
+	executorStreamLifecycle.active = make(map[*executorStream]struct{})
+}
+
+func admitExecutorStream(stream *executorStream) bool {
+	executorStreamLifecycle.mu.Lock()
+	defer executorStreamLifecycle.mu.Unlock()
+	if executorStreamLifecycle.stopping {
+		return false
+	}
+	executorStreamLifecycle.active[stream] = struct{}{}
+	executorStreamLifecycle.wg.Add(1)
+	return true
+}
+
+func unregisterExecutorStream(stream *executorStream) {
+	executorStreamLifecycle.mu.Lock()
+	delete(executorStreamLifecycle.active, stream)
+	executorStreamLifecycle.mu.Unlock()
+	executorStreamLifecycle.wg.Done()
+}
+
+func shutdownExecutorStreams() {
+	executorStreamLifecycle.mu.Lock()
+	executorStreamLifecycle.stopping = true
+	streams := make([]*executorStream, 0, len(executorStreamLifecycle.active))
+	for stream := range executorStreamLifecycle.active {
+		streams = append(streams, stream)
+	}
+	executorStreamLifecycle.mu.Unlock()
+	for _, stream := range streams {
+		_ = stream.closeHost()
+	}
+	executorStreamLifecycle.wg.Wait()
+}
+
 func (s *executorStream) closeHost() error {
 	s.closeHostOnce.Do(func() {
 		_, s.closeHostErr = s.call(pluginabi.MethodHostModelStreamClose, pluginapi.HostModelStreamCloseRequest{StreamID: s.hostStreamID})
@@ -1237,7 +1286,12 @@ func startExecutorStream(req executorRPCRequest, call hostCaller, closeStream fu
 		_ = stream.closeHost()
 		return nil, err
 	}
+	if !admitExecutorStream(stream) {
+		_ = stream.closeHost()
+		return nil, fmt.Errorf("executor stream lifecycle is stopping")
+	}
 	go func() {
+		defer unregisterExecutorStream(stream)
 		if err := runStreamForward(stream); err != nil {
 			_ = closeStream(stream.pluginStreamID, err.Error())
 		}

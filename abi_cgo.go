@@ -87,6 +87,8 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	if host.call == nil || host.free_buffer == nil {
 		return 1
 	}
+	resetExecutorStreamLifecycle()
+	resetCallerPatternCache()
 	setHostCallback(func(method string, request []byte) ([]byte, error) {
 		methodC := C.CString(method)
 		defer C.free(unsafe.Pointer(methodC))
@@ -158,5 +160,7 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
+	shutdownExecutorStreams()
+	resetCallerPatternCache()
 	setHostCallback(nil)
 }
