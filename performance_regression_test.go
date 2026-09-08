@@ -183,7 +183,14 @@ func TestRunStreamForwardReleasesSetupBeforeRead(t *testing.T) {
 			return nil, nil
 		}
 	}
-	if err := runStreamForward(req, call); err != nil {
+	stream, _, err := prepareExecutorStream(req, call)
+	if err != nil {
+		t.Fatalf("prepareExecutorStream error = %v", err)
+	}
+	if req.OriginalRequest != nil || req.Headers != nil || req.Query != nil || req.Metadata != nil {
+		t.Fatalf("setup fields retained after prepare: %#v", req)
+	}
+	if err := runStreamForward(stream); err != nil {
 		t.Fatalf("runStreamForward error = %v", err)
 	}
 }

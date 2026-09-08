@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unsafe"
@@ -3711,13 +3712,22 @@ func TestHandleExecutorExecuteStreamRestoresLineDelimitedRawJSONForWebSocket(t *
 		{Payload: []byte(`{"type":"response.created","response":{"id":"r1"}}` + "\n" + `{"type":"response.completed","response":{"model":"deepseek-v4-flash","output":[]}}`)},
 		{Done: true},
 	}
-	emitted, _, _, _, err := runExecutorStreamTestWithHostContentType(req, reads, "application/json")
+	emitted, _, _, respRaw, err := runExecutorStreamTestWithHostContentType(req, reads, "application/json")
 	if err != nil {
 		t.Fatalf("handleExecutorExecuteStream error = %v", err)
 	}
 	joined := strings.Join(emitted, "")
 	if !strings.Contains(joined, `"response":{"model":"codex-ws-client"`) || strings.Contains(joined, `deepseek-v4-flash`) || strings.Contains(joined, "data: ") {
 		t.Fatalf("emitted=%q", joined)
+	}
+	var resp struct {
+		Headers http.Header `json:"headers"`
+	}
+	if err := json.Unmarshal(respRaw, &resp); err != nil {
+		t.Fatalf("decode stream response: %v", err)
+	}
+	if got := resp.Headers.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
 	}
 }
 
@@ -3738,13 +3748,22 @@ func TestHandleExecutorExecuteStreamRestoresSpaceDelimitedRawJSONForWebSocket(t 
 		{Payload: []byte(`{"type":"response.created","response":{"id":"r1"}} ` + `{"type":"response.completed","response":{"model":"deepseek-v4-flash","output":[]}}`)},
 		{Done: true},
 	}
-	emitted, _, _, _, err := runExecutorStreamTestWithHostContentType(req, reads, "application/json")
+	emitted, _, _, respRaw, err := runExecutorStreamTestWithHostContentType(req, reads, "application/json")
 	if err != nil {
 		t.Fatalf("handleExecutorExecuteStream error = %v", err)
 	}
 	joined := strings.Join(emitted, "")
 	if !strings.Contains(joined, `"response":{"model":"codex-ws-client"`) || strings.Contains(joined, `deepseek-v4-flash`) || strings.Contains(joined, "data: ") {
 		t.Fatalf("emitted=%q", joined)
+	}
+	var resp struct {
+		Headers http.Header `json:"headers"`
+	}
+	if err := json.Unmarshal(respRaw, &resp); err != nil {
+		t.Fatalf("decode stream response: %v", err)
+	}
+	if got := resp.Headers.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
 	}
 }
 
@@ -4291,6 +4310,463 @@ func TestSplitJSONValuesKeepsDecoderOwnedPayload(t *testing.T) {
 	}
 }
 
+func TestHandleExecutorExecuteStreamReturnsPreparedHostHeaders(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	tests := []struct {
+		name            string
+		hostHeaders     http.Header
+		wantContentType string
+		wantFramed      bool
+	}{
+		{
+			name: "application json",
+			hostHeaders: http.Header{
+				"content-type":      {"application/json"},
+				"content-length":    {"999"},
+				"transfer-encoding": {"chunked"},
+				"x-request-id":      {"request-1"},
+			},
+			wantContentType: "application/json",
+		},
+		{
+			name: "missing content type",
+			hostHeaders: http.Header{
+				"x-request-id": {"request-1"},
+			},
+			wantContentType: "text/event-stream",
+			wantFramed:      true,
+		},
+		{
+			name: "event stream with parameters",
+			hostHeaders: http.Header{
+				"content-type": {"text/event-stream; charset=utf-8"},
+				"x-request-id": {"request-1"},
+			},
+			wantContentType: "text/event-stream; charset=utf-8",
+			wantFramed:      true,
+		},
+		{
+			name: "json profile mentioning event stream",
+			hostHeaders: http.Header{
+				"content-type": {`application/json; profile="text/event-stream"`},
+				"x-request-id": {"request-1"},
+			},
+			wantContentType: `application/json; profile="text/event-stream"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var emitted []byte
+			pluginDone := make(chan struct{})
+			var pluginCloseOnce sync.Once
+			reads := []pluginapi.HostModelStreamReadResponse{
+				{Payload: []byte(`{"model":"upstream"}`)},
+				{Done: true},
+			}
+			call := func(method string, payload any) (json.RawMessage, error) {
+				switch method {
+				case pluginabi.MethodHostModelExecuteStream:
+					return json.Marshal(pluginapi.HostModelStreamResponse{
+						StatusCode: http.StatusOK,
+						StreamID:   "host-stream",
+						Headers:    tt.hostHeaders.Clone(),
+					})
+				case pluginabi.MethodHostModelStreamRead:
+					next := reads[0]
+					reads = reads[1:]
+					return json.Marshal(next)
+				case pluginabi.MethodHostStreamEmit:
+					var emit struct {
+						Payload []byte `json:"payload"`
+					}
+					raw, err := json.Marshal(payload)
+					if err != nil {
+						return nil, err
+					}
+					if err := json.Unmarshal(raw, &emit); err != nil {
+						return nil, err
+					}
+					emitted = append(emitted, emit.Payload...)
+					return json.Marshal(map[string]any{})
+				case pluginabi.MethodHostModelStreamClose:
+					return json.Marshal(map[string]any{})
+				case pluginabi.MethodHostStreamClose:
+					pluginCloseOnce.Do(func() { close(pluginDone) })
+					return json.Marshal(map[string]any{})
+				default:
+					return nil, fmt.Errorf("unexpected method %q", method)
+				}
+			}
+			req := rpcExecutorRequest{
+				ExecutorRequest: pluginapi.ExecutorRequest{
+					Model:           "client",
+					Format:          "openai",
+					SourceFormat:    "openai",
+					Stream:          true,
+					OriginalRequest: []byte(`{"model":"client","stream":true}`),
+				},
+				StreamID: "plugin-stream",
+			}
+			rawReq, err := json.Marshal(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			respRaw, err := handleExecutorExecuteStream(rawReq, call)
+			if err != nil {
+				t.Fatalf("handleExecutorExecuteStream error = %v", err)
+			}
+			select {
+			case <-pluginDone:
+			case <-time.After(2 * time.Second):
+				t.Fatal("stream forwarder did not close plugin stream")
+			}
+			var resp pluginapi.ExecutorStreamResponse
+			if err := json.Unmarshal(respRaw, &resp); err != nil {
+				t.Fatalf("decode setup response: %v", err)
+			}
+			if got := resp.Headers.Get("Content-Type"); got != tt.wantContentType {
+				t.Fatalf("Content-Type = %q, want %q", got, tt.wantContentType)
+			}
+			if got := resp.Headers.Get("X-Request-Id"); got != "request-1" {
+				t.Fatalf("X-Request-Id = %q, want request-1", got)
+			}
+			for key := range resp.Headers {
+				if strings.EqualFold(key, "Content-Length") || strings.EqualFold(key, "Transfer-Encoding") {
+					t.Fatalf("setup headers retained %q: %v", key, resp.Headers)
+				}
+			}
+			if got := strings.Contains(string(emitted), "data: "); got != tt.wantFramed {
+				t.Fatalf("emitted=%q, framed=%v, want %v", emitted, got, tt.wantFramed)
+			}
+		})
+	}
+}
+
+func TestHandleExecutorExecuteStreamCompletesSetupBeforeReturning(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	setupStarted := make(chan struct{})
+	setupReleased := make(chan struct{})
+	readStarted := make(chan struct{})
+	readReleased := make(chan struct{})
+	pluginDone := make(chan struct{})
+	var setupOnce, readOnce, pluginOnce sync.Once
+	releaseSetup := func() { setupOnce.Do(func() { close(setupReleased) }) }
+	releaseRead := func() { readOnce.Do(func() { close(readReleased) }) }
+	defer releaseSetup()
+	defer releaseRead()
+	call := func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostModelExecuteStream:
+			close(setupStarted)
+			<-setupReleased
+			return json.Marshal(pluginapi.HostModelStreamResponse{
+				StatusCode: http.StatusOK,
+				StreamID:   "host-stream",
+				Headers:    http.Header{"Content-Type": {"application/json"}},
+			})
+		case pluginabi.MethodHostModelStreamRead:
+			close(readStarted)
+			<-readReleased
+			return json.Marshal(pluginapi.HostModelStreamReadResponse{Done: true})
+		case pluginabi.MethodHostModelStreamClose:
+			return json.Marshal(map[string]any{})
+		case pluginabi.MethodHostStreamClose:
+			pluginOnce.Do(func() { close(pluginDone) })
+			return json.Marshal(map[string]any{})
+		default:
+			return nil, fmt.Errorf("unexpected method %q", method)
+		}
+	}
+	req := rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "client",
+			Format:          "openai",
+			SourceFormat:    "openai",
+			Stream:          true,
+			OriginalRequest: []byte(`{"model":"client","stream":true}`),
+		},
+		StreamID: "plugin-stream",
+	}
+	rawReq, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		body []byte
+		err  error
+	}
+	returned := make(chan result, 1)
+	go func() {
+		body, err := handleExecutorExecuteStream(rawReq, call)
+		returned <- result{body: body, err: err}
+	}()
+	select {
+	case got := <-returned:
+		t.Fatalf("handler returned before setup completed: (%s, %v)", got.body, got.err)
+	case <-setupStarted:
+	}
+	select {
+	case got := <-returned:
+		t.Fatalf("handler returned while setup was blocked: (%s, %v)", got.body, got.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseSetup()
+	var got result
+	select {
+	case got = <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not return after setup completed")
+	}
+	if got.err != nil {
+		t.Fatalf("handleExecutorExecuteStream error = %v", got.err)
+	}
+	var resp pluginapi.ExecutorStreamResponse
+	if err := json.Unmarshal(got.body, &resp); err != nil {
+		t.Fatalf("decode setup response: %v", err)
+	}
+	if got := resp.Headers.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+	select {
+	case <-readStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not start reading after setup response")
+	}
+	releaseRead()
+	select {
+	case <-pluginDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not close plugin stream")
+	}
+}
+
+func TestPrepareExecutorStreamClosesPartialStreamIDOnDecodeError(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	closeCalls := 0
+	call := func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostModelExecuteStream:
+			return json.RawMessage(`{"stream_id":"host-partial","status_code":"not-a-number"}`), nil
+		case pluginabi.MethodHostModelStreamClose:
+			closeCalls++
+			got := payload.(pluginapi.HostModelStreamCloseRequest)
+			if got.StreamID != "host-partial" {
+				t.Fatalf("closed host stream %q, want host-partial", got.StreamID)
+			}
+			return json.Marshal(map[string]any{})
+		default:
+			return nil, fmt.Errorf("unexpected method %q", method)
+		}
+	}
+	req := executorRPCRequest{
+		Model:           "client",
+		Format:          "openai",
+		SourceFormat:    "openai",
+		OriginalRequest: []byte(`{"model":"client","stream":true}`),
+		StreamID:        "plugin-stream",
+	}
+	_, err := startExecutorStream(req, call, func(string, string) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "decode host stream response") {
+		t.Fatalf("startExecutorStream error = %v, want decode host stream response", err)
+	}
+	if closeCalls != 1 {
+		t.Fatalf("host close calls = %d, want 1", closeCalls)
+	}
+}
+
+func TestRunStreamForwardProcessesTerminalPayload(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	tests := []struct {
+		name            string
+		reads           []pluginapi.HostModelStreamReadResponse
+		wantPluginError string
+	}{
+		{
+			name: "done payload",
+			reads: []pluginapi.HostModelStreamReadResponse{{
+				Payload: []byte(`{"model":"upstream"}`),
+				Done:    true,
+			}},
+		},
+		{
+			name: "error and done payload",
+			reads: []pluginapi.HostModelStreamReadResponse{{
+				Payload: []byte(`{"model":"upstream"}`),
+				Error:   "upstream failed",
+				Done:    true,
+			}},
+			wantPluginError: "upstream failed",
+		},
+		{
+			name: "split sse payload before error",
+			reads: []pluginapi.HostModelStreamReadResponse{
+				{Payload: []byte(`data: {"model":"up`)},
+				{Payload: []byte("stream\"}\n\n"), Error: "upstream failed"},
+			},
+			wantPluginError: "upstream failed",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reads := append([]pluginapi.HostModelStreamReadResponse(nil), tt.reads...)
+			var emitted []byte
+			var events []string
+			var pluginError string
+			pluginDone := make(chan struct{})
+			var pluginOnce sync.Once
+			closePlugin := func(errText string) {
+				pluginError = errText
+				events = append(events, "plugin-close")
+				pluginOnce.Do(func() { close(pluginDone) })
+			}
+			call := func(method string, payload any) (json.RawMessage, error) {
+				switch method {
+				case pluginabi.MethodHostModelExecuteStream:
+					return json.Marshal(pluginapi.HostModelStreamResponse{
+						StatusCode: http.StatusOK,
+						StreamID:   "host-stream",
+						Headers:    http.Header{"Content-Type": {"text/event-stream"}},
+					})
+				case pluginabi.MethodHostModelStreamRead:
+					next := reads[0]
+					reads = reads[1:]
+					return json.Marshal(next)
+				case pluginabi.MethodHostStreamEmit:
+					var emit struct {
+						Payload []byte `json:"payload"`
+					}
+					raw, err := json.Marshal(payload)
+					if err != nil {
+						return nil, err
+					}
+					if err := json.Unmarshal(raw, &emit); err != nil {
+						return nil, err
+					}
+					emitted = append(emitted, emit.Payload...)
+					events = append(events, "emit")
+					return json.Marshal(map[string]any{})
+				case pluginabi.MethodHostModelStreamClose:
+					events = append(events, "host-close")
+					return json.Marshal(map[string]any{})
+				case pluginabi.MethodHostStreamClose:
+					var close struct {
+						Error string `json:"error"`
+					}
+					raw, err := json.Marshal(payload)
+					if err != nil {
+						return nil, err
+					}
+					if err := json.Unmarshal(raw, &close); err != nil {
+						return nil, err
+					}
+					closePlugin(close.Error)
+					return json.Marshal(map[string]any{})
+				default:
+					return nil, fmt.Errorf("unexpected method %q", method)
+				}
+			}
+			req := executorRPCRequest{
+				Model:           "client",
+				Format:          "openai",
+				SourceFormat:    "openai",
+				OriginalRequest: []byte(`{"model":"client","stream":true}`),
+				StreamID:        "plugin-stream",
+			}
+			if _, err := startExecutorStream(req, call, func(_ string, errText string) error {
+				closePlugin(errText)
+				return nil
+			}); err != nil {
+				t.Fatalf("startExecutorStream error = %v", err)
+			}
+			select {
+			case <-pluginDone:
+			case <-time.After(2 * time.Second):
+				t.Fatal("stream forwarder did not close plugin stream")
+			}
+			if got := string(emitted); !strings.Contains(got, `"model":"client"`) {
+				t.Fatalf("emitted=%q, want restored terminal payload", got)
+			}
+			if got := strings.Join(events, ","); got != "emit,host-close,plugin-close" {
+				t.Fatalf("event order = %q, want emit,host-close,plugin-close", got)
+			}
+			if tt.wantPluginError != "" && !strings.Contains(pluginError, tt.wantPluginError) {
+				t.Fatalf("plugin close error = %q, want %q", pluginError, tt.wantPluginError)
+			}
+		})
+	}
+}
+
+func TestRunStreamForwardPreservesInBandErrorAcrossCleanupFailures(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	sentinelEmit := errors.New("flush emit failed")
+	sentinelHostClose := errors.New("host close failed")
+	sentinelPluginClose := errors.New("plugin close failed")
+	emitCalls := 0
+	hostCloseCalls := 0
+	directPluginCloseCalls := 0
+	outerPluginCloseCalls := 0
+	outerError := ""
+	outerDone := make(chan struct{})
+	call := func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostModelExecuteStream:
+			return json.Marshal(pluginapi.HostModelStreamResponse{
+				StatusCode: http.StatusOK,
+				StreamID:   "host-stream",
+				Headers:    http.Header{"Content-Type": {"text/event-stream"}},
+			})
+		case pluginabi.MethodHostModelStreamRead:
+			return json.Marshal(pluginapi.HostModelStreamReadResponse{
+				Payload: []byte("event"),
+				Error:   "primary upstream error",
+				Done:    true,
+			})
+		case pluginabi.MethodHostStreamEmit:
+			emitCalls++
+			return nil, sentinelEmit
+		case pluginabi.MethodHostModelStreamClose:
+			hostCloseCalls++
+			return nil, sentinelHostClose
+		case pluginabi.MethodHostStreamClose:
+			directPluginCloseCalls++
+			return nil, sentinelPluginClose
+		default:
+			return nil, fmt.Errorf("unexpected method %q", method)
+		}
+	}
+	req := executorRPCRequest{
+		Model:           "client",
+		Format:          "openai",
+		SourceFormat:    "openai",
+		OriginalRequest: []byte(`{"model":"client","stream":true}`),
+		StreamID:        "plugin-stream",
+	}
+	if _, err := startExecutorStream(req, call, func(_ string, errText string) error {
+		outerPluginCloseCalls++
+		outerError = errText
+		close(outerDone)
+		return nil
+	}); err != nil {
+		t.Fatalf("startExecutorStream error = %v", err)
+	}
+	select {
+	case <-outerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("outer wrapper did not retry plugin close")
+	}
+	if emitCalls != 1 || hostCloseCalls != 1 || directPluginCloseCalls != 1 || outerPluginCloseCalls != 1 {
+		t.Fatalf("cleanup calls = emit:%d host:%d direct-plugin:%d outer-plugin:%d, want 1 each", emitCalls, hostCloseCalls, directPluginCloseCalls, outerPluginCloseCalls)
+	}
+	for _, want := range []string{"primary upstream error", sentinelEmit.Error(), sentinelHostClose.Error(), sentinelPluginClose.Error()} {
+		if !strings.Contains(outerError, want) {
+			t.Fatalf("outer error = %q, missing %q", outerError, want)
+		}
+	}
+	if !strings.HasPrefix(outerError, "primary upstream error") {
+		t.Fatalf("outer error = %q, want primary in-band error first", outerError)
+	}
+}
+
 func TestRunStreamForwardFlushesPendingBytesOnReadError(t *testing.T) {
 	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
 	sentinelReadError := errors.New("host stream read failed")
@@ -4365,9 +4841,13 @@ func TestRunStreamForwardFlushesPendingBytesOnReadError(t *testing.T) {
 	}
 
 	directState := &streamState{}
+	directStream, _, err := prepareExecutorStream(newRequest(), newCall(directState))
+	if err != nil {
+		t.Fatalf("prepareExecutorStream error = %v", err)
+	}
 	directDone := make(chan error, 1)
 	go func() {
-		directDone <- runStreamForward(newRequest(), newCall(directState))
+		directDone <- runStreamForward(directStream)
 	}()
 	select {
 	case err := <-directDone:
@@ -4457,9 +4937,9 @@ func TestRunStreamForwardClosesHostStreamOnHTTPError(t *testing.T) {
 				return nil, fmt.Errorf("unexpected method %q", method)
 			}
 
-			err := runStreamForward(&req, call)
+			_, _, err := prepareExecutorStream(&req, call)
 			if err == nil || err.Error() != "execute stream status 503: upstream failed" {
-				t.Fatalf("runStreamForward error = %v, want original status error", err)
+				t.Fatalf("prepareExecutorStream error = %v, want original status error", err)
 			}
 			if closeCalls != tt.wantClose {
 				t.Fatalf("host close calls = %d, want %d", closeCalls, tt.wantClose)

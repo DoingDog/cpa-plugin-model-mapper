@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -1108,29 +1109,52 @@ func handleExecutorExecuteStream(raw []byte, call hostCaller) ([]byte, error) {
 	})
 }
 
-func startExecutorStream(req executorRPCRequest, call hostCaller, closeStream func(string, string) error) ([]byte, error) {
-	reqCopy := req
-	go func(req *executorRPCRequest) {
-		if err := runStreamForward(req, call); err != nil {
-			_ = closeStream(req.StreamID, err.Error())
-		}
-	}(&reqCopy)
-	return json.Marshal(map[string]any{"headers": http.Header{"Content-Type": []string{"text/event-stream"}}})
+type executorStream struct {
+	pluginStreamID    string
+	hostStreamID      string
+	originalModel     string
+	frameRawJSONAsSSE bool
+	call              hostCaller
+	closeHostOnce     sync.Once
+	closeHostErr      error
 }
 
-func runStreamForward(req *executorRPCRequest, call hostCaller) error {
+func (s *executorStream) closeHost() error {
+	s.closeHostOnce.Do(func() {
+		_, s.closeHostErr = s.call(pluginabi.MethodHostModelStreamClose, pluginapi.HostModelStreamCloseRequest{StreamID: s.hostStreamID})
+	})
+	return s.closeHostErr
+}
+
+func (s *executorStream) closePlugin(errText string) error {
+	_, err := s.call(pluginabi.MethodHostStreamClose, struct {
+		StreamID string `json:"stream_id"`
+		Error    string `json:"error,omitempty"`
+	}{StreamID: s.pluginStreamID, Error: errText})
+	return err
+}
+
+func (s *executorStream) emit(payload []byte) error {
+	_, err := s.call(pluginabi.MethodHostStreamEmit, struct {
+		StreamID string `json:"stream_id"`
+		Payload  []byte `json:"payload"`
+	}{StreamID: s.pluginStreamID, Payload: payload})
+	return err
+}
+
+func prepareExecutorStream(req *executorRPCRequest, call hostCaller) (*executorStream, http.Header, error) {
 	scope := callerScopeFromMetadata(req.Metadata)
 	cfg := loadedConfig()
 	decision, err := routeModel(cfg, req.SourceFormat, req.Model, scope, callerAPIKeyForSelectedRules(cfg, req.SourceFormat, req.Headers, req.Query, scope))
 	if err != nil {
-		return fmt.Errorf("route stream: %w", err)
+		return nil, nil, fmt.Errorf("route stream: %w", err)
 	}
 	if !decision.Handled {
-		return fmt.Errorf("route stream: unhandled model route for %q", req.Model)
+		return nil, nil, fmt.Errorf("route stream: unhandled model route for %q", req.Model)
 	}
 	body, changed, err := rewriteRequestModel(req.OriginalRequest, decision.UpstreamModel)
 	if err != nil {
-		return fmt.Errorf("rewrite stream request: %w", err)
+		return nil, nil, fmt.Errorf("rewrite stream request: %w", err)
 	}
 	if changed {
 		req.Headers.Del("Content-Length")
@@ -1149,112 +1173,162 @@ func runStreamForward(req *executorRPCRequest, call hostCaller) error {
 		HostCallbackID: req.HostCallbackID,
 	})
 	releaseExecutorStreamSetup(req)
-	body = nil
 	if err != nil {
-		return fmt.Errorf("execute stream: %w", err)
+		return nil, nil, fmt.Errorf("execute stream: %w", err)
 	}
+	var partial struct {
+		StreamID string `json:"stream_id"`
+	}
+	_ = json.Unmarshal(hostRaw, &partial)
 	var hostResp struct {
 		pluginapi.HostModelStreamResponse
 		Body []byte `json:"body"`
 	}
 	if err := json.Unmarshal(hostRaw, &hostResp); err != nil {
-		return fmt.Errorf("decode host stream response: %w", err)
-	}
-	if hostResp.StatusCode >= 400 {
-		if hostResp.StreamID != "" {
-			_, _ = call(pluginabi.MethodHostModelStreamClose, pluginapi.HostModelStreamCloseRequest{StreamID: hostResp.StreamID})
+		decodeErr := fmt.Errorf("decode host stream response: %w", err)
+		if partial.StreamID == "" {
+			return nil, nil, decodeErr
 		}
-		return fmt.Errorf("execute stream status %d: %s", hostResp.StatusCode, string(hostResp.Body))
+		_, closeErr := call(pluginabi.MethodHostModelStreamClose, pluginapi.HostModelStreamCloseRequest{StreamID: partial.StreamID})
+		if closeErr != nil {
+			return nil, nil, errors.Join(decodeErr, fmt.Errorf("close host stream: %w", closeErr))
+		}
+		return nil, nil, decodeErr
 	}
-	if hostResp.StreamID == "" {
-		return fmt.Errorf("missing host stream id")
+	stream := &executorStream{
+		pluginStreamID: req.StreamID,
+		hostStreamID:   hostResp.StreamID,
+		originalModel:  decision.OriginalModel,
+		call:           call,
 	}
-	hostStreamID := hostResp.StreamID
-	closeHost := func() error {
-		_, err := call(pluginabi.MethodHostModelStreamClose, pluginapi.HostModelStreamCloseRequest{StreamID: hostStreamID})
-		return err
+	if hostResp.StatusCode >= http.StatusBadRequest {
+		if stream.hostStreamID != "" {
+			_ = stream.closeHost()
+		}
+		return nil, nil, fmt.Errorf("execute stream status %d: %s", hostResp.StatusCode, string(hostResp.Body))
 	}
-	closePlugin := func(errText string) error {
-		_, err := call(pluginabi.MethodHostStreamClose, struct {
-			StreamID string `json:"stream_id"`
-			Error    string `json:"error,omitempty"`
-		}{StreamID: req.StreamID, Error: errText})
-		return err
+	if stream.hostStreamID == "" {
+		return nil, nil, fmt.Errorf("missing host stream id")
 	}
-	emit := func(payload []byte) error {
-		_, err := call(pluginabi.MethodHostStreamEmit, struct {
-			StreamID string `json:"stream_id"`
-			Payload  []byte `json:"payload"`
-		}{StreamID: req.StreamID, Payload: payload})
-		return err
+	headers := hostResp.Headers.Clone()
+	if headers == nil {
+		headers = make(http.Header)
 	}
-	rewriter := newStreamChunkRewriter(decision.OriginalModel)
-	rewriter.frameRawJSONAsSSE = isEventStreamContentType(hostResp.Headers.Get("Content-Type"))
-	flushAndEmit := func() error {
-		flushed, err := rewriter.Flush()
+	canonicalizeHeaders(headers)
+	headers.Del("Content-Length")
+	headers.Del("Transfer-Encoding")
+	if headers.Get("Content-Type") == "" {
+		headers.Set("Content-Type", "text/event-stream")
+	}
+	stream.frameRawJSONAsSSE = isEventStreamContentType(headers.Get("Content-Type"))
+	return stream, headers, nil
+}
+
+func startExecutorStream(req executorRPCRequest, call hostCaller, closeStream func(string, string) error) ([]byte, error) {
+	stream, headers, err := prepareExecutorStream(&req, call)
+	if err != nil {
+		return nil, err
+	}
+	setup := pluginapi.ExecutorStreamResponse{Headers: headers}
+	response, err := json.Marshal(struct {
+		Headers http.Header `json:"headers"`
+	}{Headers: setup.Headers})
+	if err != nil {
+		_ = stream.closeHost()
+		return nil, err
+	}
+	go func() {
+		if err := runStreamForward(stream); err != nil {
+			_ = closeStream(stream.pluginStreamID, err.Error())
+		}
+	}()
+	return response, nil
+}
+
+func joinStreamErrors(primary error, cleanup ...error) error {
+	errs := make([]error, 0, len(cleanup)+1)
+	if primary != nil {
+		errs = append(errs, primary)
+	}
+	for _, err := range cleanup {
 		if err != nil {
-			return fmt.Errorf("flush stream rewriter: %w", err)
+			errs = append(errs, err)
 		}
-		if err := emitRewritten(flushed, rewriter.frameRawJSONAsSSE, emit); err != nil {
-			return fmt.Errorf("emit flushed stream chunk: %w", err)
-		}
+	}
+	return errors.Join(errs...)
+}
+
+func (s *executorStream) processPayload(rewriter *streamChunkRewriter, payload []byte) error {
+	if len(payload) == 0 {
 		return nil
 	}
+	chunks, err := rewriter.Write(payload)
+	if err != nil {
+		return fmt.Errorf("rewrite stream chunk: %w", err)
+	}
+	if err := emitRewritten(chunks, rewriter.frameRawJSONAsSSE, s.emit); err != nil {
+		return fmt.Errorf("emit stream chunk: %w", err)
+	}
+	return nil
+}
+
+func (s *executorStream) flushAndEmit(rewriter *streamChunkRewriter) error {
+	flushed, err := rewriter.Flush()
+	if err != nil {
+		return fmt.Errorf("flush stream rewriter: %w", err)
+	}
+	if err := emitRewritten(flushed, rewriter.frameRawJSONAsSSE, s.emit); err != nil {
+		return fmt.Errorf("emit flushed stream chunk: %w", err)
+	}
+	return nil
+}
+
+func (s *executorStream) finish(rewriter *streamChunkRewriter, primary error, payloadErr error, pluginError string, closePlugin bool) error {
+	cleanup := make([]error, 0, 3)
+	if payloadErr != nil {
+		cleanup = append(cleanup, payloadErr)
+	}
+	if err := s.flushAndEmit(rewriter); err != nil {
+		cleanup = append(cleanup, err)
+	}
+	if err := s.closeHost(); err != nil {
+		cleanup = append(cleanup, fmt.Errorf("close host stream: %w", err))
+	}
+	if closePlugin {
+		if err := s.closePlugin(pluginError); err != nil {
+			cleanup = append(cleanup, fmt.Errorf("close plugin stream: %w", err))
+		}
+	}
+	if primary != nil && pluginError != "" && len(cleanup) == 0 {
+		return nil
+	}
+	return joinStreamErrors(primary, cleanup...)
+}
+
+func runStreamForward(stream *executorStream) error {
+	rewriter := newStreamChunkRewriter(stream.originalModel)
+	rewriter.frameRawJSONAsSSE = stream.frameRawJSONAsSSE
 	for {
-		readRaw, err := call(pluginabi.MethodHostModelStreamRead, pluginapi.HostModelStreamReadRequest{StreamID: hostStreamID})
+		readRaw, err := stream.call(pluginabi.MethodHostModelStreamRead, pluginapi.HostModelStreamReadRequest{StreamID: stream.hostStreamID})
 		if err != nil {
-			readErr := fmt.Errorf("read host stream: %w", err)
-			if flushErr := flushAndEmit(); flushErr != nil {
-				_ = closeHost()
-				return fmt.Errorf("%v; %w", flushErr, readErr)
-			}
-			if closeErr := closeHost(); closeErr != nil {
-				return fmt.Errorf("close host stream: %v; %w", closeErr, readErr)
-			}
-			return readErr
+			return stream.finish(rewriter, fmt.Errorf("read host stream: %w", err), nil, "", false)
 		}
 		var chunk pluginapi.HostModelStreamReadResponse
 		if err := json.Unmarshal(readRaw, &chunk); err != nil {
-			_ = closeHost()
-			return fmt.Errorf("decode host stream chunk: %w", err)
+			return stream.finish(rewriter, fmt.Errorf("decode host stream chunk: %w", err), nil, "", false)
 		}
+		payloadErr := stream.processPayload(rewriter, chunk.Payload)
 		if chunk.Error != "" {
-			if err := flushAndEmit(); err != nil {
-				_ = closeHost()
-				return err
+			return stream.finish(rewriter, errors.New(chunk.Error), payloadErr, chunk.Error, true)
+		}
+		if payloadErr != nil || chunk.Done {
+			pluginError := ""
+			if payloadErr != nil {
+				pluginError = payloadErr.Error()
 			}
-			if err := closeHost(); err != nil {
-				return fmt.Errorf("close host stream: %w", err)
-			}
-			if err := closePlugin(chunk.Error); err != nil {
-				return fmt.Errorf("close plugin stream: %w", err)
-			}
-			return nil
-		}
-		if chunk.Done {
-			break
-		}
-		chunks, err := rewriter.Write(chunk.Payload)
-		if err != nil {
-			_ = closeHost()
-			return fmt.Errorf("rewrite stream chunk: %w", err)
-		}
-		if err := emitRewritten(chunks, rewriter.frameRawJSONAsSSE, emit); err != nil {
-			_ = closeHost()
-			return fmt.Errorf("emit stream chunk: %w", err)
+			return stream.finish(rewriter, payloadErr, nil, pluginError, true)
 		}
 	}
-	if err := flushAndEmit(); err != nil {
-		_ = closeHost()
-		return err
-	}
-	if err := closeHost(); err != nil {
-		return fmt.Errorf("close host stream: %w", err)
-	}
-	if err := closePlugin(""); err != nil {
-		return fmt.Errorf("close plugin stream: %w", err)
-	}
-	return nil
 }
 
 func handleExecutorExecute(raw []byte, call hostCaller) ([]byte, error) {
