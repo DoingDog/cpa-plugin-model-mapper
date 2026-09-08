@@ -1662,6 +1662,11 @@ func rewriteResponseModelFieldsWithReplacementChecked(body []byte, model string,
 		return nil, false, true, err
 	}
 	changed = responseChanged || changed
+	interactionChanged, err := rewriteNestedRawStringFields(doc, "interaction", model, replacement, "model")
+	if err != nil {
+		return nil, false, true, err
+	}
+	changed = interactionChanged || changed
 	if !changed {
 		return bytes.Clone(body), false, true, nil
 	}

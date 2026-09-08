@@ -1652,7 +1652,7 @@ func TestModelRewriteTreatsOpaqueContentAsRawJSON(t *testing.T) {
 		t.Fatalf("request rewrite touched unsupported fields: %s", rewritten)
 	}
 
-	response := []byte(`{"model":"upstream","modelVersion":"upstream","counter":9007199254740993,"message":{"model":"upstream","modelVersion":"keep-message-version","nested":{"model":"keep-nested"}},"response":{"model":"upstream","modelVersion":"upstream","output":[{"model":"keep-output"}]},"content":[{"model":"keep-content"}]}`)
+	response := []byte(`{"model":"upstream","modelVersion":"upstream","counter":9007199254740993,"message":{"model":"upstream","modelVersion":"keep-message-version","nested":{"model":"keep-nested"}},"response":{"model":"upstream","modelVersion":"upstream","output":[{"model":"keep-output"}]},"interaction":{"model":"upstream","output":[{"model":"keep-output"}]},"content":[{"model":"keep-content"}]}`)
 	restored, changed, err := restoreResponseModel(response, "client")
 	if err != nil {
 		t.Fatalf("restoreResponseModel error = %v", err)
@@ -1669,18 +1669,24 @@ func TestModelRewriteTreatsOpaqueContentAsRawJSON(t *testing.T) {
 			t.Fatalf("%s=%s, want client", key, responseDoc[key])
 		}
 	}
-	var message, nestedResponse map[string]json.RawMessage
+	var message, nestedResponse, interaction map[string]json.RawMessage
 	if err := json.Unmarshal(responseDoc["message"], &message); err != nil {
 		t.Fatalf("decode message: %v", err)
 	}
 	if err := json.Unmarshal(responseDoc["response"], &nestedResponse); err != nil {
 		t.Fatalf("decode nested response: %v", err)
 	}
+	if err := json.Unmarshal(responseDoc["interaction"], &interaction); err != nil {
+		t.Fatalf("decode interaction: %v", err)
+	}
 	if string(message["model"]) != `"client"` || string(message["modelVersion"]) != `"keep-message-version"` || string(message["nested"]) != `{"model":"keep-nested"}` {
 		t.Fatalf("message=%s, response whitelist violated", responseDoc["message"])
 	}
 	if string(nestedResponse["model"]) != `"client"` || string(nestedResponse["modelVersion"]) != `"client"` || string(nestedResponse["output"]) != `[{"model":"keep-output"}]` {
 		t.Fatalf("response=%s, response whitelist violated", responseDoc["response"])
+	}
+	if string(interaction["model"]) != `"client"` || string(interaction["output"]) != `[{"model":"keep-output"}]` {
+		t.Fatalf("interaction=%s, response whitelist violated", responseDoc["interaction"])
 	}
 	if string(responseDoc["content"]) != `[{"model":"keep-content"}]` {
 		t.Fatalf("content=%s, want unchanged", responseDoc["content"])
@@ -3156,7 +3162,7 @@ func TestHandleExecutorExecuteRestoresKnownResponseModelFields(t *testing.T) {
 		t.Fatalf("marshal req: %v", err)
 	}
 	respRaw, err := handleExecutorExecute(rawReq, func(string, any) (json.RawMessage, error) {
-		return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: 200, Body: []byte(`{"model":"gpt-5.5","modelVersion":"gpt-5.5","message":{"model":"gpt-5.5"},"response":{"model":"gpt-5.5","modelVersion":"gpt-5.5"},"content":[{"text":"gpt-5.5 should stay in content"}]}`)})
+		return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: 200, Body: []byte(`{"model":"gpt-5.5","modelVersion":"gpt-5.5","message":{"model":"gpt-5.5"},"response":{"model":"gpt-5.5","modelVersion":"gpt-5.5"},"interaction":{"model":"gpt-5.5","output":[{"model":"keep-output"}]},"content":[{"text":"gpt-5.5 should stay in content"}]}`)})
 	})
 	if err != nil {
 		t.Fatalf("handleExecutorExecute error = %v", err)
@@ -3179,6 +3185,10 @@ func TestHandleExecutorExecuteRestoresKnownResponseModelFields(t *testing.T) {
 	response, ok := payload["response"].(map[string]any)
 	if !ok || response["model"] != "claude-opus-4" || response["modelVersion"] != "claude-opus-4" {
 		t.Fatalf("payload=%s, response model fields not restored", resp.Payload)
+	}
+	interaction, ok := payload["interaction"].(map[string]any)
+	if !ok || interaction["model"] != "claude-opus-4" || !reflect.DeepEqual(interaction["output"], []any{map[string]any{"model": "keep-output"}}) {
+		t.Fatalf("payload=%s, interaction whitelist violated", resp.Payload)
 	}
 	if !strings.Contains(string(resp.Payload), `gpt-5.5 should stay in content`) {
 		t.Fatalf("payload=%s, content text should not be rewritten", resp.Payload)
@@ -4379,7 +4389,7 @@ func TestHandleExecutorExecuteStreamRestoresKnownSSEModelFields(t *testing.T) {
 		StreamID:       "plugin-stream-known-fields-1",
 	}
 	reads := []pluginapi.HostModelStreamReadResponse{
-		{Payload: []byte(`data: {"model":"gpt-5.5","modelVersion":"gpt-5.5","message":{"model":"gpt-5.5"},"response":{"model":"gpt-5.5","modelVersion":"gpt-5.5"},"content":[{"text":"gpt-5.5 should stay in content"}]}` + "\n\n")},
+		{Payload: []byte(`data: {"model":"gpt-5.5","modelVersion":"gpt-5.5","message":{"model":"gpt-5.5"},"response":{"model":"gpt-5.5","modelVersion":"gpt-5.5"},"interaction":{"model":"gpt-5.5","output":[{"model":"keep-output"}]},"content":[{"text":"gpt-5.5 should stay in content"}]}` + "\n\n")},
 		{Done: true},
 	}
 	emitted, _, _, _, err := runExecutorStreamTest(req, reads)
@@ -4387,7 +4397,7 @@ func TestHandleExecutorExecuteStreamRestoresKnownSSEModelFields(t *testing.T) {
 		t.Fatalf("handleExecutorExecuteStream error = %v", err)
 	}
 	joined := strings.Join(emitted, "")
-	for _, want := range []string{`"model":"claude-opus-4"`, `"modelVersion":"claude-opus-4"`, `"message":{"model":"claude-opus-4"}`, `"response":{"model":"claude-opus-4","modelVersion":"claude-opus-4"}`} {
+	for _, want := range []string{`"model":"claude-opus-4"`, `"modelVersion":"claude-opus-4"`, `"message":{"model":"claude-opus-4"}`, `"response":{"model":"claude-opus-4","modelVersion":"claude-opus-4"}`, `"interaction":{"model":"claude-opus-4","output":[{"model":"keep-output"}]}`} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("emitted=%q missing %s", joined, want)
 		}
