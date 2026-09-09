@@ -70,14 +70,14 @@ func run(args []string) error {
 }
 
 func validateDistinctPaths(paths ...string) error {
-	absolutePaths := make([]string, len(paths))
+	canonicalPaths := make([]string, len(paths))
 	infos := make([]os.FileInfo, len(paths))
 	for i, path := range paths {
-		absolute, err := filepath.Abs(path)
+		canonical, err := canonicalPackagePath(path)
 		if err != nil {
-			return fmt.Errorf("normalize package path %s: %w", filepath.ToSlash(path), err)
+			return err
 		}
-		absolutePaths[i] = absolute
+		canonicalPaths[i] = canonical
 
 		info, err := os.Stat(path)
 		if err == nil {
@@ -92,9 +92,9 @@ func validateDistinctPaths(paths ...string) error {
 
 	for i := range paths {
 		for j := 0; j < i; j++ {
-			samePath := absolutePaths[i] == absolutePaths[j]
+			samePath := canonicalPaths[i] == canonicalPaths[j]
 			if runtime.GOOS == "windows" {
-				samePath = strings.EqualFold(absolutePaths[i], absolutePaths[j])
+				samePath = strings.EqualFold(canonicalPaths[i], canonicalPaths[j])
 			}
 			if samePath || (infos[i] != nil && infos[j] != nil && os.SameFile(infos[i], infos[j])) {
 				return fmt.Errorf("package paths must be distinct")
@@ -102,6 +102,49 @@ func validateDistinctPaths(paths ...string) error {
 		}
 	}
 	return nil
+}
+
+func canonicalPackagePath(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("normalize package path %s: %w", filepath.ToSlash(path), err)
+	}
+
+	var suffix []string
+	for current := absolute; ; current = filepath.Dir(current) {
+		info, err := os.Lstat(current)
+		if err == nil {
+			resolved, err := filepath.EvalSymlinks(current)
+			if err == nil {
+				return filepath.Join(append([]string{resolved}, suffix...)...), nil
+			}
+			if !os.IsNotExist(err) || info.Mode()&os.ModeSymlink == 0 {
+				return "", fmt.Errorf("resolve package path %s: %w", filepath.ToSlash(path), err)
+			}
+
+			target, err := os.Readlink(current)
+			if err != nil {
+				return "", fmt.Errorf("read package path symlink %s: %w", filepath.ToSlash(path), err)
+			}
+			if !filepath.IsAbs(target) {
+				target = filepath.Join(filepath.Dir(current), target)
+			}
+			resolved, err = canonicalPackagePath(target)
+			if err != nil {
+				return "", err
+			}
+			return filepath.Join(append([]string{resolved}, suffix...)...), nil
+		}
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf("stat package path %s: %w", filepath.ToSlash(path), err)
+		}
+
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", fmt.Errorf("resolve package path %s: %w", filepath.ToSlash(path), err)
+		}
+		suffix = append([]string{filepath.Base(current)}, suffix...)
+	}
 }
 
 func packageExistingArtifacts(version, distDir, outDir string) error {
@@ -144,6 +187,9 @@ func packageExistingArtifacts(version, distDir, outDir string) error {
 		}
 		zipPaths = append(zipPaths, zipPath)
 	}
+	if err := writeChecksums(filepath.Join(outDir, "checksums.txt"), zipPaths); err != nil {
+		return err
+	}
 	for _, artifact := range artifactSpecs() {
 		if found[artifact] {
 			continue
@@ -154,7 +200,7 @@ func packageExistingArtifacts(version, distDir, outDir string) error {
 			return fmt.Errorf("remove stale archive %s: %w", filepath.ToSlash(zipPath), err)
 		}
 	}
-	return writeChecksums(filepath.Join(outDir, "checksums.txt"), zipPaths)
+	return nil
 }
 
 func artifactSpecs() []artifactSpec {

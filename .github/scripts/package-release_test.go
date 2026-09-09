@@ -249,6 +249,62 @@ func assertSentinelsUnchanged(t *testing.T, sentinels map[string][]byte, paths .
 	}
 }
 
+func TestRunRejectsAliasedAbsentOutputsBeforeWriting(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		paths func(*testing.T, string) (string, string)
+	}{
+		{
+			name: "symlinked parent",
+			paths: func(t *testing.T, dir string) (string, string) {
+				t.Helper()
+				realParent := filepath.Join(dir, "real")
+				aliasParent := filepath.Join(dir, "alias")
+				if err := os.Mkdir(realParent, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(realParent, aliasParent); err != nil {
+					t.Skipf("create parent symlink: %v", err)
+				}
+				return filepath.Join(realParent, "archive.zip"), filepath.Join(aliasParent, "archive.zip")
+			},
+		},
+		{
+			name: "dangling checksum symlink",
+			paths: func(t *testing.T, dir string) (string, string) {
+				t.Helper()
+				out := filepath.Join(dir, "out")
+				if err := os.Mkdir(out, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				archive := filepath.Join(out, "archive.zip")
+				checksum := filepath.Join(out, "checksums.txt")
+				if err := os.Symlink(filepath.Base(archive), checksum); err != nil {
+					t.Skipf("create checksum symlink: %v", err)
+				}
+				return archive, checksum
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			library := filepath.Join(dir, "model-mapper.so")
+			if err := os.WriteFile(library, []byte("plugin"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			archive, checksum := tt.paths(t, dir)
+
+			err := run([]string{"-library", library, "-archive", archive, "-checksum", checksum})
+			if err == nil || !strings.Contains(err.Error(), "must be distinct") {
+				t.Fatalf("run error = %v, want distinct path error", err)
+			}
+			if _, err := os.Lstat(archive); !os.IsNotExist(err) {
+				t.Fatalf("archive exists after rejected run: %v", err)
+			}
+		})
+	}
+}
+
 func TestPackageExistingArtifactsRejectsUnverifiedVersionsBeforeWriting(t *testing.T) {
 	for _, tt := range []struct {
 		name         string
@@ -350,6 +406,59 @@ func TestPackageExistingArtifactsUsesSha256sumFormat(t *testing.T) {
 		if !strings.Contains(got, wantLine+"\n") {
 			t.Fatalf("checksums.txt = %q, missing %q", got, wantLine)
 		}
+	}
+}
+
+func TestPackageExistingArtifactsPreservesStaleArchivesWhenChecksumWriteFails(t *testing.T) {
+	dir := t.TempDir()
+	dist := filepath.Join(dir, "dist")
+	out := filepath.Join(dir, "release")
+	writeArtifact := func(path, contents string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path+".version", []byte("0.5.3\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	linuxPath := filepath.Join(dist, "linux_amd64", "model-mapper.so")
+	windowsPath := filepath.Join(dist, "windows_amd64", "model-mapper.dll")
+	writeArtifact(linuxPath, "linux")
+	writeArtifact(windowsPath, "windows")
+	if err := packageExistingArtifacts("0.5.3", dist, out); err != nil {
+		t.Fatalf("first packageExistingArtifacts error = %v", err)
+	}
+
+	staleArchive := filepath.Join(out, "model-mapper_0.5.3_windows_amd64.zip")
+	checksumsPath := filepath.Join(out, "checksums.txt")
+	for _, path := range []string{windowsPath, windowsPath + ".version"} {
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("remove Windows artifact %s: %v", path, err)
+		}
+	}
+	if err := os.Chmod(checksumsPath, 0o444); err != nil {
+		t.Fatalf("make checksum manifest read-only: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(checksumsPath, 0o644) })
+
+	err := packageExistingArtifacts("0.5.3", dist, out)
+	if err == nil || !strings.Contains(err.Error(), "write checksums") {
+		t.Fatalf("second packageExistingArtifacts error = %v, want checksum write error", err)
+	}
+	checksums, err := os.ReadFile(checksumsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(checksums), filepath.Base(staleArchive)) {
+		t.Fatalf("checksums.txt does not contain stale archive: %q", checksums)
+	}
+	if _, err := os.Stat(staleArchive); err != nil {
+		t.Fatalf("stale archive was removed while checksums.txt references it: %v", err)
 	}
 }
 
