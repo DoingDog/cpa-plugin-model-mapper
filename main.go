@@ -597,6 +597,9 @@ trimmed:
 			if !changed {
 				return [][]byte{bytes.Clone(p)}, len(p), true, false, nil
 			}
+			if start == 0 && end == len(p) {
+				return [][]byte{restored}, len(p), true, false, nil
+			}
 			out := make([]byte, 0, len(p)-end+start+len(restored))
 			out = append(out, p[:start]...)
 			out = append(out, restored...)
