@@ -2173,21 +2173,32 @@ func callerAPIKey(headers http.Header, query url.Values, scope string) string {
 	if scope == "" {
 		return ""
 	}
-	authorization := headers.Get("Authorization")
-	parts := strings.SplitN(authorization, " ", 2)
-	if len(parts) == 2 && strings.EqualFold(parts[0], "bearer") {
-		authorization = strings.TrimSpace(parts[1])
-	}
-	for _, candidate := range []string{
-		authorization,
-		headers.Get("X-Goog-Api-Key"),
-		headers.Get("X-Api-Key"),
-		query.Get("key"),
-		query.Get("auth_token"),
-	} {
+	matchesScope := func(candidate string) string {
 		candidate = strings.TrimSpace(candidate)
 		if candidate != "" && callerScope(candidate) == scope {
 			return candidate
+		}
+		return ""
+	}
+	for _, authorization := range headers.Values("Authorization") {
+		parts := strings.SplitN(authorization, " ", 2)
+		if len(parts) == 2 && strings.EqualFold(parts[0], "bearer") {
+			authorization = parts[1]
+		}
+		if candidate := matchesScope(authorization); candidate != "" {
+			return candidate
+		}
+	}
+	for _, values := range [][]string{
+		headers.Values("X-Goog-Api-Key"),
+		headers.Values("X-Api-Key"),
+		query["key"],
+		query["auth_token"],
+	} {
+		for _, candidate := range values {
+			if candidate := matchesScope(candidate); candidate != "" {
+				return candidate
+			}
 		}
 	}
 	return ""

@@ -531,12 +531,17 @@ func TestCallerAPIKeyUsesOnlyAuthenticatedCredential(t *testing.T) {
 	}{
 		{name: "authorization bearer", headers: http.Header{"Authorization": {"Bearer sk-auth"}}, scope: callerScope("sk-auth"), want: "sk-auth"},
 		{name: "authorization raw", headers: http.Header{"Authorization": {"sk-raw"}}, scope: callerScope("sk-raw"), want: "sk-raw"},
+		{name: "later bearer", headers: http.Header{"Authorization": {"Bearer spoofed", "Bearer sk-auth"}}, scope: callerScope("sk-auth"), want: "sk-auth"},
 		{name: "google header", headers: http.Header{"X-Goog-Api-Key": {"sk-google"}}, scope: callerScope("sk-google"), want: "sk-google"},
+		{name: "later google header", headers: http.Header{"X-Goog-Api-Key": {"spoofed", "sk-google"}}, scope: callerScope("sk-google"), want: "sk-google"},
 		{name: "anthropic header", headers: http.Header{"X-Api-Key": {"sk-anthropic"}}, scope: callerScope("sk-anthropic"), want: "sk-anthropic"},
+		{name: "later anthropic header", headers: http.Header{"X-Api-Key": {"spoofed", "sk-anthropic"}}, scope: callerScope("sk-anthropic"), want: "sk-anthropic"},
 		{name: "query key", query: url.Values{"key": {"sk-query"}}, scope: callerScope("sk-query"), want: "sk-query"},
+		{name: "later query key", query: url.Values{"key": {"spoofed", "sk-query"}}, scope: callerScope("sk-query"), want: "sk-query"},
 		{name: "query auth token", query: url.Values{"auth_token": {"sk-token"}}, scope: callerScope("sk-token"), want: "sk-token"},
 		{name: "matching candidate after wrong candidate", headers: http.Header{"Authorization": {"Bearer wrong"}, "X-Api-Key": {"sk-right"}}, scope: callerScope("sk-right"), want: "sk-right"},
 		{name: "header does not match authenticated scope", headers: http.Header{"Authorization": {"Bearer spoofed"}}, scope: callerScope("sk-authenticated")},
+		{name: "no digest match", headers: http.Header{"X-Api-Key": {"one", "two"}}, scope: callerScope("three")},
 		{name: "missing authenticated scope", headers: http.Header{"Authorization": {"Bearer sk-auth"}}},
 	}
 	for _, tt := range tests {
@@ -3249,7 +3254,7 @@ func TestReconfigureRulesStackModeIsAtomic(t *testing.T) {
 }
 
 func TestHandleExecutorExecuteUsesCallerScopeAcrossRuleSets(t *testing.T) {
-	const rules = "sk-test#client-model=>scoped-target;sk-kimi-*#client-model=>wildcard-target;#sk-*#client-model=>inverse-target;client-model=>fallback-target"
+	const rules = "sk-test#client-model=>scoped-target;sk-kimi-*#client-model=>wildcard-target;sk-prod-*#client-model=>target;#sk-*#client-model=>inverse-target;client-model=>fallback-target"
 	tests := []struct {
 		name   string
 		cfg    Config
@@ -3272,6 +3277,7 @@ func TestHandleExecutorExecuteUsesCallerScopeAcrossRuleSets(t *testing.T) {
 				{name: "matching exact scope", metadata: map[string]any{"caller_scope": callerScope("sk-test")}, upstream: "scoped-target"},
 				{name: "wrong exact scope", metadata: map[string]any{"caller_scope": callerScope("sk-other")}, upstream: "fallback-target"},
 				{name: "matching wildcard scope", metadata: map[string]any{"caller_scope": callerScope("sk-kimi-team")}, headers: http.Header{"Authorization": {"Bearer sk-kimi-team"}}, upstream: "wildcard-target"},
+				{name: "later matching wildcard header", metadata: map[string]any{"caller_scope": callerScope("sk-prod-team")}, headers: http.Header{"X-Api-Key": {"spoofed", "sk-prod-team"}}, upstream: "target"},
 				{name: "matching inverse wildcard scope", metadata: map[string]any{"caller_scope": callerScope("ak-team")}, query: url.Values{"auth_token": {"ak-team"}}, upstream: "inverse-target"},
 			}
 			for _, scopeTest := range scopeTests {
