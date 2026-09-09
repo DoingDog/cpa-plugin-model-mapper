@@ -40,10 +40,67 @@ func BenchmarkCallerPatternCacheRetention(b *testing.B) {
 	}
 }
 
+func BenchmarkCallerPatternCacheWarmParallel(b *testing.B) {
+	rules, err := parseRules("sk-*#client=>target")
+	if err != nil {
+		b.Fatal(err)
+	}
+	rule := &rules[0]
+	b.Run("hot-key", func(b *testing.B) {
+		key := "sk-hot"
+		scope := callerScope(key)
+		resetCallerPatternCache()
+		matched, authenticated := callerPatternMatch(rule, scope, key)
+		if !matched || !authenticated {
+			b.Fatalf("warm match=(%v,%v), want (true,true)", matched, authenticated)
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				matched, authenticated := callerPatternMatch(rule, scope, key)
+				if !matched || !authenticated {
+					b.Fatalf("match=(%v,%v), want (true,true)", matched, authenticated)
+				}
+			}
+		})
+	})
+
+	keys := make([]string, 1024)
+	scopes := make([]string, len(keys))
+	for i := range keys {
+		keys[i] = fmt.Sprintf("sk-%d", i)
+		scopes[i] = callerScope(keys[i])
+	}
+	b.Run("working-set-1024", func(b *testing.B) {
+		resetCallerPatternCache()
+		for i, key := range keys {
+			matched, authenticated := callerPatternMatch(rule, scopes[i], key)
+			if !matched || !authenticated {
+				b.Fatalf("warm match=(%v,%v), want (true,true)", matched, authenticated)
+			}
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			index := 0
+			for pb.Next() {
+				matched, authenticated := callerPatternMatch(rule, scopes[index], keys[index])
+				if !matched || !authenticated {
+					b.Fatalf("match=(%v,%v), want (true,true)", matched, authenticated)
+				}
+				index = (index + 1) & (len(keys) - 1)
+			}
+		})
+	})
+}
+
 var (
 	benchmarkRewriteTopLevelModelOutput    []byte
 	benchmarkRewriteTopLevelModelChanged   bool
 	benchmarkResponseModelMarkerScanResult bool
+	benchmarkStreamOutputBytes             int
+	benchmarkEmitRewrittenOutputBytes      int
 )
 
 func BenchmarkResponseModelMarkerScan(b *testing.B) {
@@ -157,6 +214,95 @@ func BenchmarkRewriteTopLevelModel(b *testing.B) {
 				benchmarkRewriteTopLevelModelChanged = changed
 			}
 		})
+	}
+}
+
+type restoreResponseBenchmarkFixture struct {
+	name              string
+	body              []byte
+	changed           bool
+	unchanged         bool
+	wantModel         string
+	wantResponseModel string
+}
+
+func BenchmarkRestoreResponseModel(b *testing.B) {
+	for _, size := range []int{4 << 10, 64 << 10, 1 << 20, 8 << 20} {
+		for _, fixture := range restoreResponseBenchmarkFixtures(size) {
+			b.Run(fmt.Sprintf("%d/%s", size, fixture.name), func(b *testing.B) {
+				out, changed, err := restoreResponseModel(fixture.body, "client")
+				if err != nil || changed != fixture.changed {
+					b.Fatalf("preflight restore=(%d,%v,%v), want changed=%v", len(out), changed, err, fixture.changed)
+				}
+				fixture.assertRestored(b, out)
+
+				b.SetBytes(int64(len(fixture.body)))
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					benchmarkRewriteTopLevelModelOutput, benchmarkRewriteTopLevelModelChanged, err = restoreResponseModel(fixture.body, "client")
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func restoreResponseBenchmarkFixtures(size int) []restoreResponseBenchmarkFixture {
+	return []restoreResponseBenchmarkFixture{
+		{
+			name:      "no-marker",
+			body:      restoreResponseBenchmarkFixtureBody(size, `{"opaque":"`, `","id":"response"}`),
+			unchanged: true,
+		},
+		{
+			name:      "same-model",
+			body:      restoreResponseBenchmarkFixtureBody(size, `{"model":"client","opaque":"`, `","id":"response"}`),
+			unchanged: true,
+			wantModel: "client",
+		},
+		{
+			name:      "top-level-changed",
+			body:      restoreResponseBenchmarkFixtureBody(size, `{"model":"upstream","opaque":"`, `","id":"response"}`),
+			changed:   true,
+			wantModel: "client",
+		},
+		{
+			name:              "nested-response-changed",
+			body:              restoreResponseBenchmarkFixtureBody(size, `{"response":{"model":"upstream"},"opaque":"`, `","id":"response"}`),
+			changed:           true,
+			wantResponseModel: "client",
+		},
+	}
+}
+
+func restoreResponseBenchmarkFixtureBody(size int, prefix, suffix string) []byte {
+	body := make([]byte, 0, size)
+	body = append(body, prefix...)
+	body = append(body, bytes.Repeat([]byte("x"), size-len(prefix)-len(suffix))...)
+	return append(body, suffix...)
+}
+
+func (fixture restoreResponseBenchmarkFixture) assertRestored(b *testing.B, out []byte) {
+	if fixture.unchanged && !bytes.Equal(out, fixture.body) {
+		b.Fatalf("preflight restore changed unchanged fixture %q", fixture.name)
+	}
+	var restored struct {
+		Model    string `json:"model"`
+		Response struct {
+			Model string `json:"model"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal(out, &restored); err != nil {
+		b.Fatalf("preflight decode %q: %v", fixture.name, err)
+	}
+	if fixture.wantModel != "" && restored.Model != fixture.wantModel {
+		b.Fatalf("preflight model=%q, want %q", restored.Model, fixture.wantModel)
+	}
+	if fixture.wantResponseModel != "" && restored.Response.Model != fixture.wantResponseModel {
+		b.Fatalf("preflight response.model=%q, want %q", restored.Response.Model, fixture.wantResponseModel)
 	}
 }
 
@@ -338,30 +484,57 @@ func TestEmitRewrittenBatchesSSEChunks(t *testing.T) {
 	}
 }
 
-func BenchmarkEmitRewrittenSingleChunkBatch(b *testing.B) {
-	chunk := bytes.Repeat([]byte("x"), 64<<10)
-	chunks := [][]byte{chunk}
-	var emitted []byte
-	emit := func(p []byte) error {
-		emitted = p
-		return nil
-	}
-	b.SetBytes(int64(len(chunk)))
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if err := emitRewritten(chunks, true, emit); err != nil {
-			b.Fatal(err)
+func BenchmarkEmitRewrittenBatch(b *testing.B) {
+	for _, totalSize := range []int{64 << 10, 1 << 20} {
+		for _, chunkCount := range []int{1, 2, 32, 128} {
+			b.Run(fmt.Sprintf("%d/chunks=%d", totalSize, chunkCount), func(b *testing.B) {
+				chunks := emitRewrittenBatchBenchmarkFixture(totalSize, chunkCount)
+				want := bytes.Join(chunks, nil)
+				calls := 0
+				var emitted []byte
+				if err := emitRewritten(chunks, true, func(p []byte) error {
+					calls++
+					emitted = append(emitted[:0], p...)
+					return nil
+				}); err != nil {
+					b.Fatal(err)
+				}
+				if calls != 1 || !bytes.Equal(emitted, want) {
+					b.Fatalf("preflight calls=%d emitted=%d, want one %d-byte ordered batch", calls, len(emitted), len(want))
+				}
+
+				emit := func(p []byte) error {
+					benchmarkEmitRewrittenOutputBytes = len(p)
+					return nil
+				}
+				b.SetBytes(int64(totalSize))
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if err := emitRewritten(chunks, true, emit); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
 		}
-	}
-	b.StopTimer()
-	if len(emitted) != len(chunk) {
-		b.Fatalf("emitted length=%d, want %d", len(emitted), len(chunk))
 	}
 }
 
+func emitRewrittenBatchBenchmarkFixture(totalSize, chunkCount int) [][]byte {
+	chunks := make([][]byte, chunkCount)
+	for i := range chunks {
+		size := totalSize / chunkCount
+		if i < totalSize%chunkCount {
+			size++
+		}
+		chunks[i] = bytes.Repeat([]byte("x"), size)
+	}
+	return chunks
+}
+
 func BenchmarkStreamChunkRewriterFragmentedRawJSON(b *testing.B) {
-	payload := append([]byte(`{"model":"upstream","id":"`), bytes.Repeat([]byte("x"), 64<<10)...)
+	opaqueID := string(bytes.Repeat([]byte("x"), 64<<10))
+	payload := append([]byte(`{"model":"upstream","id":"`), opaqueID...)
 	payload = append(payload, `"}`...)
 	const fragments = 32
 	chunkSize := (len(payload) + fragments - 1) / fragments
@@ -374,22 +547,54 @@ func BenchmarkStreamChunkRewriterFragmentedRawJSON(b *testing.B) {
 		chunks = append(chunks, payload[start:end])
 	}
 
+	r := newStreamChunkRewriter("client")
+	var output []byte
+	for _, chunk := range chunks {
+		out, err := r.Write(chunk)
+		if err != nil {
+			b.Fatal(err)
+		}
+		output = append(output, bytes.Join(out, nil)...)
+	}
+	out, err := r.Flush()
+	if err != nil {
+		b.Fatal(err)
+	}
+	output = append(output, bytes.Join(out, nil)...)
+	var restored struct {
+		Model string `json:"model"`
+		ID    string `json:"id"`
+	}
+	if err := json.Unmarshal(output, &restored); err != nil {
+		b.Fatalf("preflight output is not JSON: %v", err)
+	}
+	if restored.Model != "client" || restored.ID != opaqueID {
+		b.Fatalf("preflight restored=%#v, want client model and intact ID", restored)
+	}
+
 	b.SetBytes(int64(len(payload)))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		r := newStreamChunkRewriter("client")
-		outputs := 0
+		outputBytes := 0
 		for _, chunk := range chunks {
 			out, err := r.Write(chunk)
 			if err != nil {
 				b.Fatal(err)
 			}
-			outputs += len(out)
+			for _, p := range out {
+				outputBytes += len(p)
+			}
 		}
-		if outputs != 1 {
-			b.Fatalf("outputs=%d, want 1", outputs)
+		out, err := r.Flush()
+		if err != nil {
+			b.Fatal(err)
 		}
+		for _, p := range out {
+			outputBytes += len(p)
+		}
+		benchmarkStreamOutputBytes = outputBytes
 	}
 }
 
@@ -462,8 +667,15 @@ func TestStreamChunkRewriterFastPathsCompleteSSEBatchWithoutModelMarker(t *testi
 
 func BenchmarkStreamChunkRewriterCompleteSSEBatch(b *testing.B) {
 	payload := bytes.Repeat([]byte("data:x\n\n"), 8192)
+	r := newStreamChunkRewriter("client")
+	r.frameRawJSONAsSSE = true
+	chunks, err := r.Write(payload)
+	if err != nil || len(chunks) != 1 || !bytes.Equal(chunks[0], payload) {
+		b.Fatalf("preflight Write=(%q,%v), want unchanged batch", chunks, err)
+	}
 	b.ReportAllocs()
 	b.SetBytes(int64(len(payload)))
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		r := newStreamChunkRewriter("client")
 		r.frameRawJSONAsSSE = true
