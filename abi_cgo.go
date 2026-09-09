@@ -128,11 +128,14 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 
 //export cliproxyPluginCall
 func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
-	if method == nil || response == nil {
+	if response == nil {
 		return 1
 	}
 	response.ptr = nil
 	response.len = 0
+	if method == nil {
+		return 1
+	}
 	requestBytes, ok := copyPluginRequest(unsafe.Pointer(request), uint64(requestLen))
 	if !ok {
 		return 1

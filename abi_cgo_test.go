@@ -2,7 +2,11 @@
 
 package main
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+	"unsafe"
+)
 
 func TestCIntLengthBounds(t *testing.T) {
 	for _, tt := range []struct {
@@ -50,5 +54,28 @@ func TestCopyPluginRequestRejectsNullWithLength(t *testing.T) {
 	}
 	if _, ok := copyPluginRequest(nil, maxCIntLength+1); ok {
 		t.Fatal("oversized request accepted")
+	}
+}
+
+func TestPluginCallClearsResponseWhenMethodNil(t *testing.T) {
+	call := reflect.ValueOf(cliproxyPluginCall)
+	response := reflect.New(call.Type().In(3).Elem())
+	ptr := response.Elem().FieldByName("ptr")
+	length := response.Elem().FieldByName("len")
+
+	reflect.NewAt(ptr.Type(), unsafe.Pointer(ptr.UnsafeAddr())).Elem().SetPointer(unsafe.Pointer(new(byte)))
+	reflect.NewAt(length.Type(), unsafe.Pointer(length.UnsafeAddr())).Elem().SetUint(1)
+
+	results := call.Call([]reflect.Value{
+		reflect.Zero(call.Type().In(0)),
+		reflect.Zero(call.Type().In(1)),
+		reflect.Zero(call.Type().In(2)),
+		response,
+	})
+	if got := results[0].Int(); got != 1 {
+		t.Fatalf("cliproxyPluginCall(nil,nil,0,response)=%d, want 1", got)
+	}
+	if !ptr.IsNil() || length.Uint() != 0 {
+		t.Fatalf("response=(%#x,%d), want (nil,0)", ptr.Pointer(), length.Uint())
 	}
 }
