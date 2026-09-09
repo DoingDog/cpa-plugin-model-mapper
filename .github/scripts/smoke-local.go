@@ -40,19 +40,18 @@ type smokeEnv struct {
 }
 
 type caseConfig struct {
-	name                string
-	pluginRules         string
-	requestFormat       string
-	rulesField          string
-	requestModel        string
-	requestAPIKey       string
-	stream              bool
-	wantSuccess         bool
-	wantFailureContains string
-	wantOriginalModel   string
-	forbidModel         string
-	allowStartFailure   bool
-	allowConfigFailure  bool
+	name                      string
+	pluginRules               string
+	requestFormat             string
+	rulesField                string
+	requestModel              string
+	requestAPIKey             string
+	stream                    bool
+	wantSuccess               bool
+	wantFailureContains       string
+	wantConfigFailureContains string
+	wantOriginalModel         string
+	forbidModel               string
 }
 
 type openAIResponse struct {
@@ -121,7 +120,7 @@ func run() error {
 		{name: "no-rules", requestModel: "client-visible-no-rules", requestAPIKey: localAPIKey, wantSuccess: true, forbidModel: "client-visible-no-rules"},
 		{name: "openai-dedicated-chain", requestModel: "deepseek-v4-pro", requestAPIKey: localAPIKey, pluginRules: "deepseek-v4-pro=>deepseek-v4-flash;deepseek-v4-flash=>gpt-5.6-luna", wantSuccess: true, wantOriginalModel: "deepseek-v4-pro", forbidModel: "gpt-5.6-luna"},
 		{name: "unmatched-model", requestModel: "client-visible-unmatched", requestAPIKey: localAPIKey, pluginRules: "deepseek-v4-pro=>gpt-5.6-luna", wantSuccess: true, forbidModel: "client-visible-unmatched"},
-		{name: "bad-rules", requestModel: "deepseek-v4-pro", requestAPIKey: localAPIKey, pluginRules: "bad rule", wantSuccess: false, allowStartFailure: true, allowConfigFailure: true},
+		{name: "bad-rules", requestModel: "deepseek-v4-pro", requestAPIKey: localAPIKey, pluginRules: "bad rule", wantSuccess: false, wantConfigFailureContains: "invalid rule"},
 		{name: "nonexistent-upstream-model", requestModel: "deepseek-v4-pro", requestAPIKey: localAPIKey, pluginRules: "deepseek-v4-pro=>definitely-not-a-real-upstream-model", wantSuccess: false, wantFailureContains: "definitely-not-a-real-upstream-model"},
 		{name: "wrong-api-key", requestModel: "deepseek-v4-flash", requestAPIKey: wrongAPIKey, wantSuccess: false},
 		{name: "global-rules-scoped-hit", requestFormat: "openai", rulesField: "global_rules", requestModel: "client-global-rules", requestAPIKey: localAPIKey, pluginRules: "local-smoke-key#client-global-rules=>definitely-not-a-real-upstream-model;client-global-rules=>deepseek-v4-flash", wantSuccess: false, wantFailureContains: "definitely-not-a-real-upstream-model"},
@@ -157,22 +156,54 @@ func prepareDirs(env smokeEnv) error {
 	return nil
 }
 
-func runCase(env smokeEnv, tc caseConfig) error {
-	if err := os.WriteFile(env.config, []byte(buildConfig(env, tc)), 0o600); err != nil {
+func writeSmokeConfig(path string, data []byte) error {
+	if err := os.Chmod(path, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+func requireConfigFailure(env smokeEnv, configErr error, marker string) error {
+	if configErr != nil && strings.Contains(configErr.Error(), marker) {
+		return nil
+	}
+	body, readErr := os.ReadFile(env.logFile)
+	if readErr == nil && strings.Contains(string(body), marker) {
+		return nil
+	}
+	if configErr != nil {
+		return configErr
+	}
+	if readErr != nil {
+		return fmt.Errorf("read CPA log: %w", readErr)
+	}
+	return fmt.Errorf("want CPA configuration failure containing %q", marker)
+}
+
+func runCase(env smokeEnv, tc caseConfig) (caseErr error) {
+	if err := writeSmokeConfig(env.config, []byte(buildConfig(env, tc))); err != nil {
 		return fmt.Errorf("write config: %w", err)
 	}
+	defer func() {
+		if err := os.Remove(env.config); err != nil && !errors.Is(err, os.ErrNotExist) {
+			caseErr = errors.Join(caseErr, fmt.Errorf("remove smoke config: %w", err))
+		}
+	}()
 	proc, err := startCPA(env)
 	if err != nil {
-		if tc.allowStartFailure {
-			return nil
+		if tc.wantConfigFailureContains != "" && !strings.HasPrefix(err.Error(), "CPA port ") {
+			return requireConfigFailure(env, err, tc.wantConfigFailureContains)
 		}
 		return err
 	}
-	var caseErr error
 	if readyErr := waitReady(proc, env.port, localAPIKey); readyErr != nil {
-		if !tc.allowStartFailure {
+		if tc.wantConfigFailureContains != "" {
+			caseErr = requireConfigFailure(env, readyErr, tc.wantConfigFailureContains)
+		} else {
 			caseErr = readyErr
 		}
+	} else if tc.wantConfigFailureContains != "" {
+		caseErr = requireConfigFailure(env, nil, tc.wantConfigFailureContains)
 	} else if tc.stream {
 		caseErr = runStreamCase(env.port, tc)
 	} else {
@@ -269,11 +300,20 @@ func stopCPA(proc *cpaProcess) (stopErr error) {
 		}
 	}()
 	select {
-	case <-proc.waitDone:
+	case waitErr := <-proc.waitDone:
+		if waitErr != nil {
+			return earlyExitError(proc.logFile.Name(), waitErr)
+		}
 		return nil
 	default:
 	}
 	interruptErr := proc.cmd.Process.Signal(os.Interrupt)
+	if errors.Is(interruptErr, os.ErrProcessDone) {
+		if waitErr := <-proc.waitDone; waitErr != nil {
+			return earlyExitError(proc.logFile.Name(), waitErr)
+		}
+		return nil
+	}
 	if interruptErr == nil {
 		select {
 		case <-proc.waitDone:
@@ -317,7 +357,7 @@ func earlyExitError(logPath string, waitErr error) error {
 	if trimmed == "" {
 		return fmt.Errorf("CPA exited early: %w", waitErr)
 	}
-	return fmt.Errorf("CPA exited early: %s", trimmed)
+	return fmt.Errorf("CPA exited early: %w: %s", waitErr, trimmed)
 }
 
 func waitReady(proc *cpaProcess, port int, apiKey string) error {
@@ -371,9 +411,6 @@ func runJSONCase(port int, tc caseConfig) error {
 	}
 	var parsed openAIResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		if tc.allowConfigFailure && status/100 != 2 {
-			return nil
-		}
 		return fmt.Errorf("decode response: %w", err)
 	}
 	hasError := len(parsed.Error) != 0 && !bytes.Equal(bytes.TrimSpace(parsed.Error), []byte("null"))
@@ -418,13 +455,16 @@ func runStreamCase(port int, tc caseConfig) error {
 			continue
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" {
+			continue
+		}
 		if payload == "[DONE]" {
 			sawDone = true
 			continue
 		}
 		var parsed openAIResponse
 		if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
-			continue
+			return fmt.Errorf("decode streamed data %q: %w", payload, err)
 		}
 		if parsed.Model == tc.wantOriginalModel {
 			sawOriginal = true
