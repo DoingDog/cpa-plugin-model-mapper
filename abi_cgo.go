@@ -72,6 +72,17 @@ func cIntLength(size uint64) (C.int, bool) {
 	return C.int(size), true
 }
 
+func copyPluginRequest(ptr unsafe.Pointer, length uint64) ([]byte, bool) {
+	cLength, ok := cIntLength(length)
+	if !ok || ptr == nil && length != 0 {
+		return nil, false
+	}
+	if length == 0 {
+		return nil, true
+	}
+	return C.GoBytes(ptr, cLength), true
+}
+
 func pluginResponseLength(size uint64) bool {
 	return size <= maxPluginResponseBytes
 }
@@ -122,13 +133,9 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	}
 	response.ptr = nil
 	response.len = 0
-	requestLength, ok := cIntLength(uint64(requestLen))
+	requestBytes, ok := copyPluginRequest(unsafe.Pointer(request), uint64(requestLen))
 	if !ok {
 		return 1
-	}
-	var requestBytes []byte
-	if request != nil && requestLength > 0 {
-		requestBytes = C.GoBytes(unsafe.Pointer(request), requestLength)
 	}
 	payload, err := handleMethod(C.GoString(method), requestBytes)
 	if err != nil {

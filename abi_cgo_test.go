@@ -40,3 +40,15 @@ func TestPluginResponseLengthBounds(t *testing.T) {
 		}
 	}
 }
+
+func TestCopyPluginRequestRejectsNullWithLength(t *testing.T) {
+	if got, ok := copyPluginRequest(nil, 1); ok || got != nil {
+		t.Fatalf("copyPluginRequest(nil,1)=(%v,%v), want (nil,false)", got, ok)
+	}
+	if got, ok := copyPluginRequest(nil, 0); !ok || got != nil {
+		t.Fatalf("copyPluginRequest(nil,0)=(%v,%v), want (nil,true)", got, ok)
+	}
+	if _, ok := copyPluginRequest(nil, maxCIntLength+1); ok {
+		t.Fatal("oversized request accepted")
+	}
+}
