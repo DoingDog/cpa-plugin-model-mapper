@@ -235,7 +235,9 @@ func BenchmarkRestoreResponseModel(b *testing.B) {
 				if err != nil || changed != fixture.changed {
 					b.Fatalf("preflight restore=(%d,%v,%v), want changed=%v", len(out), changed, err, fixture.changed)
 				}
-				fixture.assertRestored(b, out)
+				if err := fixture.validateRestored(out); err != nil {
+					b.Fatalf("preflight %q: %v", fixture.name, err)
+				}
 
 				b.SetBytes(int64(len(fixture.body)))
 				b.ReportAllocs()
@@ -293,9 +295,9 @@ func restoreResponseBenchmarkFixtureBody(size int, prefix, suffix string) []byte
 	return append(body, suffix...)
 }
 
-func (fixture restoreResponseBenchmarkFixture) assertRestored(b *testing.B, out []byte) {
+func (fixture restoreResponseBenchmarkFixture) validateRestored(out []byte) error {
 	if fixture.geminiArray {
-		var restored []struct {
+		var want, restored []struct {
 			ModelVersion string `json:"modelVersion"`
 			Opaque       struct {
 				Model        string `json:"model"`
@@ -304,32 +306,73 @@ func (fixture restoreResponseBenchmarkFixture) assertRestored(b *testing.B, out 
 			Role struct {
 				Model string `json:"model"`
 			} `json:"role"`
+			Payload string `json:"payload"`
+		}
+		if err := json.Unmarshal(fixture.body, &want); err != nil {
+			return fmt.Errorf("decode fixture: %w", err)
 		}
 		if err := json.Unmarshal(out, &restored); err != nil {
-			b.Fatalf("preflight decode %q: %v", fixture.name, err)
+			return fmt.Errorf("decode: %w", err)
 		}
-		if len(restored) != 1 || restored[0].ModelVersion != "client" || restored[0].Opaque.Model != "opaque-model" || restored[0].Opaque.ModelVersion != "opaque-version" || restored[0].Role.Model != "role-model" {
-			b.Fatalf("preflight gemini array=%#v, want restored immediate modelVersion and preserved opaque and role models", restored)
+		if len(want) != 1 || len(restored) != 1 || restored[0].ModelVersion != "client" || restored[0].Opaque.Model != "opaque-model" || restored[0].Opaque.ModelVersion != "opaque-version" || restored[0].Role.Model != "role-model" {
+			return fmt.Errorf("gemini array did not restore model fields or preserve opaque fields")
 		}
-		return
+		if restored[0].Payload != want[0].Payload {
+			return fmt.Errorf("gemini payload length=%d, want %d", len(restored[0].Payload), len(want[0].Payload))
+		}
+		return nil
 	}
 	if fixture.unchanged && !bytes.Equal(out, fixture.body) {
-		b.Fatalf("preflight restore changed unchanged fixture %q", fixture.name)
+		return fmt.Errorf("restore changed unchanged fixture")
 	}
-	var restored struct {
+	var want, restored struct {
 		Model    string `json:"model"`
 		Response struct {
 			Model string `json:"model"`
 		} `json:"response"`
+		Opaque string `json:"opaque"`
+	}
+	if err := json.Unmarshal(fixture.body, &want); err != nil {
+		return fmt.Errorf("decode fixture: %w", err)
 	}
 	if err := json.Unmarshal(out, &restored); err != nil {
-		b.Fatalf("preflight decode %q: %v", fixture.name, err)
+		return fmt.Errorf("decode: %w", err)
 	}
 	if fixture.wantModel != "" && restored.Model != fixture.wantModel {
-		b.Fatalf("preflight model=%q, want %q", restored.Model, fixture.wantModel)
+		return fmt.Errorf("model=%q, want %q", restored.Model, fixture.wantModel)
 	}
 	if fixture.wantResponseModel != "" && restored.Response.Model != fixture.wantResponseModel {
-		b.Fatalf("preflight response.model=%q, want %q", restored.Response.Model, fixture.wantResponseModel)
+		return fmt.Errorf("response.model=%q, want %q", restored.Response.Model, fixture.wantResponseModel)
+	}
+	if restored.Opaque != want.Opaque {
+		return fmt.Errorf("opaque payload length=%d, want %d", len(restored.Opaque), len(want.Opaque))
+	}
+	return nil
+}
+
+func TestRestoreResponseBenchmarkPreflightRejectsTruncatedChangedOutput(t *testing.T) {
+	fixtures := restoreResponseBenchmarkFixtures(4 << 10)
+	for _, test := range []struct {
+		name    string
+		fixture restoreResponseBenchmarkFixture
+		out     []byte
+	}{
+		{
+			name:    "changed object",
+			fixture: fixtures[2],
+			out:     []byte(`{"model":"client"}`),
+		},
+		{
+			name:    "gemini array",
+			fixture: fixtures[4],
+			out:     []byte(`[{"modelVersion":"client","opaque":{"model":"opaque-model","modelVersion":"opaque-version"},"role":{"model":"role-model"}}]`),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.fixture.validateRestored(test.out); err == nil {
+				t.Fatal("preflight accepted truncated output")
+			}
+		})
 	}
 }
 
