@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -302,6 +303,41 @@ func TestRunRejectsAliasedAbsentOutputsBeforeWriting(t *testing.T) {
 				t.Fatalf("archive exists after rejected run: %v", err)
 			}
 		})
+	}
+}
+
+func TestRunRejectsAliasedOutputsThroughSymlinkThenParent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX path resolution applies a symlink before a following ..")
+	}
+
+	dir := t.TempDir()
+	library := filepath.Join(dir, "model-mapper.so")
+	realChild := filepath.Join(dir, "real", "child")
+	out := filepath.Join(dir, "out")
+	hop := filepath.Join(out, "hop")
+	archive := filepath.Join(dir, "real", "archive.zip")
+	// Preserve the raw spelling: POSIX resolves hop before the following `..`.
+	checksum := hop + string(filepath.Separator) + ".." + string(filepath.Separator) + "archive.zip"
+	if err := os.WriteFile(library, []byte("plugin"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(realChild, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realChild, hop); err != nil {
+		t.Skipf("create hop symlink: %v", err)
+	}
+
+	err := run([]string{"-library", library, "-archive", archive, "-checksum", checksum})
+	if err == nil || !strings.Contains(err.Error(), "must be distinct") {
+		t.Fatalf("run error = %v, want distinct path error", err)
+	}
+	if _, err := os.Lstat(archive); !os.IsNotExist(err) {
+		t.Fatalf("archive exists after rejected run: %v", err)
 	}
 }
 

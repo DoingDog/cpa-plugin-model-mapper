@@ -105,13 +105,13 @@ func validateDistinctPaths(paths ...string) error {
 }
 
 func canonicalPackagePath(path string) (string, error) {
-	absolute, err := filepath.Abs(path)
+	absolute, err := rawAbsolutePackagePath(path)
 	if err != nil {
 		return "", fmt.Errorf("normalize package path %s: %w", filepath.ToSlash(path), err)
 	}
 
 	var suffix []string
-	for current := absolute; ; current = filepath.Dir(current) {
+	for current := absolute; ; current = rawPackagePathDir(current) {
 		info, err := os.Lstat(current)
 		if err == nil {
 			resolved, err := filepath.EvalSymlinks(current)
@@ -127,7 +127,11 @@ func canonicalPackagePath(path string) (string, error) {
 				return "", fmt.Errorf("read package path symlink %s: %w", filepath.ToSlash(path), err)
 			}
 			if !filepath.IsAbs(target) {
-				target = filepath.Join(filepath.Dir(current), target)
+				parent := rawPackagePathDir(current)
+				if !os.IsPathSeparator(parent[len(parent)-1]) {
+					parent += string(filepath.Separator)
+				}
+				target = parent + target
 			}
 			resolved, err = canonicalPackagePath(target)
 			if err != nil {
@@ -139,12 +143,59 @@ func canonicalPackagePath(path string) (string, error) {
 			return "", fmt.Errorf("stat package path %s: %w", filepath.ToSlash(path), err)
 		}
 
-		parent := filepath.Dir(current)
+		parent := rawPackagePathDir(current)
 		if parent == current {
 			return "", fmt.Errorf("resolve package path %s: %w", filepath.ToSlash(path), err)
 		}
-		suffix = append([]string{filepath.Base(current)}, suffix...)
+		start, end := len(parent), len(current)
+		for start < end && os.IsPathSeparator(current[start]) {
+			start++
+		}
+		for end > start && os.IsPathSeparator(current[end-1]) {
+			end--
+		}
+		suffix = append([]string{current[start:end]}, suffix...)
 	}
+}
+
+func rawAbsolutePackagePath(path string) (string, error) {
+	if filepath.IsAbs(path) {
+		return path, nil
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	if len(path) > 0 && os.IsPathSeparator(path[0]) {
+		return filepath.VolumeName(cwd) + path, nil
+	}
+	if filepath.VolumeName(path) != "" {
+		return filepath.Abs(path)
+	}
+	return cwd + string(filepath.Separator) + path, nil
+}
+
+func rawPackagePathDir(path string) string {
+	volumeLength := len(filepath.VolumeName(path))
+	rootLength := volumeLength
+	if rootLength < len(path) && os.IsPathSeparator(path[rootLength]) {
+		rootLength++
+	}
+
+	end := len(path)
+	for end > rootLength && os.IsPathSeparator(path[end-1]) {
+		end--
+	}
+	for end > rootLength && !os.IsPathSeparator(path[end-1]) {
+		end--
+	}
+	for end > rootLength && os.IsPathSeparator(path[end-1]) {
+		end--
+	}
+	if end == rootLength {
+		return path[:rootLength]
+	}
+	return path[:end]
 }
 
 func packageExistingArtifacts(version, distDir, outDir string) error {
