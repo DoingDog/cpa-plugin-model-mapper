@@ -132,6 +132,99 @@ func TestStopCPAReturnsPreexistingFailure(t *testing.T) {
 	}
 }
 
+func TestStopCPAReturnsUnexpectedExitAfterKillRace(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=TestStopCPATerminatesRunningProcess")
+	cmd.Env = append(os.Environ(), "CPA_SMOKE_HELPER_PROCESS=1")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	logFile, err := os.Create(filepath.Join(t.TempDir(), "process.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := logFile.WriteString("CPA crashed before kill"); err != nil {
+		t.Fatal(err)
+	}
+	if err := logFile.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	waitDone := make(chan error, 1)
+	proc := &cpaProcess{
+		cmd:      cmd,
+		logFile:  logFile,
+		waitDone: waitDone,
+		signal: func(os.Signal) error {
+			waitDone <- errors.New("exit status 3")
+			close(waitDone)
+			return errors.New("interrupt unavailable")
+		},
+		kill: func() error { return os.ErrProcessDone },
+	}
+
+	err = stopCPA(proc)
+	if err == nil {
+		t.Fatal("stopCPA error = nil")
+	}
+	if !strings.Contains(err.Error(), "exit status 3") || !strings.Contains(err.Error(), "CPA crashed before kill") {
+		t.Fatalf("stopCPA error = %v, want raced process failure", err)
+	}
+}
+
+func TestRunCaseRemovesPartiallyWrittenConfig(t *testing.T) {
+	dir := t.TempDir()
+	env := smokeEnv{
+		apiKey:  "smoke-config-secret-sentinel",
+		config:  filepath.Join(dir, "config.yaml"),
+		logFile: filepath.Join(dir, "cpa.log"),
+	}
+	originalWriteFile := writeSmokeConfigFile
+	writeSmokeConfigFile = func(path string, data []byte, perm os.FileMode) error {
+		if err := os.WriteFile(path, data[:len(data)/2], perm); err != nil {
+			return err
+		}
+		return errors.New("partial write")
+	}
+	t.Cleanup(func() { writeSmokeConfigFile = originalWriteFile })
+
+	err := runCase(env, caseConfig{})
+	if err == nil || !strings.Contains(err.Error(), "write config") {
+		t.Fatalf("runCase error = %v, want config write error", err)
+	}
+	if _, err := os.Stat(env.config); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("partially written smoke config still exists")
+	}
+}
+
+func TestRunCaseDoesNotDeleteExistingConfig(t *testing.T) {
+	dir := t.TempDir()
+	env := smokeEnv{
+		apiKey:  "smoke-config-secret-sentinel",
+		cpaBin:  filepath.Join(dir, "missing-cpa"),
+		config:  filepath.Join(dir, "config.yaml"),
+		logFile: filepath.Join(dir, "cpa.log"),
+	}
+	const userConfig = "user-owned-config"
+	if err := os.WriteFile(env.config, []byte(userConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runCase(env, caseConfig{}); err == nil {
+		t.Fatal("runCase error = nil")
+	}
+	body, err := os.ReadFile(env.config)
+	if err != nil {
+		t.Fatalf("read existing config: %v", err)
+	}
+	if string(body) != userConfig {
+		t.Fatalf("existing config = %q, want %q", body, userConfig)
+	}
+}
+
 func TestRunCaseRemovesConfigAfterStartFailure(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -176,6 +269,24 @@ func TestWriteSmokeConfigTightensPermissions(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("config permissions = %o, want 600", info.Mode().Perm())
+	}
+}
+
+func TestRunCaseRejectsLaunchFailureWithConfigMarkerInExecutablePath(t *testing.T) {
+	dir := t.TempDir()
+	env := smokeEnv{
+		apiKey:  "smoke-config-secret-sentinel",
+		cpaBin:  filepath.Join(dir, "missing-invalid rule-cpa"),
+		config:  filepath.Join(dir, "config.yaml"),
+		logFile: filepath.Join(dir, "cpa.log"),
+	}
+
+	err := runCase(env, caseConfig{wantConfigFailureContains: "invalid rule"})
+	if err == nil {
+		t.Fatal("runCase error = nil")
+	}
+	if !strings.Contains(err.Error(), "start CPA") {
+		t.Fatalf("runCase error = %v, want launch error", err)
 	}
 }
 

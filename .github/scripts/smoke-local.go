@@ -26,6 +26,8 @@ const (
 	wrongAPIKey    = "wrong-local-smoke-key"
 )
 
+var writeSmokeConfigFile = os.WriteFile
+
 type smokeEnv struct {
 	repoRoot string
 	baseURL  string
@@ -63,6 +65,16 @@ type cpaProcess struct {
 	cmd      *exec.Cmd
 	logFile  *os.File
 	waitDone chan error
+	signal   func(os.Signal) error
+	kill     func() error
+}
+
+type cpaStartedExitError struct {
+	err error
+}
+
+func (err *cpaStartedExitError) Error() string {
+	return err.err.Error()
 }
 
 func main() {
@@ -160,7 +172,7 @@ func writeSmokeConfig(path string, data []byte) error {
 	if err := os.Chmod(path, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+	return writeSmokeConfigFile(path, data, 0o600)
 }
 
 func requireConfigFailure(env smokeEnv, configErr error, marker string) error {
@@ -181,17 +193,25 @@ func requireConfigFailure(env smokeEnv, configErr error, marker string) error {
 }
 
 func runCase(env smokeEnv, tc caseConfig) (caseErr error) {
-	if err := writeSmokeConfig(env.config, []byte(buildConfig(env, tc))); err != nil {
-		return fmt.Errorf("write config: %w", err)
+	configFile, err := os.OpenFile(env.config, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("create smoke config: %w", err)
 	}
 	defer func() {
 		if err := os.Remove(env.config); err != nil && !errors.Is(err, os.ErrNotExist) {
 			caseErr = errors.Join(caseErr, fmt.Errorf("remove smoke config: %w", err))
 		}
 	}()
+	if err := configFile.Close(); err != nil {
+		return fmt.Errorf("close smoke config: %w", err)
+	}
+	if err := writeSmokeConfig(env.config, []byte(buildConfig(env, tc))); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
 	proc, err := startCPA(env)
 	if err != nil {
-		if tc.wantConfigFailureContains != "" && !strings.HasPrefix(err.Error(), "CPA port ") {
+		var startedExit *cpaStartedExitError
+		if tc.wantConfigFailureContains != "" && errors.As(err, &startedExit) {
 			return requireConfigFailure(env, err, tc.wantConfigFailureContains)
 		}
 		return err
@@ -282,7 +302,7 @@ func startCPA(env smokeEnv) (*cpaProcess, error) {
 	select {
 	case err := <-proc.waitDone:
 		_ = logFile.Close()
-		return nil, earlyExitError(env.logFile, err)
+		return nil, &cpaStartedExitError{err: earlyExitError(env.logFile, err)}
 	default:
 		return proc, nil
 	}
@@ -307,7 +327,12 @@ func stopCPA(proc *cpaProcess) (stopErr error) {
 		return nil
 	default:
 	}
-	interruptErr := proc.cmd.Process.Signal(os.Interrupt)
+	var interruptErr error
+	if proc.signal != nil {
+		interruptErr = proc.signal(os.Interrupt)
+	} else {
+		interruptErr = proc.cmd.Process.Signal(os.Interrupt)
+	}
 	if errors.Is(interruptErr, os.ErrProcessDone) {
 		if waitErr := <-proc.waitDone; waitErr != nil {
 			return earlyExitError(proc.logFile.Name(), waitErr)
@@ -321,16 +346,23 @@ func stopCPA(proc *cpaProcess) (stopErr error) {
 		case <-time.After(2 * time.Second):
 		}
 	}
-	if err := proc.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+	killErr := proc.cmd.Process.Kill()
+	if proc.kill != nil {
+		killErr = proc.kill()
+	}
+	if killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
 		if interruptErr != nil {
 			return errors.Join(
 				fmt.Errorf("send interrupt to CPA: %w", interruptErr),
-				fmt.Errorf("kill CPA: %w", err),
+				fmt.Errorf("kill CPA: %w", killErr),
 			)
 		}
-		return fmt.Errorf("kill CPA: %w", err)
+		return fmt.Errorf("kill CPA: %w", killErr)
 	}
-	<-proc.waitDone
+	waitErr := <-proc.waitDone
+	if errors.Is(killErr, os.ErrProcessDone) && interruptErr != nil && waitErr != nil {
+		return earlyExitError(proc.logFile.Name(), waitErr)
+	}
 	return nil
 }
 
