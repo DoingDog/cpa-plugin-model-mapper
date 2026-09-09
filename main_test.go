@@ -3701,6 +3701,52 @@ func TestFrameSSEDataSupportsAllSSELineEndings(t *testing.T) {
 	}
 }
 
+func TestStreamChunkRewriterFramesRawJSONByFormat(t *testing.T) {
+	cases := []struct{ format, payload, wantPrefix string }{
+		{"openai-response", `{"type":"response.completed","response":{"model":"upstream"}}`, "event: response.completed\ndata: "},
+		{"claude", `{"type":"message_start","message":{"model":"upstream"}}`, "event: message_start\ndata: "},
+		{"gemini", `{"modelVersion":"upstream"}`, "data: "},
+		{"interactions", `{"type":"interaction.completed","interaction":{"model":"upstream"}}`, "data: "},
+	}
+	for _, tt := range cases {
+		t.Run(tt.format, func(t *testing.T) {
+			r := newStreamChunkRewriter("client")
+			r.format = tt.format
+			r.frameRawJSONAsSSE = true
+			chunks, err := r.Write([]byte(tt.payload))
+			if err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			flushed, err := r.Flush()
+			if err != nil {
+				t.Fatalf("Flush: %v", err)
+			}
+			got := string(bytes.Join(append(chunks, flushed...), nil))
+			if !strings.HasPrefix(got, tt.wantPrefix) || strings.Contains(got, "upstream") {
+				t.Fatalf("output=%q, want prefix %q and restored model", got, tt.wantPrefix)
+			}
+		})
+	}
+}
+
+func TestStreamChunkRewriterPreservesFramedResponsesEventBytes(t *testing.T) {
+	input := "event: response.completed\r\nid: 1\r\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"client\"}}\r\n\r\n"
+	r := newStreamChunkRewriter("client")
+	r.format = "openai-response"
+	r.frameRawJSONAsSSE = true
+	chunks, err := r.Write([]byte(input))
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	flushed, err := r.Flush()
+	if err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if got := string(bytes.Join(append(chunks, flushed...), nil)); got != input {
+		t.Fatalf("output=%q, want byte-identical %q", got, input)
+	}
+}
+
 func TestStreamChunkRewriterPreservesColonlessJSONScalarSSE(t *testing.T) {
 	r := newStreamChunkRewriter("client")
 	r.frameRawJSONAsSSE = true
@@ -3893,7 +3939,7 @@ func TestHandleExecutorExecuteStreamRestoresGeminiJSONStreamArray(t *testing.T) 
 		t.Fatalf("handleExecutorExecuteStream error = %v", err)
 	}
 	got := strings.Join(emitted, "")
-	if !json.Valid([]byte(got)) || strings.Contains(got, "data:") || !strings.Contains(got, "\n,\n") {
+	if !json.Valid([]byte(got)) || strings.Contains(got, "data:") || strings.Contains(got, "event:") || !strings.Contains(got, "\n,\n") {
 		t.Fatalf("emitted=%q, want complete unframed array with preserved separator", got)
 	}
 	var values []map[string]json.RawMessage
@@ -4849,6 +4895,96 @@ func TestPrepareExecutorStreamClosesPartialStreamIDOnDecodeError(t *testing.T) {
 	}
 }
 
+func TestRunStreamForwardTerminatesReframedOpenAIChat(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	newRequest := func(format string) rpcExecutorRequest {
+		return rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "client",
+			Format:          format,
+			SourceFormat:    format,
+			Stream:          true,
+			OriginalRequest: []byte(`{"model":"client","stream":true}`),
+		}, StreamID: "plugin-stream-terminal-" + format}
+	}
+	for _, tt := range []struct {
+		name, format, payload string
+		reads                 []pluginapi.HostModelStreamReadResponse
+		wantDone              int
+	}{
+		{name: "raw chat completion", format: "openai", payload: `{"model":"upstream","choices":[]}`, reads: []pluginapi.HostModelStreamReadResponse{{Payload: []byte(`{"model":"upstream","choices":[]}`)}, {Done: true}}, wantDone: 1},
+		{name: "already framed done", format: "openai", reads: []pluginapi.HostModelStreamReadResponse{{Payload: []byte(`{"model":"upstream","choices":[]}`)}, {Payload: []byte("data: [DONE]\n\n")}, {Done: true}}, wantDone: 1},
+		{name: "responses", format: "openai-response", reads: []pluginapi.HostModelStreamReadResponse{{Payload: []byte(`{"type":"response.completed","response":{"model":"upstream"}}`)}, {Done: true}}},
+		{name: "claude", format: "claude", reads: []pluginapi.HostModelStreamReadResponse{{Payload: []byte(`{"type":"message_start","message":{"model":"upstream"}}`)}, {Done: true}}},
+		{name: "gemini", format: "gemini", reads: []pluginapi.HostModelStreamReadResponse{{Payload: []byte(`{"modelVersion":"upstream"}`)}, {Done: true}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			emitted, _, _, _, err := runExecutorStreamTestWithHostContentType(newRequest(tt.format), tt.reads, "text/event-stream")
+			if err != nil {
+				t.Fatalf("run stream: %v", err)
+			}
+			got := strings.Join(emitted, "")
+			if strings.Count(got, "data: [DONE]\n\n") != tt.wantDone {
+				t.Fatalf("output=%q, [DONE] count=%d, want %d", got, strings.Count(got, "data: [DONE]\n\n"), tt.wantDone)
+			}
+			if !strings.Contains(got, "client") || strings.Contains(got, "upstream") {
+				t.Fatalf("output=%q, want restored client model", got)
+			}
+		})
+	}
+}
+
+func TestRunStreamForwardDoesNotFabricateDoneOnError(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	sentinel := errors.New("host stream read failed")
+	reads := 0
+	var emitted []byte
+	call := func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostModelExecuteStream:
+			return json.Marshal(pluginapi.HostModelStreamResponse{StatusCode: http.StatusOK, StreamID: "host-stream", Headers: http.Header{"Content-Type": {"text/event-stream"}}})
+		case pluginabi.MethodHostModelStreamRead:
+			reads++
+			if reads == 1 {
+				return json.Marshal(pluginapi.HostModelStreamReadResponse{Payload: []byte(`{"model":"upstream","choices":[]}`)})
+			}
+			return nil, sentinel
+		case pluginabi.MethodHostStreamEmit:
+			var emit struct {
+				Payload []byte `json:"payload"`
+			}
+			raw, err := json.Marshal(payload)
+			if err != nil {
+				return nil, err
+			}
+			if err := json.Unmarshal(raw, &emit); err != nil {
+				return nil, err
+			}
+			emitted = append(emitted, emit.Payload...)
+			return json.Marshal(map[string]any{})
+		case pluginabi.MethodHostModelStreamClose:
+			return json.Marshal(map[string]any{})
+		default:
+			return nil, fmt.Errorf("unexpected method %q", method)
+		}
+	}
+	stream, _, err := prepareExecutorStream(&executorRPCRequest{
+		Model:           "client",
+		Format:          "openai",
+		SourceFormat:    "openai",
+		OriginalRequest: []byte(`{"model":"client","stream":true}`),
+		StreamID:        "plugin-stream-error-terminal",
+	}, call)
+	if err != nil {
+		t.Fatalf("prepare stream: %v", err)
+	}
+	if err := runStreamForward(stream); !errors.Is(err, sentinel) {
+		t.Fatalf("runStreamForward error=%v, want %v", err, sentinel)
+	}
+	if got := string(emitted); !strings.Contains(got, `"model":"client"`) || strings.Contains(got, "data: [DONE]") {
+		t.Fatalf("output=%q, want flushed payload without fabricated [DONE]", got)
+	}
+}
+
 func TestRunStreamForwardProcessesTerminalPayload(t *testing.T) {
 	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
 	tests := []struct {
@@ -4961,8 +5097,12 @@ func TestRunStreamForwardProcessesTerminalPayload(t *testing.T) {
 			if got := string(emitted); !strings.Contains(got, `"model":"client"`) {
 				t.Fatalf("emitted=%q, want restored terminal payload", got)
 			}
-			if got := strings.Join(events, ","); got != "emit,host-close,plugin-close" {
-				t.Fatalf("event order = %q, want emit,host-close,plugin-close", got)
+			wantEvents := "emit,host-close,plugin-close"
+			if tt.name == "done payload" {
+				wantEvents = "emit,emit,host-close,plugin-close"
+			}
+			if got := strings.Join(events, ","); got != wantEvents {
+				t.Fatalf("event order = %q, want %s", got, wantEvents)
 			}
 			if tt.wantPluginError != "" && !strings.Contains(pluginError, tt.wantPluginError) {
 				t.Fatalf("plugin close error = %q, want %q", pluginError, tt.wantPluginError)

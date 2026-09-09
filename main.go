@@ -34,11 +34,14 @@ type sseRewriter struct {
 	scanFrom      int
 	bomPrefix     []byte
 	bomDone       bool
+	sawDone       bool
 }
 
 type streamChunkRewriter struct {
 	originalModel     string
+	format            string
 	frameRawJSONAsSSE bool
+	framedRawJSON     bool
 	sse               *sseRewriter
 	pending           []byte
 }
@@ -312,7 +315,12 @@ func (r *sseRewriter) rewriteEvent(out [][]byte, event []byte) ([][]byte, error)
 				return r.rewriteMultiDataEvent(out[:originalOutLen], originalEvent)
 			}
 			value := sseFieldValue(line)
-			if len(value) == 0 || bytes.Equal(value, []byte("[DONE]")) {
+			if len(value) == 0 {
+				out = append(out, append(append([]byte(nil), line...), lineBreak...))
+				continue
+			}
+			if bytes.Equal(bytes.TrimSpace(value), []byte("[DONE]")) {
+				r.sawDone = true
 				out = append(out, append(append([]byte(nil), line...), lineBreak...))
 				continue
 			}
@@ -425,6 +433,24 @@ func completeSSEEvents(p []byte) bool {
 	return found
 }
 
+func hasSSEDoneEvent(p []byte) bool {
+	for len(p) > 0 {
+		eventLen, delimiterLen, _ := findSSEEventDelimiter(p, 0, true)
+		if delimiterLen == 0 {
+			return false
+		}
+		for event := p[:eventLen]; len(event) > 0; {
+			line, _, remaining := splitSSELine(event)
+			event = remaining
+			if bytes.HasPrefix(line, []byte("data:")) && bytes.Equal(bytes.TrimSpace(sseFieldValue(line)), []byte("[DONE]")) {
+				return true
+			}
+		}
+		p = p[eventLen+delimiterLen:]
+	}
+	return false
+}
+
 func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 	if !r.sse.bomDone {
 		p = r.sse.consumeLeadingBOM(p)
@@ -442,6 +468,7 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 		return r.sse.Write(p)
 	}
 	if r.frameRawJSONAsSSE && !couldStartJSONValue(p) && completeSSEEvents(p) && !mightContainResponseModelField(p) {
+		r.sse.sawDone = r.sse.sawDone || hasSSEDoneEvent(p)
 		return [][]byte{bytes.Clone(p)}, nil
 	}
 	if r.frameRawJSONAsSSE && isColonlessSSEChunk(p) {
@@ -565,7 +592,7 @@ trimmed:
 		}
 		if valid {
 			if r.frameRawJSONAsSSE {
-				return [][]byte{frameSSEData(restored)}, len(p), true, false, nil
+				return [][]byte{r.frameRawJSON(restored)}, len(p), true, false, nil
 			}
 			if !changed {
 				return [][]byte{bytes.Clone(p)}, len(p), true, false, nil
@@ -594,7 +621,7 @@ trimmed:
 			return nil, 0, false, false, err
 		}
 		if r.frameRawJSONAsSSE {
-			out = append(out, frameSSEData(restored))
+			out = append(out, r.frameRawJSON(restored))
 		} else {
 			chunk := make([]byte, 0, start-cursor+len(restored))
 			chunk = append(chunk, p[cursor:start]...)
@@ -661,8 +688,42 @@ func (r *streamChunkRewriter) Flush() ([][]byte, error) {
 	return r.sse.Flush()
 }
 
+func (r *streamChunkRewriter) Finish() ([][]byte, error) {
+	chunks, err := r.Flush()
+	if err != nil {
+		return nil, err
+	}
+	if r.format == "openai" && r.frameRawJSONAsSSE && r.framedRawJSON && !r.sse.sawDone {
+		chunks = append(chunks, []byte("data: [DONE]\n\n"))
+	}
+	return chunks, nil
+}
+
+func (r *streamChunkRewriter) frameRawJSON(p []byte) []byte {
+	r.framedRawJSON = true
+	eventType := ""
+	if r.format == "openai-response" || r.format == "claude" {
+		var event struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(p, &event) == nil {
+			eventType = event.Type
+		}
+	}
+	return frameSSEEvent(p, eventType)
+}
+
 func frameSSEData(p []byte) []byte {
+	return frameSSEEvent(p, "")
+}
+
+func frameSSEEvent(p []byte, eventType string) []byte {
 	var out bytes.Buffer
+	if eventType != "" {
+		out.WriteString("event: ")
+		out.WriteString(eventType)
+		out.WriteByte('\n')
+	}
 	start := 0
 	for {
 		position, length, _ := sseLineEnding(p, start, true)
@@ -1163,6 +1224,7 @@ type executorStream struct {
 	pluginStreamID    string
 	hostStreamID      string
 	originalModel     string
+	format            string
 	frameRawJSONAsSSE bool
 	call              hostCaller
 	closeHostOnce     sync.Once
@@ -1322,6 +1384,7 @@ func prepareExecutorStream(req *executorRPCRequest, call hostCaller) (*executorS
 		pluginStreamID: req.StreamID,
 		hostStreamID:   hostResp.StreamID,
 		originalModel:  decision.OriginalModel,
+		format:         req.Format,
 		call:           call,
 	}
 	if hostResp.StatusCode >= http.StatusBadRequest {
@@ -1412,8 +1475,16 @@ func (s *executorStream) processPayload(rewriter *streamChunkRewriter, payload [
 	return nil
 }
 
-func (s *executorStream) flushAndEmit(rewriter *streamChunkRewriter) error {
-	flushed, err := rewriter.Flush()
+func (s *executorStream) flushAndEmit(rewriter *streamChunkRewriter, cleanCompletion bool) error {
+	var (
+		flushed [][]byte
+		err     error
+	)
+	if cleanCompletion {
+		flushed, err = rewriter.Finish()
+	} else {
+		flushed, err = rewriter.Flush()
+	}
 	if err != nil {
 		return fmt.Errorf("flush stream rewriter: %w", err)
 	}
@@ -1423,12 +1494,12 @@ func (s *executorStream) flushAndEmit(rewriter *streamChunkRewriter) error {
 	return nil
 }
 
-func (s *executorStream) finish(rewriter *streamChunkRewriter, primary error, payloadErr error, closePlugin bool) error {
+func (s *executorStream) finish(rewriter *streamChunkRewriter, primary error, payloadErr error, closePlugin bool, cleanCompletion bool) error {
 	cleanup := make([]error, 0, 2)
 	if payloadErr != nil {
 		cleanup = append(cleanup, payloadErr)
 	}
-	if err := s.flushAndEmit(rewriter); err != nil {
+	if err := s.flushAndEmit(rewriter, cleanCompletion); err != nil {
 		cleanup = append(cleanup, err)
 	}
 	if err := s.closeHost(); err != nil {
@@ -1450,22 +1521,23 @@ func (s *executorStream) finish(rewriter *streamChunkRewriter, primary error, pa
 
 func runStreamForward(stream *executorStream) error {
 	rewriter := newStreamChunkRewriter(stream.originalModel)
+	rewriter.format = stream.format
 	rewriter.frameRawJSONAsSSE = stream.frameRawJSONAsSSE
 	for {
 		readRaw, err := stream.call(pluginabi.MethodHostModelStreamRead, pluginapi.HostModelStreamReadRequest{StreamID: stream.hostStreamID})
 		if err != nil {
-			return stream.finish(rewriter, fmt.Errorf("read host stream: %w", err), nil, false)
+			return stream.finish(rewriter, fmt.Errorf("read host stream: %w", err), nil, false, false)
 		}
 		var chunk pluginapi.HostModelStreamReadResponse
 		if err := json.Unmarshal(readRaw, &chunk); err != nil {
-			return stream.finish(rewriter, fmt.Errorf("decode host stream chunk: %w", err), nil, false)
+			return stream.finish(rewriter, fmt.Errorf("decode host stream chunk: %w", err), nil, false, false)
 		}
 		payloadErr := stream.processPayload(rewriter, chunk.Payload)
 		if chunk.Error != "" {
-			return stream.finish(rewriter, errors.New(chunk.Error), payloadErr, true)
+			return stream.finish(rewriter, errors.New(chunk.Error), payloadErr, true, false)
 		}
 		if payloadErr != nil || chunk.Done {
-			return stream.finish(rewriter, payloadErr, nil, true)
+			return stream.finish(rewriter, payloadErr, nil, true, chunk.Done && payloadErr == nil)
 		}
 	}
 }
