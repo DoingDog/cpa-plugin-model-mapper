@@ -345,11 +345,21 @@ func stopCPA(proc *cpaProcess) (stopErr error) {
 			return nil
 		case <-time.After(2 * time.Second):
 		}
+	} else {
+		select {
+		case waitErr := <-proc.waitDone:
+			if waitErr != nil {
+				return earlyExitError(proc.logFile.Name(), waitErr)
+			}
+			return nil
+		default:
+		}
 	}
-	killErr := proc.cmd.Process.Kill()
+	kill := proc.cmd.Process.Kill
 	if proc.kill != nil {
-		killErr = proc.kill()
+		kill = proc.kill
 	}
+	killErr := kill()
 	if killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
 		if interruptErr != nil {
 			return errors.Join(

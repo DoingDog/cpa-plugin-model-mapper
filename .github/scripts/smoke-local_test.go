@@ -175,6 +175,53 @@ func TestStopCPAReturnsUnexpectedExitAfterKillRace(t *testing.T) {
 	}
 }
 
+func TestStopCPAReturnsExitQueuedAfterFailedInterrupt(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=TestStopCPATerminatesRunningProcess")
+	cmd.Env = append(os.Environ(), "CPA_SMOKE_HELPER_PROCESS=1")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	logFile, err := os.Create(filepath.Join(t.TempDir(), "process.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := logFile.WriteString("CPA crashed before kill"); err != nil {
+		t.Fatal(err)
+	}
+	if err := logFile.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	waitDone := make(chan error, 1)
+	killCalled := false
+	proc := &cpaProcess{
+		cmd:      cmd,
+		logFile:  logFile,
+		waitDone: waitDone,
+		signal: func(os.Signal) error {
+			waitDone <- errors.New("exit status 3")
+			close(waitDone)
+			return errors.New("interrupt unavailable")
+		},
+		kill: func() error {
+			killCalled = true
+			return nil
+		},
+	}
+
+	err = stopCPA(proc)
+	if err == nil || !strings.Contains(err.Error(), "exit status 3") || !strings.Contains(err.Error(), "CPA crashed before kill") {
+		t.Fatalf("stopCPA error = %v, want queued process failure", err)
+	}
+	if killCalled {
+		t.Fatal("kill hook was called after queued process exit")
+	}
+}
+
 func TestRunCaseRemovesPartiallyWrittenConfig(t *testing.T) {
 	dir := t.TempDir()
 	env := smokeEnv{
