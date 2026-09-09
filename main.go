@@ -34,6 +34,7 @@ type sseRewriter struct {
 	scanFrom      int
 	bomPrefix     []byte
 	bomDone       bool
+	trackDone     bool
 	sawDone       bool
 }
 
@@ -319,7 +320,7 @@ func (r *sseRewriter) rewriteEvent(out [][]byte, event []byte) ([][]byte, error)
 				out = append(out, append(append([]byte(nil), line...), lineBreak...))
 				continue
 			}
-			if bytes.Equal(bytes.TrimSpace(value), []byte("[DONE]")) {
+			if r.trackDone && bytes.Equal(bytes.TrimSpace(value), []byte("[DONE]")) {
 				r.sawDone = true
 				out = append(out, append(append([]byte(nil), line...), lineBreak...))
 				continue
@@ -452,6 +453,7 @@ func hasSSEDoneEvent(p []byte) bool {
 }
 
 func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
+	r.sse.trackDone = r.format == "openai"
 	if !r.sse.bomDone {
 		p = r.sse.consumeLeadingBOM(p)
 		if len(p) == 0 && !r.sse.bomDone {
@@ -468,7 +470,9 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 		return r.sse.Write(p)
 	}
 	if r.frameRawJSONAsSSE && !couldStartJSONValue(p) && completeSSEEvents(p) && !mightContainResponseModelField(p) {
-		r.sse.sawDone = r.sse.sawDone || hasSSEDoneEvent(p)
+		if r.sse.trackDone {
+			r.sse.sawDone = r.sse.sawDone || hasSSEDoneEvent(p)
+		}
 		return [][]byte{bytes.Clone(p)}, nil
 	}
 	if r.frameRawJSONAsSSE && isColonlessSSEChunk(p) {
