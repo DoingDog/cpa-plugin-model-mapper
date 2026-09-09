@@ -483,6 +483,14 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 		r.pending = append(r.pending, p...)
 		return nil, nil
 	}
+	if !r.frameRawJSONAsSSE && len(p) > 0 && len(bytes.Trim(p, " \t\r\n")) == 0 {
+		if owned {
+			r.pending = p
+		} else {
+			r.pending = append(r.pending, p...)
+		}
+		return nil, nil
+	}
 	return r.rawJSONChunks(p)
 }
 
@@ -505,48 +513,68 @@ func (r *streamChunkRewriter) rawJSONChunks(p []byte) ([][]byte, error) {
 }
 
 func (r *streamChunkRewriter) tryRawJSONChunks(p []byte) ([][]byte, int, bool, bool, error) {
-	trimmed := bytes.Trim(p, " \t\r\n")
-	if len(trimmed) > 0 {
-		switch trimmed[0] {
+	start := skipTopLevelModelJSONSpace(p, 0)
+	end := len(p)
+	for end > start {
+		switch p[end-1] {
+		case ' ', '\t', '\r', '\n':
+			end--
+		default:
+			goto trimmed
+		}
+	}
+
+trimmed:
+	value := p[start:end]
+	if len(value) > 0 {
+		switch value[0] {
 		case '{':
-			if bytes.IndexByte(trimmed, '}') < 0 {
+			if bytes.IndexByte(value, '}') < 0 {
 				return nil, 0, false, true, nil
 			}
 		case '[':
-			if bytes.IndexByte(trimmed, ']') < 0 {
+			if bytes.IndexByte(value, ']') < 0 {
 				return nil, 0, false, true, nil
 			}
 		}
 	}
-	couldBeComplete := len(trimmed) > 0
+	couldBeComplete := len(value) > 0
 	if couldBeComplete {
-		switch trimmed[0] {
+		switch value[0] {
 		case '{':
-			couldBeComplete = trimmed[len(trimmed)-1] == '}'
+			couldBeComplete = value[len(value)-1] == '}'
 		case '[':
-			couldBeComplete = trimmed[len(trimmed)-1] == ']'
+			couldBeComplete = value[len(value)-1] == ']'
 		case '"':
-			couldBeComplete = trimmed[len(trimmed)-1] == '"'
+			couldBeComplete = value[len(value)-1] == '"'
 		}
 	}
 	if couldBeComplete {
 		var restored []byte
+		changed := false
 		valid := false
-		if mightContainResponseModelField(trimmed) {
+		if mightContainResponseModelField(value) {
 			var err error
-			restored, _, valid, err = r.sse.restoreResponseModelCandidate(trimmed)
+			restored, changed, valid, err = r.sse.restoreResponseModelCandidate(value)
 			if err != nil {
 				return nil, 0, false, false, err
 			}
-		} else if json.Valid(trimmed) {
-			restored = bytes.Clone(trimmed)
+		} else if json.Valid(value) {
+			restored = bytes.Clone(value)
 			valid = true
 		}
 		if valid {
 			if r.frameRawJSONAsSSE {
 				return [][]byte{frameSSEData(restored)}, len(p), true, false, nil
 			}
-			return [][]byte{restored}, len(p), true, false, nil
+			if !changed {
+				return [][]byte{bytes.Clone(p)}, len(p), true, false, nil
+			}
+			out := make([]byte, 0, len(p)-end+start+len(restored))
+			out = append(out, p[:start]...)
+			out = append(out, restored...)
+			out = append(out, p[end:]...)
+			return [][]byte{out}, len(p), true, false, nil
 		}
 	}
 	values, consumed, ok, incomplete := splitJSONValues(p)
@@ -557,16 +585,26 @@ func (r *streamChunkRewriter) tryRawJSONChunks(p []byte) ([][]byte, int, bool, b
 		return nil, consumed, true, incomplete, nil
 	}
 	out := make([][]byte, 0, len(values))
-	for _, value := range values {
+	cursor := 0
+	for i, value := range values {
+		start := skipTopLevelModelJSONSpace(p, cursor)
+		end := start + len(value)
 		restored, _, err := r.sse.restoreResponseModel(value)
 		if err != nil {
 			return nil, 0, false, false, err
 		}
 		if r.frameRawJSONAsSSE {
 			out = append(out, frameSSEData(restored))
-			continue
+		} else {
+			chunk := make([]byte, 0, start-cursor+len(restored))
+			chunk = append(chunk, p[cursor:start]...)
+			chunk = append(chunk, restored...)
+			if i == len(values)-1 {
+				chunk = append(chunk, p[end:consumed]...)
+			}
+			out = append(out, chunk)
 		}
-		out = append(out, restored)
+		cursor = end
 	}
 	return out, consumed, true, incomplete, nil
 }
@@ -582,7 +620,7 @@ func splitJSONValues(p []byte) ([][]byte, int, bool, bool) {
 		var raw json.RawMessage
 		err := dec.Decode(&raw)
 		if err == io.EOF {
-			return values, consumed, len(values) > 0, false
+			return values, len(p), len(values) > 0, false
 		}
 		if err != nil {
 			if err == io.ErrUnexpectedEOF {
@@ -1949,6 +1987,24 @@ func rewriteResponseModelFieldsWithReplacement(body []byte, model string, replac
 }
 
 func rewriteResponseModelFieldsWithReplacementChecked(body []byte, model string, replacement json.RawMessage) ([]byte, bool, bool, error) {
+	if !json.Valid(body) {
+		return bytes.Clone(body), false, false, nil
+	}
+	start := skipTopLevelModelJSONSpace(body, 0)
+	if start == len(body) {
+		return bytes.Clone(body), false, false, nil
+	}
+	switch body[start] {
+	case '{':
+		return rewriteResponseModelObjectWithReplacementChecked(body, model, replacement)
+	case '[':
+		return rewriteResponseModelArrayWithReplacementChecked(body, model, replacement)
+	default:
+		return bytes.Clone(body), false, true, nil
+	}
+}
+
+func rewriteResponseModelObjectWithReplacementChecked(body []byte, model string, replacement json.RawMessage) ([]byte, bool, bool, error) {
 	var doc map[string]json.RawMessage
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return bytes.Clone(body), false, false, nil
@@ -1977,6 +2033,48 @@ func rewriteResponseModelFieldsWithReplacementChecked(body []byte, model string,
 	if err != nil {
 		return nil, false, true, err
 	}
+	return out, true, true, nil
+}
+
+func rewriteResponseModelArrayWithReplacementChecked(body []byte, model string, replacement json.RawMessage) ([]byte, bool, bool, error) {
+	if !json.Valid(body) {
+		return bytes.Clone(body), false, false, nil
+	}
+	cursor := skipTopLevelModelJSONSpace(body, 0) + 1
+	copyFrom := 0
+	changed := false
+	var out []byte
+	for {
+		start := skipTopLevelModelJSONSpace(body, cursor)
+		if body[start] == ']' {
+			break
+		}
+		end := skipTopLevelModelJSONValue(body, start)
+		if body[start] == '{' {
+			restored, elementChanged, _, err := rewriteResponseModelObjectWithReplacementChecked(body[start:end], model, replacement)
+			if err != nil {
+				return nil, false, true, err
+			}
+			if elementChanged {
+				if !changed {
+					out = make([]byte, 0, len(body)-end+start+len(restored))
+				}
+				out = append(out, body[copyFrom:start]...)
+				out = append(out, restored...)
+				copyFrom = end
+				changed = true
+			}
+		}
+		next := skipTopLevelModelJSONSpace(body, end)
+		if body[next] == ']' {
+			break
+		}
+		cursor = next + 1
+	}
+	if !changed {
+		return bytes.Clone(body), false, true, nil
+	}
+	out = append(out, body[copyFrom:]...)
 	return out, true, true, nil
 }
 

@@ -1872,6 +1872,50 @@ func TestRestoreResponseModelTopLevelOnly(t *testing.T) {
 	}
 }
 
+func TestRestoreResponseModelRestoresGeminiStreamArray(t *testing.T) {
+	input := []byte("[\n" +
+		`{"modelVersion":"upstream","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"args":{"model":"opaque","modelVersion":"opaque"}}}]}}]}` +
+		"\n,\n" +
+		`{"modelVersion":"upstream","id":"x"}` +
+		"\n]")
+	replacement, err := json.Marshal("client")
+	if err != nil {
+		t.Fatalf("marshal replacement: %v", err)
+	}
+	got, changed, valid, err := rewriteResponseModelFieldsWithReplacementChecked(input, "client", replacement)
+	if err != nil || !valid || !changed {
+		t.Fatalf("rewrite=(%s,%v,%v,%v), want changed valid array", got, changed, valid, err)
+	}
+	if !bytes.Contains(got, []byte("\n,\n")) {
+		t.Fatalf("outer separator missing from %q", got)
+	}
+	var values []json.RawMessage
+	if err := json.Unmarshal(got, &values); err != nil {
+		t.Fatalf("unmarshal restored array: %v", err)
+	}
+	if len(values) != 2 {
+		t.Fatalf("element count=%d, want 2", len(values))
+	}
+	for i, value := range values {
+		var item map[string]json.RawMessage
+		if err := json.Unmarshal(value, &item); err != nil {
+			t.Fatalf("unmarshal element %d: %v", i, err)
+		}
+		if string(item["modelVersion"]) != `"client"` {
+			t.Fatalf("element %d modelVersion=%s, want client", i, item["modelVersion"])
+		}
+	}
+	if !bytes.Contains(values[0], []byte(`"role":"model"`)) || !bytes.Contains(values[0], []byte(`"args":{"model":"opaque","modelVersion":"opaque"}`)) {
+		t.Fatalf("nested Gemini content changed: %s", values[0])
+	}
+	for _, body := range [][]byte{[]byte(`[]`), []byte(`[null,1,{"id":"x"}]`)} {
+		got, changed, valid, err := rewriteResponseModelFieldsWithReplacementChecked(body, "client", replacement)
+		if err != nil || !valid || changed || !bytes.Equal(got, body) {
+			t.Fatalf("unchanged array rewrite(%s)=(%s,%v,%v,%v)", body, got, changed, valid, err)
+		}
+	}
+}
+
 func TestRestoreResponseModelLeavesUnsupportedBodiesUnchanged(t *testing.T) {
 	tests := [][]byte{
 		[]byte(`{"payload":{"model":"B"}}`),
@@ -3820,6 +3864,41 @@ func TestHandleExecutorExecuteStreamRestoresRawJSONNestedResponseModel(t *testin
 	}
 }
 
+func TestHandleExecutorExecuteStreamRestoresGeminiJSONStreamArray(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	input := "[\n{\"modelVersion\":\"upstream\",\"id\":\"one\"}\n,\n{\"modelVersion\":\"upstream\",\"id\":\"two\"}\n]"
+	reads := []pluginapi.HostModelStreamReadResponse{
+		{Payload: []byte(input[:7])},
+		{Payload: []byte(input[7:41])},
+		{Payload: []byte(input[41:])},
+		{Done: true},
+	}
+	emitted, _, _, _, err := runExecutorStreamTestWithHostContentType(rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "client",
+			Format:          "gemini",
+			SourceFormat:    "gemini",
+			Stream:          true,
+			OriginalRequest: []byte(`{"contents":[]}`),
+		},
+		StreamID: "plugin-stream-gemini-array",
+	}, reads, "application/json")
+	if err != nil {
+		t.Fatalf("handleExecutorExecuteStream error = %v", err)
+	}
+	got := strings.Join(emitted, "")
+	if !json.Valid([]byte(got)) || strings.Contains(got, "data:") || !strings.Contains(got, "\n,\n") {
+		t.Fatalf("emitted=%q, want complete unframed array with preserved separator", got)
+	}
+	var values []map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(got), &values); err != nil {
+		t.Fatalf("unmarshal emitted array: %v", err)
+	}
+	if len(values) != 2 || string(values[0]["modelVersion"]) != `"client"` || string(values[1]["modelVersion"]) != `"client"` {
+		t.Fatalf("emitted=%q, want restored Gemini modelVersion values", got)
+	}
+}
+
 func TestHandleExecutorExecuteStreamRestoresLineDelimitedRawJSONEvents(t *testing.T) {
 	setLoadedConfigForTest(Config{CodexResponsesRules: "codex-ws*=>deepseek-v4-flash"})
 	req := rpcExecutorRequest{
@@ -4185,6 +4264,44 @@ func legacyRawJSONChunksForTest(r *streamChunkRewriter, p []byte) ([][]byte, err
 	return out, nil
 }
 
+func TestStreamChunkRewriterPreservesUnframedRawJSONSeparators(t *testing.T) {
+	cases := []struct{ name, input, want string }{
+		{"single trailing LF", "{\"model\":\"upstream\"}\n", "{\"model\":\"client\"}\n"},
+		{"leading and trailing", " \t{\"model\":\"upstream\"}\r\n", " \t{\"model\":\"client\"}\r\n"},
+		{"blank-line objects", "{\"model\":\"upstream\"}\n\n{\"model\":\"upstream\"}\n", "{\"model\":\"client\"}\n\n{\"model\":\"client\"}\n"},
+		{"scalar boundary", "1 2\n", "1 2\n"},
+	}
+	writeAndFlush := func(t *testing.T, parts ...[]byte) []byte {
+		t.Helper()
+		r := newStreamChunkRewriter("client")
+		var chunks [][]byte
+		for _, part := range parts {
+			written, err := r.Write(part)
+			if err != nil {
+				t.Fatalf("Write(%q): %v", part, err)
+			}
+			chunks = append(chunks, written...)
+		}
+		flushed, err := r.Flush()
+		if err != nil {
+			t.Fatalf("Flush: %v", err)
+		}
+		return bytes.Join(append(chunks, flushed...), nil)
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := string(writeAndFlush(t, []byte(tt.input))); got != tt.want {
+				t.Fatalf("all-in-one output=%q, want %q", got, tt.want)
+			}
+			for split := 0; split <= len(tt.input); split++ {
+				if got := string(writeAndFlush(t, []byte(tt.input[:split]), []byte(tt.input[split:]))); got != tt.want {
+					t.Fatalf("split %d output=%q, want %q", split, got, tt.want)
+				}
+			}
+		})
+	}
+}
+
 func TestStreamChunkRewriterBuffersSplitRawJSON(t *testing.T) {
 	for _, framed := range []bool{false, true} {
 		t.Run(fmt.Sprintf("framed=%v", framed), func(t *testing.T) {
@@ -4364,12 +4481,9 @@ func TestRawJSONSingleValueFastPathMatchesLegacy(t *testing.T) {
 		[]byte(" \r\n\t "),
 		[]byte("not-json"),
 		[]byte(`{}`),
-		[]byte("  {\"id\":\"r1\"} \r\n"),
 		[]byte(`{"model":"upstream"}`),
 		[]byte(`{"response":{"model":"upstream"}}`),
 		[]byte(`{"` + backslash + `u006dodel":"upstream"}`),
-		[]byte("{\"model\":\"upstream\"}\n{\"model\":\"other\"}"),
-		[]byte("null true 123 \"text\""),
 		[]byte(`{"valid":true} trailing`),
 		[]byte{0xc2, 0xa0},
 	}
