@@ -164,6 +164,53 @@ func TestApplyLifecycleConfigRejectsNonStringConfigYAMLAtomically(t *testing.T) 
 	}
 }
 
+func TestApplyLifecycleConfigRejectsAdditionalYAMLDocumentsAtomically(t *testing.T) {
+	t.Cleanup(func() { setLoadedConfigForTest(defaultConfig()) })
+	route := func(t *testing.T, model string) routeDecision {
+		t.Helper()
+		decision, err := routeModel(loadedConfig(), "openai", model, "", "")
+		if err != nil {
+			t.Fatalf("route %q: %v", model, err)
+		}
+		return decision
+	}
+	for _, yamlConfig := range []string{
+		"global_rules: new=>target\n---\nglobal_rules: hidden=>target\n",
+		"global_rules: new=>target\n---\n",
+		"global_rules: new=>target\n...\ntrailing: [\n",
+	} {
+		t.Run(yamlConfig, func(t *testing.T) {
+			setLoadedConfigForTest(Config{GlobalRules: "old=>target"})
+			raw, err := json.Marshal(map[string]string{"config_yaml": base64.StdEncoding.EncodeToString([]byte(yamlConfig))})
+			if err != nil {
+				t.Fatalf("marshal lifecycle config: %v", err)
+			}
+			if err := applyLifecycleConfig(raw); err == nil {
+				t.Fatal("applyLifecycleConfig accepted additional YAML document")
+			}
+			if decision := route(t, "old"); !decision.Handled || decision.UpstreamModel != "target" {
+				t.Fatalf("old route=%#v, want old=>target", decision)
+			}
+			for _, model := range []string{"new", "hidden"} {
+				if decision := route(t, model); decision.Handled {
+					t.Fatalf("%s route=%#v, want unchanged config", model, decision)
+				}
+			}
+		})
+	}
+
+	single, err := json.Marshal(map[string]string{"config_yaml": base64.StdEncoding.EncodeToString([]byte("global_rules: new=>target\n# trailing comment\n"))})
+	if err != nil {
+		t.Fatalf("marshal single document: %v", err)
+	}
+	if err := applyLifecycleConfig(single); err != nil {
+		t.Fatalf("apply single document: %v", err)
+	}
+	if decision := route(t, "new"); !decision.Handled || decision.UpstreamModel != "target" {
+		t.Fatalf("new route=%#v, want new=>target", decision)
+	}
+}
+
 func TestDecodeLifecycleConfigDistinguishesDirectAndEmptyLifecycleConfig(t *testing.T) {
 	direct, lifecycle, err := decodeLifecycleConfig([]byte(`{"global_rules":"a=>b"}`))
 	if err != nil {

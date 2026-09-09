@@ -194,6 +194,10 @@ For nonstream responses, remove `Content-Length` only when model restoration cha
 
 Opaque response content and tool text are not recursively rewritten. Before closing the plugin stream after a read error, the plugin flushes pending rewritten bytes.
 
+Unframed raw JSON stream chunks preserve the bytes that separate complete JSON values. Gemini streamed JSON arrays restore the top-level `modelVersion` of each object element.
+
+When raw JSON is framed as SSE, `openai-response` and `claude` include an `event:` line from the top-level `type`. A clean `openai` Chat completion appends `data: [DONE]`, while Gemini does not append `[DONE]`.
+
 ## Common use cases
 
 ### 1. Use another Upstream Model from Claude Code and similar clients without changing the Client-Requested Model
@@ -213,9 +217,9 @@ Add a scoped mapping for that inbound client API key before an unscoped mapping.
 ```powershell
 make test
 make vet
-make build-windows-amd64 VERSION=0.5.2
-make build-linux-amd64 VERSION=0.5.2 LINUX_AMD64_CC="zig cc -target x86_64-linux-gnu"
-make package VERSION=0.5.2
+make build-windows-amd64 VERSION=0.5.3
+make build-linux-amd64 VERSION=0.5.3 LINUX_AMD64_CC="zig cc -target x86_64-linux-gnu"
+make package VERSION=0.5.3
 ```
 
 Aggregate packaging verifies each discovered binary's adjacent `.version` sidecar and fails if the built version differs from the requested release version.
@@ -251,7 +255,7 @@ Linux amd64 CPA:
 
 ## Smoke test
 
-Live smoke uses only local ignored state under `.test-cpa/`.
+Live smoke uses only local ignored state under `.test-cpa/`. Each live smoke case deletes its generated config before it finishes.
 
 Required environment variables:
 

@@ -1673,8 +1673,17 @@ func decodeLifecycleConfig(raw []byte) (json.RawMessage, bool, error) {
 		return nil, true, err
 	}
 	var yamlConfig lifecycleYAMLConfig
-	if err := yaml.Unmarshal(decoded, &yamlConfig); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(decoded))
+	if err := decoder.Decode(&yamlConfig); err != nil && err != io.EOF {
 		return nil, true, err
+	} else if err == nil {
+		var extra any
+		if err := decoder.Decode(&extra); err != io.EOF {
+			if err == nil {
+				return nil, true, fmt.Errorf("config_yaml must contain one YAML document")
+			}
+			return nil, true, fmt.Errorf("trailing YAML: %w", err)
+		}
 	}
 	rulesStackMode := ""
 	if node := yamlConfig.RulesStackMode; node.Kind != 0 {
