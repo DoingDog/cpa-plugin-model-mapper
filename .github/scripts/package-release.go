@@ -127,11 +127,18 @@ func canonicalPackagePath(path string) (string, error) {
 				return "", fmt.Errorf("read package path symlink %s: %w", filepath.ToSlash(path), err)
 			}
 			if !filepath.IsAbs(target) {
-				parent := rawPackagePathDir(current)
-				if !os.IsPathSeparator(parent[len(parent)-1]) {
-					parent += string(filepath.Separator)
+				if runtime.GOOS == "windows" && filepath.VolumeName(target) != "" {
+					return "", fmt.Errorf("resolve package path %s: ambiguous drive-relative symlink target %s", filepath.ToSlash(path), filepath.ToSlash(target))
 				}
-				target = parent + target
+				if runtime.GOOS == "windows" && len(target) > 0 && os.IsPathSeparator(target[0]) {
+					target = filepath.VolumeName(current) + target
+				} else {
+					parent := rawPackagePathDir(current)
+					if !os.IsPathSeparator(parent[len(parent)-1]) {
+						parent += string(filepath.Separator)
+					}
+					target = parent + target
+				}
 			}
 			resolved, err = canonicalPackagePath(target)
 			if err != nil {

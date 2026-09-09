@@ -5,10 +5,12 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -303,6 +305,45 @@ func TestRunRejectsAliasedAbsentOutputsBeforeWriting(t *testing.T) {
 				t.Fatalf("archive exists after rejected run: %v", err)
 			}
 		})
+	}
+}
+
+func TestRunRejectsWindowsRootRelativeDanglingSymlinkTargetBeforeWriting(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows root-relative symlink targets are Windows-specific")
+	}
+
+	dir := t.TempDir()
+	library := filepath.Join(dir, "model-mapper.dll")
+	archive := filepath.Join(dir, "out", "archive.zip")
+	checksum := filepath.Join(dir, "links", "checksums.txt")
+	if err := os.WriteFile(library, []byte("plugin"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(archive), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(checksum), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	target := strings.TrimPrefix(archive, filepath.VolumeName(archive))
+	if filepath.IsAbs(target) || filepath.VolumeName(target) != "" {
+		t.Fatalf("root-relative target = %q, want no volume and filepath.IsAbs false", target)
+	}
+	if err := os.Symlink(target, checksum); err != nil {
+		if errors.Is(err, syscall.Errno(1314)) {
+			t.Skipf("create checksum symlink requires Windows symlink privilege: %v", err)
+		}
+		t.Fatalf("create checksum symlink: %v", err)
+	}
+
+	err := run([]string{"-library", library, "-archive", archive, "-checksum", checksum})
+	if err == nil || !strings.Contains(err.Error(), "must be distinct") {
+		t.Fatalf("run error = %v, want distinct path error", err)
+	}
+	if _, err := os.Lstat(archive); !os.IsNotExist(err) {
+		t.Fatalf("archive exists after rejected run: %v", err)
 	}
 }
 
