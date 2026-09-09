@@ -146,6 +146,109 @@ func TestPackageLibraryWritesRootLibraryEntryAndChecksum(t *testing.T) {
 	}
 }
 
+func TestRunRejectsAliasedSinglePlatformPathsBeforeWriting(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		paths func(string) []string
+	}{
+		{
+			name: "library equals archive",
+			paths: func(dir string) []string {
+				library := filepath.Join(dir, "model-mapper.so")
+				return []string{library, library, filepath.Join(dir, "checksums.txt")}
+			},
+		},
+		{
+			name: "library equals checksum",
+			paths: func(dir string) []string {
+				library := filepath.Join(dir, "model-mapper.so")
+				return []string{library, filepath.Join(dir, "archive.zip"), library}
+			},
+		},
+		{
+			name: "archive equals checksum",
+			paths: func(dir string) []string {
+				archive := filepath.Join(dir, "archive.zip")
+				return []string{filepath.Join(dir, "model-mapper.so"), archive, archive}
+			},
+		},
+		{
+			name: "archive normalized alias checksum",
+			paths: func(dir string) []string {
+				archive := filepath.Join(dir, "x.zip")
+				checksum := dir + string(filepath.Separator) + "." + string(filepath.Separator) + "x.zip"
+				return []string{filepath.Join(dir, "model-mapper.so"), archive, checksum}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			paths := tt.paths(t.TempDir())
+			sentinels := writeDistinctSentinels(t, paths...)
+
+			err := run([]string{"-library", paths[0], "-archive", paths[1], "-checksum", paths[2]})
+			if err == nil || !strings.Contains(err.Error(), "must be distinct") {
+				t.Errorf("run error = %v, want distinct path error", err)
+			}
+			assertSentinelsUnchanged(t, sentinels, paths...)
+		})
+	}
+
+	t.Run("hardlink alias", func(t *testing.T) {
+		dir := t.TempDir()
+		library := filepath.Join(dir, "model-mapper.so")
+		archive := filepath.Join(dir, "archive.zip")
+		checksum := filepath.Join(dir, "checksums.txt")
+		sentinels := writeDistinctSentinels(t, library, archive)
+		if err := os.Link(archive, checksum); err != nil {
+			t.Skipf("hard links unsupported: %v", err)
+		}
+		sentinels[checksum] = sentinels[archive]
+
+		err := run([]string{"-library", library, "-archive", archive, "-checksum", checksum})
+		if err == nil || !strings.Contains(err.Error(), "must be distinct") {
+			t.Errorf("run error = %v, want distinct path error", err)
+		}
+		assertSentinelsUnchanged(t, sentinels, library, archive, checksum)
+	})
+}
+
+func writeDistinctSentinels(t *testing.T, paths ...string) map[string][]byte {
+	t.Helper()
+	sentinels := make(map[string][]byte)
+	for _, path := range paths {
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			t.Fatalf("absolute path %s: %v", path, err)
+		}
+		if _, ok := sentinels[absolute]; ok {
+			continue
+		}
+		sentinel := []byte("sentinel-" + string(rune('a'+len(sentinels))))
+		if err := os.WriteFile(path, sentinel, 0o644); err != nil {
+			t.Fatalf("write sentinel %s: %v", path, err)
+		}
+		sentinels[absolute] = sentinel
+	}
+	return sentinels
+}
+
+func assertSentinelsUnchanged(t *testing.T, sentinels map[string][]byte, paths ...string) {
+	t.Helper()
+	for _, path := range paths {
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			t.Fatalf("absolute path %s: %v", path, err)
+		}
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read sentinel %s: %v", path, err)
+		}
+		if want := sentinels[absolute]; !bytes.Equal(got, want) {
+			t.Fatalf("sentinel %s = %q, want %q", path, got, want)
+		}
+	}
+}
+
 func TestPackageExistingArtifactsRejectsUnverifiedVersionsBeforeWriting(t *testing.T) {
 	for _, tt := range []struct {
 		name         string
@@ -246,6 +349,78 @@ func TestPackageExistingArtifactsUsesSha256sumFormat(t *testing.T) {
 		wantLine := hex.EncodeToString(sum[:]) + "  " + name
 		if !strings.Contains(got, wantLine+"\n") {
 			t.Fatalf("checksums.txt = %q, missing %q", got, wantLine)
+		}
+	}
+}
+
+func TestPackageExistingArtifactsRemovesOnlyStaleCurrentVersionArchives(t *testing.T) {
+	dir := t.TempDir()
+	dist := filepath.Join(dir, "dist")
+	out := filepath.Join(dir, "release")
+	writeArtifact := func(path, contents string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path+".version", []byte("0.5.3\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	linuxPath := filepath.Join(dist, "linux_amd64", "model-mapper.so")
+	windowsPath := filepath.Join(dist, "windows_amd64", "model-mapper.dll")
+	writeArtifact(linuxPath, "linux")
+	writeArtifact(windowsPath, "windows")
+	if err := packageExistingArtifacts("0.5.3", dist, out); err != nil {
+		t.Fatalf("first packageExistingArtifacts error = %v", err)
+	}
+
+	linuxArchive := filepath.Join(out, "model-mapper_0.5.3_linux_amd64.zip")
+	windowsArchive := filepath.Join(out, "model-mapper_0.5.3_windows_amd64.zip")
+	fixtures := map[string][]byte{
+		filepath.Join(out, "model-mapper_0.5.2_windows_amd64.zip"): []byte("other version"),
+		filepath.Join(out, "model-mapper_0.5.3_unknown_riscv.zip"): []byte("unknown platform"),
+		filepath.Join(out, "notes.txt"):                            []byte("notes"),
+	}
+	for path, contents := range fixtures {
+		if err := os.WriteFile(path, contents, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range []string{windowsPath, windowsPath + ".version"} {
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("remove Windows artifact %s: %v", path, err)
+		}
+	}
+
+	if err := packageExistingArtifacts("0.5.3", dist, out); err != nil {
+		t.Fatalf("second packageExistingArtifacts error = %v", err)
+	}
+	if _, err := os.Stat(linuxArchive); err != nil {
+		t.Fatalf("stat Linux archive: %v", err)
+	}
+	if _, err := os.Stat(windowsArchive); err == nil {
+		t.Fatalf("stale Windows archive %s still exists", windowsArchive)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat stale Windows archive: %v", err)
+	}
+	checksums, err := os.ReadFile(filepath.Join(out, "checksums.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(checksums), "model-mapper_0.5.3_windows_amd64.zip") {
+		t.Fatalf("checksums.txt contains stale Windows archive: %q", checksums)
+	}
+	for path, want := range fixtures {
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read fixture %s: %v", path, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("fixture %s = %q, want %q", path, got, want)
 		}
 	}
 }

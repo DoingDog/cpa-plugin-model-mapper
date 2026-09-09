@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 )
 
@@ -52,6 +53,9 @@ func run(args []string) error {
 		if *libraryPath == "" || *archivePath == "" || *checksumPath == "" {
 			return fmt.Errorf("library, archive, and checksum are required together")
 		}
+		if err := validateDistinctPaths(*libraryPath, *archivePath, *checksumPath); err != nil {
+			return err
+		}
 		if err := packageLibrary(*libraryPath, *archivePath); err != nil {
 			return err
 		}
@@ -65,8 +69,44 @@ func run(args []string) error {
 	return packageExistingArtifacts(version, *distDir, *outDir)
 }
 
+func validateDistinctPaths(paths ...string) error {
+	absolutePaths := make([]string, len(paths))
+	infos := make([]os.FileInfo, len(paths))
+	for i, path := range paths {
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			return fmt.Errorf("normalize package path %s: %w", filepath.ToSlash(path), err)
+		}
+		absolutePaths[i] = absolute
+
+		info, err := os.Stat(path)
+		if err == nil {
+			infos[i] = info
+			continue
+		}
+		if os.IsNotExist(err) {
+			continue
+		}
+		return fmt.Errorf("stat package path %s: %w", filepath.ToSlash(path), err)
+	}
+
+	for i := range paths {
+		for j := 0; j < i; j++ {
+			samePath := absolutePaths[i] == absolutePaths[j]
+			if runtime.GOOS == "windows" {
+				samePath = strings.EqualFold(absolutePaths[i], absolutePaths[j])
+			}
+			if samePath || (infos[i] != nil && infos[j] != nil && os.SameFile(infos[i], infos[j])) {
+				return fmt.Errorf("package paths must be distinct")
+			}
+		}
+	}
+	return nil
+}
+
 func packageExistingArtifacts(version, distDir, outDir string) error {
 	artifacts := make([]artifactSpec, 0, len(artifactSpecs()))
+	found := make(map[artifactSpec]bool, len(artifactSpecs()))
 	for _, artifact := range artifactSpecs() {
 		binaryPath := artifact.binaryPath(distDir)
 		if _, err := os.Stat(binaryPath); err != nil {
@@ -85,6 +125,7 @@ func packageExistingArtifacts(version, distDir, outDir string) error {
 			return fmt.Errorf("artifact %s was built as %q, want %q", filepath.ToSlash(binaryPath), builtVersion, version)
 		}
 		artifacts = append(artifacts, artifact)
+		found[artifact] = true
 	}
 	if len(artifacts) == 0 {
 		return fmt.Errorf("no supported artifacts found under %s", filepath.ToSlash(distDir))
@@ -102,6 +143,16 @@ func packageExistingArtifacts(version, distDir, outDir string) error {
 			return err
 		}
 		zipPaths = append(zipPaths, zipPath)
+	}
+	for _, artifact := range artifactSpecs() {
+		if found[artifact] {
+			continue
+		}
+		zipName := fmt.Sprintf("%s_%s_%s_%s.zip", pluginName, version, artifact.osName, artifact.arch)
+		zipPath := filepath.Join(outDir, zipName)
+		if err := os.Remove(zipPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove stale archive %s: %w", filepath.ToSlash(zipPath), err)
+		}
 	}
 	return writeChecksums(filepath.Join(outDir, "checksums.txt"), zipPaths)
 }
