@@ -2068,9 +2068,6 @@ func rewriteResponseModelFieldsWithReplacement(body []byte, model string, replac
 }
 
 func rewriteResponseModelFieldsWithReplacementChecked(body []byte, model string, replacement json.RawMessage) ([]byte, bool, bool, error) {
-	if !json.Valid(body) {
-		return bytes.Clone(body), false, false, nil
-	}
 	start := skipTopLevelModelJSONSpace(body, 0)
 	if start == len(body) {
 		return bytes.Clone(body), false, false, nil
@@ -2081,6 +2078,9 @@ func rewriteResponseModelFieldsWithReplacementChecked(body []byte, model string,
 	case '[':
 		return rewriteResponseModelArrayWithReplacementChecked(body, model, replacement)
 	default:
+		if !json.Valid(body) {
+			return bytes.Clone(body), false, false, nil
+		}
 		return bytes.Clone(body), false, true, nil
 	}
 }
