@@ -224,6 +224,7 @@ type restoreResponseBenchmarkFixture struct {
 	unchanged         bool
 	wantModel         string
 	wantResponseModel string
+	geminiArray       bool
 }
 
 func BenchmarkRestoreResponseModel(b *testing.B) {
@@ -275,6 +276,13 @@ func restoreResponseBenchmarkFixtures(size int) []restoreResponseBenchmarkFixtur
 			changed:           true,
 			wantResponseModel: "client",
 		},
+		// This preflight would fail against the pre-Task-2 array behavior, which did not restore array elements.
+		{
+			name:        "gemini-array-changed",
+			body:        restoreResponseBenchmarkFixtureBody(size, `[{"modelVersion":"upstream","opaque":{"model":"opaque-model","modelVersion":"opaque-version"},"role":{"model":"role-model"},"payload":"`, `"}]`),
+			changed:     true,
+			geminiArray: true,
+		},
 	}
 }
 
@@ -286,6 +294,25 @@ func restoreResponseBenchmarkFixtureBody(size int, prefix, suffix string) []byte
 }
 
 func (fixture restoreResponseBenchmarkFixture) assertRestored(b *testing.B, out []byte) {
+	if fixture.geminiArray {
+		var restored []struct {
+			ModelVersion string `json:"modelVersion"`
+			Opaque       struct {
+				Model        string `json:"model"`
+				ModelVersion string `json:"modelVersion"`
+			} `json:"opaque"`
+			Role struct {
+				Model string `json:"model"`
+			} `json:"role"`
+		}
+		if err := json.Unmarshal(out, &restored); err != nil {
+			b.Fatalf("preflight decode %q: %v", fixture.name, err)
+		}
+		if len(restored) != 1 || restored[0].ModelVersion != "client" || restored[0].Opaque.Model != "opaque-model" || restored[0].Opaque.ModelVersion != "opaque-version" || restored[0].Role.Model != "role-model" {
+			b.Fatalf("preflight gemini array=%#v, want restored immediate modelVersion and preserved opaque and role models", restored)
+		}
+		return
+	}
 	if fixture.unchanged && !bytes.Equal(out, fixture.body) {
 		b.Fatalf("preflight restore changed unchanged fixture %q", fixture.name)
 	}
