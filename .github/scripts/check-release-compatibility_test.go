@@ -11,9 +11,10 @@ import (
 
 func TestCheckGLIBCCompatibility(t *testing.T) {
 	for _, tt := range []struct {
-		name    string
-		output  string
-		wantErr bool
+		name      string
+		output    string
+		wantErr   bool
+		wantError string
 	}{
 		{
 			name:   "at baseline",
@@ -25,6 +26,18 @@ func TestCheckGLIBCCompatibility(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name:      "DT RELR ABI requirement",
+			output:    "Name: GLIBC_2.2.5\nName: GLIBC_ABI_DT_RELR\n",
+			wantErr:   true,
+			wantError: "GLIBC_ABI_DT_RELR",
+		},
+		{
+			name:      "private ABI requirement",
+			output:    "Name: GLIBC_2.17\nName: GLIBC_PRIVATE\n",
+			wantErr:   true,
+			wantError: "GLIBC_PRIVATE",
+		},
+		{
 			name:    "missing version requirements",
 			output:  "No version information found in this file.\n",
 			wantErr: true,
@@ -34,6 +47,9 @@ func TestCheckGLIBCCompatibility(t *testing.T) {
 			err := checkGLIBCCompatibility(strings.NewReader(tt.output), "2.17")
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("checkGLIBCCompatibility error=%v, wantErr=%v", err, tt.wantErr)
+			}
+			if tt.wantError != "" && !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("checkGLIBCCompatibility error=%q, want containing %q", err, tt.wantError)
 			}
 		})
 	}
