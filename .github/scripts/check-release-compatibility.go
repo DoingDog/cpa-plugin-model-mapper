@@ -11,7 +11,10 @@ import (
 	"strings"
 )
 
-var glibcVersionPattern = regexp.MustCompile(`\bGLIBC_(\S+)`)
+var (
+	glibcNamePattern      = regexp.MustCompile(`\bName:\s+GLIBC_(\S+)`)
+	glibcReferencePattern = regexp.MustCompile(`\b[0-9]+\s+\(GLIBC_([^\s)]+)\)`)
+)
 
 func main() {
 	if err := run(os.Stdin, os.Args[1:]); err != nil {
@@ -46,14 +49,15 @@ func checkGLIBCCompatibility(input io.Reader, maximum string) error {
 	if err != nil {
 		return fmt.Errorf("read readelf output: %w", err)
 	}
-	matches := glibcVersionPattern.FindAllStringSubmatch(string(body), -1)
-	versions := make([]string, 0, len(matches))
-	for _, match := range matches {
-		version := match[1]
-		if _, err := parseDottedVersion(version); err != nil {
-			return fmt.Errorf("unsupported GLIBC requirement %s", match[0])
+	versions := []string{}
+	for _, pattern := range []*regexp.Regexp{glibcNamePattern, glibcReferencePattern} {
+		for _, match := range pattern.FindAllStringSubmatch(string(body), -1) {
+			version := match[1]
+			if _, err := parseDottedVersion(version); err != nil {
+				return fmt.Errorf("unsupported GLIBC requirement GLIBC_%s", version)
+			}
+			versions = append(versions, version)
 		}
-		versions = append(versions, version)
 	}
 	return checkMaximumVersion("GLIBC", versions, maximum)
 }

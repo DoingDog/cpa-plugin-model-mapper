@@ -17,8 +17,9 @@ func TestCheckGLIBCCompatibility(t *testing.T) {
 		wantError string
 	}{
 		{
-			name:   "at baseline",
-			output: "Name: GLIBC_2.2.5\nName: GLIBC_2.9\nName: GLIBC_2.17\n",
+			name: "at baseline",
+			output: "0x001c:   2 (GLIBC_2.2.5)\n" +
+				"Name: GLIBC_2.2.5\nName: GLIBC_2.9\nName: GLIBC_2.17\n",
 		},
 		{
 			name:    "newer than baseline",
