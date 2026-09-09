@@ -3776,6 +3776,55 @@ func TestStreamChunkRewriterFramesRawJSONByFormat(t *testing.T) {
 	}
 }
 
+func TestStreamChunkRewriterRejectsNewlinesInSynthesizedEventType(t *testing.T) {
+	for _, escaped := range []string{`\n`, `\r`} {
+		r := newStreamChunkRewriter("client")
+		r.format = "claude"
+		r.frameRawJSONAsSSE = true
+		payload := []byte(`{"type":"message_start` + escaped + `id: injected","message":{"model":"upstream"}}`)
+		chunks, err := r.Write(payload)
+		if err != nil {
+			t.Fatalf("Write(%q): %v", payload, err)
+		}
+		flushed, err := r.Flush()
+		if err != nil {
+			t.Fatalf("Flush: %v", err)
+		}
+		want := "data: {\"message\":{\"model\":\"client\"},\"type\":\"message_start" + escaped + "id: injected\"}\n\n"
+		if got := string(bytes.Join(append(chunks, flushed...), nil)); got != want {
+			t.Fatalf("output=%q, want %q", got, want)
+		}
+	}
+}
+
+func TestStreamChunkRewriterFramesRawJSONBeforeSSEDoneInSameWrite(t *testing.T) {
+	input := `{"model":"upstream","choices":[]}` + "\n\ndata: [DONE]\n\n"
+	want := "data: {\"choices\":[],\"model\":\"client\"}\n\ndata: [DONE]\n\n"
+	for _, parts := range [][][]byte{
+		{[]byte(input)},
+		{[]byte(`{"model":"upstream","choices":[]}` + "\n\n"), []byte("data: [DONE]\n\n")},
+	} {
+		r := newStreamChunkRewriter("client")
+		r.format = "openai"
+		r.frameRawJSONAsSSE = true
+		var chunks [][]byte
+		for _, part := range parts {
+			written, err := r.Write(part)
+			if err != nil {
+				t.Fatalf("Write(%q): %v", part, err)
+			}
+			chunks = append(chunks, written...)
+		}
+		finished, err := r.Finish()
+		if err != nil {
+			t.Fatalf("Finish: %v", err)
+		}
+		if got := string(bytes.Join(append(chunks, finished...), nil)); got != want {
+			t.Fatalf("output=%q, want %q", got, want)
+		}
+	}
+}
+
 func TestStreamChunkRewriterPreservesFramedResponsesEventBytes(t *testing.T) {
 	input := "event: response.completed\r\nid: 1\r\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"client\"}}\r\n\r\n"
 	r := newStreamChunkRewriter("client")

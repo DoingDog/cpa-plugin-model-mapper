@@ -507,6 +507,24 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 			return nil, nil
 		}
 	}
+	if r.frameRawJSONAsSSE && couldStartJSONValue(p) {
+		dec := json.NewDecoder(bytes.NewReader(p))
+		var raw json.RawMessage
+		if dec.Decode(&raw) == nil {
+			suffix := bytes.TrimLeft(p[dec.InputOffset():], " \t\r\n")
+			if len(suffix) > 0 && isSSEChunk(suffix) {
+				restored, _, err := r.sse.restoreResponseModel(raw)
+				if err != nil {
+					return nil, err
+				}
+				chunks, err := r.sse.Write(suffix)
+				if err != nil {
+					return nil, err
+				}
+				return append([][]byte{r.frameRawJSON(restored)}, chunks...), nil
+			}
+		}
+	}
 	if isSSEChunk(p) {
 		return r.sse.Write(p)
 	}
@@ -726,7 +744,7 @@ func frameSSEData(p []byte) []byte {
 
 func frameSSEEvent(p []byte, eventType string) []byte {
 	var out bytes.Buffer
-	if eventType != "" {
+	if eventType != "" && !strings.ContainsAny(eventType, "\r\n") {
 		out.WriteString("event: ")
 		out.WriteString(eventType)
 		out.WriteByte('\n')
