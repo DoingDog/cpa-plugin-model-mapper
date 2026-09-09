@@ -38,6 +38,12 @@ func TestCheckGLIBCCompatibility(t *testing.T) {
 			wantError: "GLIBC_PRIVATE",
 		},
 		{
+			name:      "nonnumeric suffix",
+			output:    "Name: GLIBC_2.17-TEST\n",
+			wantErr:   true,
+			wantError: "GLIBC_2.17-TEST",
+		},
+		{
 			name:    "missing version requirements",
 			output:  "No version information found in this file.\n",
 			wantErr: true,

@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-var glibcVersionPattern = regexp.MustCompile(`\bGLIBC_([A-Za-z0-9_.]+)`)
+var glibcVersionPattern = regexp.MustCompile(`\bGLIBC_(\S+)`)
 
 func main() {
 	if err := run(os.Stdin, os.Args[1:]); err != nil {
