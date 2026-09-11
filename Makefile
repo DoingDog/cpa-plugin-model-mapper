@@ -31,7 +31,7 @@ build-platform:
 	@case "$(GOOS)" in windows) ext=".dll" ;; darwin) ext=".dylib" ;; *) ext=".so" ;; esac; \
 	out="$(DIST_DIR)/$(GOOS)_$(GOARCH)/$(PLUGIN_NAME)$$ext"; \
 	mkdir -p "$$(dirname "$$out")"; \
-	rm -f "$$out.version"; \
+	rm -f "$$out.version" || exit 1; \
 	if [ -n "$(BUILD_CC)" ]; then export CC="$(BUILD_CC)"; fi; \
 	if [ "$(GOOS)" = "darwin" ]; then export MACOSX_DEPLOYMENT_TARGET="$(MACOSX_DEPLOYMENT_TARGET)"; fi; \
 	CGO_ENABLED=1 GOOS="$(GOOS)" GOARCH="$(GOARCH)" $(GO) build -trimpath -buildmode=c-shared -ldflags='$(LDFLAGS) $(VERSION_LDFLAGS)' -o "$$out" .
@@ -85,8 +85,8 @@ install-linux-amd64: build-linux-amd64
 	cp $(LINUX_AMD64_OUT) "$(CPA_PLUGINS_DIR)/$(PLUGIN_NAME).so"
 
 smoke-local:
-	@host_goos="$$( go env GOOS )"; \
-	host_goarch="$$( go env GOARCH )"; \
+	@host_goos="$$( $(GO) env GOOS )"; \
+	host_goarch="$$( $(GO) env GOARCH )"; \
 	$(MAKE) --no-print-directory build-platform GOOS="$$host_goos" GOARCH="$$host_goarch" GO="$(GO)" DIST_DIR="$(DIST_DIR)" PLUGIN_NAME="$(PLUGIN_NAME)"
 	$(GO) run .github/scripts/smoke-local.go
 

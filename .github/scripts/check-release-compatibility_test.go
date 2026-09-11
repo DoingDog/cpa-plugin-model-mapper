@@ -135,13 +135,58 @@ func TestMakeSmokeLocalBuildsCurrentHostPlatform(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(body)
-	for _, want := range []string{"go env GOOS", "go env GOARCH", "build-platform", `GOOS="$$host_goos"`, `GOARCH="$$host_goarch"`} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("Makefile missing %q", want)
+	targetStart := strings.Index(text, "smoke-local:")
+	if targetStart == -1 {
+		t.Fatal("Makefile missing smoke-local target")
+	}
+	targetEnd := strings.Index(text[targetStart:], "\nclean:")
+	if targetEnd == -1 {
+		t.Fatal("Makefile missing end of smoke-local target")
+	}
+	target := text[targetStart : targetStart+targetEnd]
+	for _, want := range []string{"$(GO) env GOOS", "$(GO) env GOARCH", "build-platform", `GOOS="$$host_goos"`, `GOARCH="$$host_goarch"`} {
+		if !strings.Contains(target, want) {
+			t.Fatalf("smoke-local missing %q", want)
 		}
 	}
 	if strings.Contains(text, "smoke-local: build-windows-amd64") {
 		t.Fatal("smoke-local still has a fixed Windows amd64 prerequisite")
+	}
+}
+
+func TestBuildPlatformStopsAfterSidecarRemovalFailure(t *testing.T) {
+	makePath, err := exec.LookPath("make")
+	if err != nil {
+		t.Skip("make is not available")
+	}
+
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoRoot := wd
+	if _, err := os.Stat(filepath.Join(repoRoot, "Makefile")); err != nil {
+		repoRoot = filepath.Clean(filepath.Join(wd, "..", ".."))
+	}
+
+	tempDir := t.TempDir()
+	binDir := filepath.Join(tempDir, "bin")
+	if err := os.Mkdir(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "rm"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(makePath,
+		"--no-print-directory", "build-platform",
+		"GOOS=linux", "GOARCH=amd64", "GO=true",
+		"DIST_DIR="+filepath.ToSlash(filepath.Join(tempDir, "dist")),
+	)
+	cmd.Dir = repoRoot
+	cmd.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if output, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("build-platform succeeded after sidecar removal failure:\n%s", output)
 	}
 }
 
