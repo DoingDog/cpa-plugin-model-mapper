@@ -2697,6 +2697,25 @@ func TestSSERewriterJoinsMultiDataJSONBeforeRestoring(t *testing.T) {
 	}
 }
 
+func TestSSERewriterChangedMultiDataArrayRemainsValidSSE(t *testing.T) {
+	input := []byte("data: [\ndata: {\"model\":\"upstream\"}\ndata: ]\n\n")
+	chunks, err := newSSERewriter("client").Write(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := bytes.Join(chunks, nil)
+	var data [][]byte
+	for _, line := range bytes.Split(output, []byte{'\n'}) {
+		if bytes.HasPrefix(line, []byte("data:")) {
+			data = append(data, bytes.Clone(sseFieldValue(line)))
+		}
+	}
+	joined := bytes.Join(data, []byte{'\n'})
+	if !json.Valid(joined) || bytes.Contains(joined, []byte("upstream")) || !bytes.Contains(joined, []byte("client")) {
+		t.Fatalf("output=%q joined-data=%q", output, joined)
+	}
+}
+
 func TestSSERewriterRestoresEscapedKeyAcrossDataFields(t *testing.T) {
 	backslash := string(rune(92))
 	lf := string([]byte{10})
@@ -4029,6 +4048,33 @@ func TestStreamChunkRewriterBOMPartitionInvariant(t *testing.T) {
 		}
 		if got != want || !strings.Contains(got, `"model":"client"`) {
 			t.Fatalf("split %d output = %q, want partition-invariant restored output %q", split, got, want)
+		}
+	}
+}
+
+func TestStreamChunkRewriterLeadingWhitespacePartitionInvariant(t *testing.T) {
+	input := []byte(" data: {\"model\":\"upstream\"}\n\n")
+	rewrite := func(parts ...[]byte) []byte {
+		r := newStreamChunkRewriter("client")
+		r.frameRawJSONAsSSE = true
+		var chunks [][]byte
+		for _, part := range parts {
+			written, err := r.Write(part)
+			if err != nil {
+				t.Fatal(err)
+			}
+			chunks = append(chunks, written...)
+		}
+		flushed, err := r.Flush()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return bytes.Join(append(chunks, flushed...), nil)
+	}
+	whole := rewrite(input)
+	for split := 0; split <= len(input); split++ {
+		if got := rewrite(input[:split], input[split:]); !bytes.Equal(got, whole) {
+			t.Fatalf("split %d output=%q, want %q", split, got, whole)
 		}
 	}
 }

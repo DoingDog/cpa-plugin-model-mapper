@@ -275,6 +275,11 @@ func (r *sseRewriter) rewriteMultiDataEvent(out [][]byte, event []byte) ([][]byt
 	if !changed {
 		return appendUnchangedSSEEvent(out, event), nil
 	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, restored); err != nil {
+		return nil, err
+	}
+	restored = compact.Bytes()
 
 	retainedFields := nonDataFields + 1
 	retained := 0
@@ -532,7 +537,7 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 		r.pending = append(r.pending, p...)
 		return nil, nil
 	}
-	if !r.frameRawJSONAsSSE && len(p) > 0 && len(bytes.Trim(p, " \t\r\n")) == 0 {
+	if len(p) > 0 && len(bytes.Trim(p, " \t\r\n")) == 0 {
 		if owned {
 			r.pending = p
 		} else {
