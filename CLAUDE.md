@@ -13,7 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Build Linux amd64 plugin from Windows with Zig: `make build-linux-amd64 LINUX_AMD64_CC="zig cc -target x86_64-linux-gnu"`
 - Build/package one platform: `make package VERSION=0.1.2 GOOS=windows GOARCH=amd64`
 - Package already-built artifacts into `dist/release/`: `make package VERSION=0.1.2`
-- Run live local smoke: `make smoke-local` builds and copies the current `go env GOOS/GOARCH` artifact; set `CPA_SMOKE_API_KEY` and `CPA_SMOKE_CPA_BIN`, whose relative path-like values resolve from the repository root
+- Run live local smoke: `make smoke-local` builds and copies the artifact for the current GOOS and GOARCH values reported by go env; set `CPA_SMOKE_API_KEY` and `CPA_SMOKE_CPA_BIN`, whose relative path-like values resolve from the repository root
 - Clean build output: `make clean`
 
 Do not run `go test ./.github/scripts`; that directory contains multiple `package main` scripts and will collide on duplicate `main`/`run` symbols. Test script files explicitly as shown above.
@@ -33,10 +33,10 @@ This is a single-package Go `c-shared` CLIProxyAPI native plugin. `abi_cgo.go` i
 
 Important model-rewrite invariants:
 
-- Request rewriting intentionally changes only the top-level JSON `model` field. When that rewrite changes the request body, remove `Content-Length`, `Content-MD5`, and `Digest`.
-- Response restoration is deliberately whitelisted to `model`, `modelVersion`, `response.model`, `response.modelVersion`, `message.model`, and `interaction.model`. Do not replace recursively through arbitrary content/tool text. When model restoration changes nonstream response bytes, remove `Content-Length`, `Content-MD5`, `Digest`, `ETag`, `Accept-Ranges`, and `Content-Range`; preserve them when unchanged.
+- Request rewriting intentionally changes only the top-level JSON `model` field. When that rewrite changes the request body, remove `Content-Length`, `Content-Digest`, `Repr-Digest`, `Digest`, and `Content-MD5`.
+- Response restoration is deliberately whitelisted to `model`, `modelVersion`, `response.model`, `response.modelVersion`, `message.model`, and `interaction.model`. Do not replace recursively through arbitrary content/tool text. When model restoration changes nonstream response bytes, remove `Content-Length`, `Content-Digest`, `Repr-Digest`, `Digest`, `Content-MD5`, `ETag`, and `Content-Range`; preserve them when unchanged.
 - Case operations change ASCII English letters only and do not make later mappings case-insensitive.
-- Mapped streams remove the same stale response metadata before forwarding. Streaming responses pass through `streamChunkRewriter`, which handles complete SSE events, split SSE prefixes, unterminated SSE data at flush time, raw JSON chunks, line/space-delimited JSON values, and raw JSON that must be framed as SSE for Responses SSE clients. Gemini raw core chunks are not double-framed.
+- Mapped streams remove that response body-dependent set plus `Transfer-Encoding` before forwarding. Streaming responses pass through `streamChunkRewriter`, which handles complete SSE events, split SSE prefixes, unterminated SSE data at flush time, raw JSON chunks, line/space-delimited JSON values, and raw JSON that must be framed as SSE for Responses SSE clients. Gemini raw core chunks are not double-framed.
 - On a host stream read error, flush pending rewritten bytes before closing the plugin stream so clients do not hang waiting for buffered output.
 
 ## Release and packaging

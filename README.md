@@ -179,7 +179,7 @@ This maps every model to `kimi` only when the authenticated key does not match `
 
 ## Rewrite boundaries
 
-Request rewriting changes only a top-level string JSON `model` field. It does not rewrite nested request objects. When the rewritten request body changes, the plugin removes `Content-Length`, `Content-MD5`, and `Digest`.
+Request rewriting changes only a top-level string JSON `model` field. It does not rewrite nested request objects. When the rewritten request body changes, the plugin removes `Content-Length`, `Content-Digest`, `Repr-Digest`, `Digest`, and `Content-MD5`.
 
 Response restoration changes only these paths:
 
@@ -190,7 +190,7 @@ Response restoration changes only these paths:
 - `message.model`
 - `interaction.model`
 
-When model restoration changes nonstream response bytes, the plugin removes `Content-Length`, `Content-MD5`, `Digest`, `ETag`, `Accept-Ranges`, and `Content-Range`; it preserves them when unchanged. Mapped streams remove the same stale response metadata before forwarding.
+When model restoration changes nonstream response bytes, the plugin removes `Content-Length`, `Content-Digest`, `Repr-Digest`, `Digest`, `Content-MD5`, `ETag`, and `Content-Range`; it preserves them when unchanged. Mapped streams remove that response body-dependent set plus `Transfer-Encoding` before forwarding.
 
 Opaque response content and tool text are not recursively rewritten. Before closing the plugin stream after a read error, the plugin flushes pending rewritten bytes.
 
@@ -255,7 +255,7 @@ Linux amd64 CPA:
 
 ## Smoke test
 
-Live smoke uses only local ignored state under `.test-cpa/`. Each live smoke case deletes its generated config before it finishes. `make smoke-local` builds and copies the current `go env GOOS/GOARCH` artifact. Relative path-like `CPA_SMOKE_CPA_BIN` values are resolved from the repository root.
+Generated CPA runtime state is under `.test-cpa/`. Each live smoke case deletes its generated config before it finishes. `make smoke-local` also builds `dist/<goos>_<goarch>/model-mapper` with the host extension and copies the artifact for the current GOOS and GOARCH values reported by go env. Relative path-like `CPA_SMOKE_CPA_BIN` values are resolved from the repository root.
 
 Required environment variables:
 
