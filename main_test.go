@@ -5206,6 +5206,9 @@ func TestRawJSONIncompleteContainerFlushesUnchangedOwnedChunk(t *testing.T) {
 				t.Fatalf("object Write = %q, want no output", first)
 			}
 			input[0] ^= 1
+			if tt.name == "array" {
+				input[1] ^= 1
+			}
 			chunks, err := r.Flush()
 			if err != nil || !bytes.Equal(bytes.Join(append(first, chunks...), nil), original) {
 				t.Fatalf("Flush = (%q, %v), want unchanged owned bytes", chunks, err)
