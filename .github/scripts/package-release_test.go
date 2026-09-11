@@ -75,20 +75,37 @@ func TestReleaseWorkflowMarksPrereleaseTags(t *testing.T) {
 	}
 	text := string(body)
 	for _, want := range []string{
-		`if [[ "${GITHUB_REF_NAME#v}" == *-* ]]`,
+		`release_version="${GITHUB_REF_NAME#v}"`,
+		`release_version="${release_version%%+*}"`,
+		`if [[ "${release_version}" == *-* ]]`,
 		"prerelease_args+=(--prerelease)",
 		`gh release edit "${GITHUB_REF_NAME}" "${prerelease_args[@]}"`,
 		"gh release create",
-		`"${prerelease_args[@]}"`,
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("release workflow missing %q", want)
 		}
 	}
 	publishStep := strings.Index(text, "- name: Publish GitHub release")
-	prereleaseCondition := strings.Index(text, `if [[ "${GITHUB_REF_NAME#v}" == *-* ]]`)
-	if publishStep == -1 || prereleaseCondition < publishStep {
-		t.Fatal("prerelease condition is not in the publish step")
+	versionWithoutPrefix := strings.Index(text, `release_version="${GITHUB_REF_NAME#v}"`)
+	versionWithoutBuild := strings.Index(text, `release_version="${release_version%%+*}"`)
+	prereleaseCondition := strings.Index(text, `if [[ "${release_version}" == *-* ]]`)
+	if publishStep == -1 || versionWithoutPrefix < publishStep || versionWithoutBuild < versionWithoutPrefix || prereleaseCondition < versionWithoutBuild {
+		t.Fatal("prerelease condition does not remove the build suffix in the publish step")
+	}
+
+	createStart := strings.Index(text, `gh release create "${GITHUB_REF_NAME}"`)
+	if createStart == -1 {
+		t.Fatal("release workflow missing create command")
+	}
+	const releaseBranchEnd = "\n          fi"
+	releaseBranchEndAt := strings.Index(text[createStart:], releaseBranchEnd)
+	if releaseBranchEndAt == -1 {
+		t.Fatal("release workflow missing end of release-create branch")
+	}
+	createBranch := text[createStart : createStart+releaseBranchEndAt+len(releaseBranchEnd)]
+	if !strings.Contains(createBranch, `"${prerelease_args[@]}"`) {
+		t.Fatal("release create command missing prerelease arguments")
 	}
 }
 

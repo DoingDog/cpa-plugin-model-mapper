@@ -285,7 +285,9 @@ jobs:
         run: |
           set -euo pipefail
           prerelease_args=()
-          if [[ "${GITHUB_REF_NAME#v}" == *-* ]]; then
+          release_version="${GITHUB_REF_NAME#v}"
+          release_version="${release_version%%+*}"
+          if [[ "${release_version}" == *-* ]]; then
             prerelease_args+=(--prerelease)
           fi
           sort dist/*.sha256 > dist/checksums.txt
