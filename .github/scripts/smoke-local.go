@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -118,13 +119,14 @@ func run() error {
 		dir:      filepath.Join(repoRoot, ".test-cpa"),
 	}
 	env.config = filepath.Join(env.dir, "config.yaml")
-	env.plugin = filepath.Join(env.dir, "plugins", "windows", "amd64", "model-mapper.dll")
+	pluginSource, pluginDestination := smokePluginPaths(repoRoot, env.dir)
+	env.plugin = pluginDestination
 	env.logsDir = filepath.Join(env.dir, "logs")
 	env.logFile = filepath.Join(env.logsDir, "cpa.log")
 	if err := prepareDirs(env); err != nil {
 		return err
 	}
-	if err := copyFile(filepath.Join(repoRoot, "dist", "windows_amd64", "model-mapper.dll"), env.plugin); err != nil {
+	if err := copyFile(pluginSource, env.plugin); err != nil {
 		return err
 	}
 
@@ -155,9 +157,22 @@ func run() error {
 	return nil
 }
 
+func smokePluginPaths(repoRoot, smokeDir string) (string, string) {
+	ext := ".so"
+	switch runtime.GOOS {
+	case "windows":
+		ext = ".dll"
+	case "darwin":
+		ext = ".dylib"
+	}
+	name := "model-mapper" + ext
+	return filepath.Join(repoRoot, "dist", runtime.GOOS+"_"+runtime.GOARCH, name),
+		filepath.Join(smokeDir, "plugins", runtime.GOOS, runtime.GOARCH, name)
+}
+
 func prepareDirs(env smokeEnv) error {
 	for _, dir := range []string{
-		filepath.Join(env.dir, "plugins", "windows", "amd64"),
+		filepath.Dir(env.plugin),
 		env.logsDir,
 		filepath.Join(env.dir, "tmp"),
 	} {
@@ -279,6 +294,10 @@ func buildConfig(env smokeEnv, tc caseConfig) string {
 }
 
 func startCPA(env smokeEnv) (*cpaProcess, error) {
+	cpaBin := env.cpaBin
+	if !filepath.IsAbs(cpaBin) && strings.ContainsAny(cpaBin, `/\`) {
+		cpaBin = filepath.Join(env.repoRoot, cpaBin)
+	}
 	if err := checkPortAvailable(fmt.Sprintf("127.0.0.1:%d", env.port)); err != nil {
 		return nil, err
 	}
@@ -286,7 +305,7 @@ func startCPA(env smokeEnv) (*cpaProcess, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create log file: %w", err)
 	}
-	cmd := exec.Command(env.cpaBin, "--config", "config.yaml", "--no-browser")
+	cmd := exec.Command(cpaBin, "--config", "config.yaml", "--no-browser")
 	cmd.Dir = env.dir
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
@@ -507,6 +526,10 @@ func runStreamCase(port int, tc caseConfig) error {
 		var parsed openAIResponse
 		if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
 			return fmt.Errorf("decode streamed data %q: %w", payload, err)
+		}
+		hasError := len(parsed.Error) != 0 && !bytes.Equal(bytes.TrimSpace(parsed.Error), []byte("null"))
+		if hasError {
+			return fmt.Errorf("stream returned error: %s", parsed.Error)
 		}
 		if parsed.Model == tc.wantOriginalModel {
 			sawOriginal = true

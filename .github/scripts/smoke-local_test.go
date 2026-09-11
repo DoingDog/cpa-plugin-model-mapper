@@ -14,6 +14,87 @@ import (
 	"time"
 )
 
+func TestSmokePluginPathsUseHostPlatform(t *testing.T) {
+	repo := filepath.Join("repo")
+	dir := filepath.Join(repo, ".test-cpa")
+	source, destination := smokePluginPaths(repo, dir)
+	ext := ".so"
+	if runtime.GOOS == "windows" {
+		ext = ".dll"
+	}
+	if runtime.GOOS == "darwin" {
+		ext = ".dylib"
+	}
+	name := "model-mapper" + ext
+	if source != filepath.Join(repo, "dist", runtime.GOOS+"_"+runtime.GOARCH, name) {
+		t.Fatalf("source=%q", source)
+	}
+	if destination != filepath.Join(dir, "plugins", runtime.GOOS, runtime.GOARCH, name) {
+		t.Fatalf("destination=%q", destination)
+	}
+}
+
+func TestStartCPAResolvesRelativeExecutableFromRepoRoot(t *testing.T) {
+	root := t.TempDir()
+	cpaBin := filepath.Join(root, "tools", "cpa-helper"+helperExecutableExtension())
+	if err := os.MkdirAll(filepath.Dir(cpaBin), 0o755); err != nil {
+		t.Fatalf("create helper directory: %v", err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("get test executable: %v", err)
+	}
+	if err := copyFile(executable, cpaBin); err != nil {
+		t.Fatalf("copy test executable: %v", err)
+	}
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(cpaBin, 0o755); err != nil {
+			t.Fatalf("make test executable runnable: %v", err)
+		}
+	}
+
+	dir := filepath.Join(root, ".test-cpa")
+	env := smokeEnv{
+		repoRoot: root,
+		dir:      dir,
+		cpaBin:   filepath.Join("tools", "cpa-helper"+helperExecutableExtension()),
+		logsDir:  filepath.Join(dir, "logs"),
+		logFile:  filepath.Join(dir, "logs", "cpa.log"),
+	}
+	if err := os.MkdirAll(env.logsDir, 0o755); err != nil {
+		t.Fatalf("create log directory: %v", err)
+	}
+
+	proc, err := startCPA(env)
+	if proc != nil {
+		waitErr := <-proc.waitDone
+		if closeErr := proc.logFile.Close(); closeErr != nil {
+			t.Fatalf("close log file: %v", closeErr)
+		}
+		if waitErr == nil {
+			t.Fatal("started process exit error = nil")
+		}
+		return
+	}
+	if err == nil {
+		t.Fatal("startCPA result = nil")
+	}
+	if strings.Contains(err.Error(), "start CPA") || strings.Contains(strings.ToLower(err.Error()), "file not found") {
+		t.Fatalf("startCPA error = %v, want started process exit", err)
+	}
+	var startedExit *cpaStartedExitError
+	if !errors.As(err, &startedExit) {
+		t.Fatalf("startCPA error = %v, want cpaStartedExitError", err)
+	}
+}
+
+func helperExecutableExtension() string {
+	if runtime.GOOS == "windows" {
+		return ".exe"
+	}
+	return ""
+}
+
 func TestCheckPortAvailableRejectsOccupiedPort(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -408,6 +489,26 @@ func TestRunStreamCaseRejectsMalformedData(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "decode streamed data") || !strings.Contains(err.Error(), "{broken") {
 		t.Fatalf("runStreamCase error = %v, want malformed payload", err)
+	}
+}
+
+func TestRunStreamCaseRejectsInBandError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte("data: {\"model\":\"client\"}\n\ndata: {\"error\":{\"message\":\"upstream failed\"}}\n\ndata: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	port := server.Listener.Addr().(*net.TCPAddr).Port
+	err := runStreamCase(port, caseConfig{requestModel: "client", requestAPIKey: localAPIKey, wantOriginalModel: "client"})
+	if err == nil {
+		t.Fatal("runStreamCase error = nil")
+	}
+	if !strings.Contains(err.Error(), "upstream failed") {
+		t.Fatalf("runStreamCase error = %v, want in-band stream error", err)
 	}
 }
 
