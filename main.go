@@ -476,11 +476,11 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 		return r.sse.Write(p)
 	}
 	if r.rawJSONArray {
-		return r.writeRawJSONArray(p, false)
+		return r.writeRawJSONArray(p, false, owned)
 	}
 	start := skipTopLevelModelJSONSpace(p, 0)
 	if !r.frameRawJSONAsSSE && start < len(p) && p[start] == '[' {
-		return r.writeRawJSONArray(p, true)
+		return r.writeRawJSONArray(p, true, owned)
 	}
 	if r.frameRawJSONAsSSE && !couldStartJSONValue(p) && completeSSEEvents(p) && !mightContainResponseModelField(p) {
 		if r.sse.trackDone {
@@ -556,7 +556,7 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 	return r.rawJSONChunks(p)
 }
 
-func (r *streamChunkRewriter) writeRawJSONArray(p []byte, opening bool) ([][]byte, error) {
+func (r *streamChunkRewriter) writeRawJSONArray(p []byte, opening, owned bool) ([][]byte, error) {
 	var out [][]byte
 	cursor := 0
 	if opening {
@@ -593,7 +593,11 @@ func (r *streamChunkRewriter) writeRawJSONArray(p []byte, opening bool) ([][]byt
 			complete = json.Valid(p[start:end])
 		}
 		if !complete {
-			r.pending = bytes.Clone(p[cursor:])
+			if owned {
+				r.pending = p[cursor:]
+			} else {
+				r.pending = bytes.Clone(p[cursor:])
+			}
 			return out, nil
 		}
 		if !json.Valid(p[start:end]) || next < len(p) && p[next] != ',' && p[next] != ']' {
@@ -1823,6 +1827,12 @@ type lifecycleYAMLConfig struct {
 func yamlStringConfigField(node yaml.Node, name string) (string, error) {
 	if node.Kind == 0 {
 		return "", nil
+	}
+	for node.Kind == yaml.AliasNode {
+		if node.Alias == nil {
+			return "", fmt.Errorf("%s must be a string", name)
+		}
+		node = *node.Alias
 	}
 	if node.Kind != yaml.ScalarNode || node.Tag != "!!str" {
 		return "", fmt.Errorf("%s must be a string", name)

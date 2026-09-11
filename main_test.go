@@ -35,10 +35,20 @@ func headersWithStaleBodyFields() http.Header {
 		"Content-Md5":       {"stale"},
 		"Etag":              {"etag"},
 		"If-Match":          {"if-match"},
+		"Accept-Ranges":     {"bytes"},
 		"Content-Range":     {"bytes 0-1/2"},
 		"Transfer-Encoding": {"chunked"},
 		"Content-Type":      {"application/json"},
 		"X-Keep":            {"keep"},
+	}
+}
+
+func requireNoHeader(t *testing.T, headers http.Header, name string) {
+	t.Helper()
+	for key := range headers {
+		if strings.EqualFold(key, name) {
+			t.Fatalf("headers=%#v, want no %s", headers, name)
+		}
 	}
 }
 
@@ -170,6 +180,44 @@ func TestDecodeLifecycleConfigUnquotesYAMLEmptyRuleStrings(t *testing.T) {
 	}
 	if cfg.ClaudeMessagesRules != "literal\\*=>star" {
 		t.Fatalf("claude rules = %q", cfg.ClaudeMessagesRules)
+	}
+}
+
+func TestDecodeLifecycleConfigResolvesAliasedRuleString(t *testing.T) {
+	rawYAML := []byte("global_rules: &rules client=>upstream\nclaude_messages_rules: *rules\n")
+	rawReq, err := json.Marshal(map[string]string{"config_yaml": base64.StdEncoding.EncodeToString(rawYAML)})
+	if err != nil {
+		t.Fatalf("marshal lifecycle: %v", err)
+	}
+	cfgRaw, _, err := decodeLifecycleConfig(rawReq)
+	if err != nil {
+		t.Fatalf("decodeLifecycleConfig error = %v", err)
+	}
+	cfg, err := decodeConfig(cfgRaw)
+	if err != nil {
+		t.Fatalf("decodeConfig error = %v", err)
+	}
+	if cfg.ClaudeMessagesRules != "client=>upstream" {
+		t.Fatalf("claude rules = %q, want resolved anchor string", cfg.ClaudeMessagesRules)
+	}
+}
+
+func TestDecodeLifecycleConfigRejectsAliasedNonStringRule(t *testing.T) {
+	for name, rawYAML := range map[string][]byte{
+		"null":     []byte("rules_stack_mode: &value null\nglobal_rules: *value\n"),
+		"map":      []byte("rules_stack_mode: &value {key: value}\nglobal_rules: *value\n"),
+		"sequence": []byte("rules_stack_mode: &value [value]\nglobal_rules: *value\n"),
+		"integer":  []byte("rules_stack_mode: &value 1\nglobal_rules: *value\n"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			rawReq, err := json.Marshal(map[string]string{"config_yaml": base64.StdEncoding.EncodeToString(rawYAML)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := decodeLifecycleConfig(rawReq); err == nil || !strings.Contains(err.Error(), "global_rules must be a string") {
+				t.Fatalf("decodeLifecycleConfig error=%v", err)
+			}
+		})
 	}
 }
 
@@ -1746,6 +1794,7 @@ func TestHandleModelRouteLeavesInteractionsAgentsNative(t *testing.T) {
 		handled bool
 	}{
 		{name: "agent", body: `{"agent":"client"}`, handled: false},
+		{name: "whitespace agent", body: `{"agent":" ","model":"client"}`, handled: false},
 		{name: "empty agent with model", body: `{"agent":"","model":"client"}`, handled: true},
 		{name: "model", body: `{"model":"client"}`, handled: true},
 	} {
@@ -2729,15 +2778,34 @@ func TestSSERewriterChangedMultiDataArrayRemainsValidSSE(t *testing.T) {
 		t.Fatal(err)
 	}
 	output := bytes.Join(chunks, nil)
+	var events [][]byte
+	for remaining := output; len(remaining) > 0; {
+		eventLen, delimiterLen, _ := findSSEEventDelimiter(remaining, 0, true)
+		if delimiterLen == 0 {
+			t.Fatalf("incomplete SSE output=%q", output)
+		}
+		events = append(events, remaining[:eventLen])
+		remaining = remaining[eventLen+delimiterLen:]
+	}
+	if len(events) != 1 {
+		t.Fatalf("events=%q, want exactly one SSE event", events)
+	}
+
 	var data [][]byte
-	for _, line := range bytes.Split(output, []byte{'\n'}) {
+	for event := events[0]; len(event) > 0; {
+		line, _, remaining := splitSSELine(event)
+		event = remaining
 		if bytes.HasPrefix(line, []byte("data:")) {
 			data = append(data, bytes.Clone(sseFieldValue(line)))
 		}
 	}
 	joined := bytes.Join(data, []byte{'\n'})
-	if !json.Valid(joined) || bytes.Contains(joined, []byte("upstream")) || !bytes.Contains(joined, []byte("client")) {
-		t.Fatalf("output=%q joined-data=%q", output, joined)
+	var restored []map[string]string
+	if err := json.Unmarshal(joined, &restored); err != nil {
+		t.Fatalf("decode joined event data %q: %v", joined, err)
+	}
+	if len(restored) != 1 || restored[0]["model"] != "client" {
+		t.Fatalf("joined event data=%q, restored=%#v", joined, restored)
 	}
 }
 
@@ -2954,7 +3022,7 @@ func TestHandleMethodExecutorBodyIsDecodedOnce(t *testing.T) {
 		}
 		hostResponse, err := json.Marshal(pluginapi.HostModelExecutionResponse{
 			StatusCode: http.StatusOK,
-			Body: []byte(`{"model":"upstream","modelVersion":"upstream","opaque":"{\"model\":\"must-stay-upstream-text\"}","nested":{"model":"must-stay-upstream-nested"},"tools":[{"arguments":"{\"model\":\"must-stay-upstream-tool-text\"}"}],"response":{"model":"upstream","modelVersion":"upstream","nested":{"model":"must-stay-upstream-nested"}},"message":{"model":"upstream"},"interaction":{"model":"upstream"}}`),
+			Body:       []byte(`{"model":"upstream","modelVersion":"upstream","opaque":"{\"model\":\"must-stay-upstream-text\"}","nested":{"model":"must-stay-upstream-nested"},"tools":[{"arguments":"{\"model\":\"must-stay-upstream-tool-text\"}"}],"response":{"model":"upstream","modelVersion":"upstream","nested":{"model":"must-stay-upstream-nested"}},"message":{"model":"upstream"},"interaction":{"model":"upstream"}}`),
 		})
 		if err != nil {
 			return nil, err
@@ -2992,8 +3060,11 @@ func TestHandleMethodExecutorBodyIsDecodedOnce(t *testing.T) {
 func TestHandleExecutorExecuteStreamCrossProtocol(t *testing.T) {
 	t.Cleanup(func() { setLoadedConfigForTest(defaultConfig()) })
 	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
-	assertForwarded := func(t *testing.T, forwarded hostModelExecutePayload) {
+	assertForwarded := func(t *testing.T, forwarded hostModelExecutePayload, wantStream bool) {
 		t.Helper()
+		if forwarded.Stream != wantStream {
+			t.Fatalf("Stream=%v, want %v", forwarded.Stream, wantStream)
+		}
 		if forwarded.EntryProtocol != "claude" {
 			t.Fatalf("EntryProtocol=%q, want claude", forwarded.EntryProtocol)
 		}
@@ -3057,7 +3128,7 @@ func TestHandleExecutorExecuteStreamCrossProtocol(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("stream did not close")
 		}
-		assertForwarded(t, forwarded)
+		assertForwarded(t, forwarded, true)
 	})
 	t.Run("nonstream", func(t *testing.T) {
 		var forwarded hostModelExecutePayload
@@ -3081,7 +3152,7 @@ func TestHandleExecutorExecuteStreamCrossProtocol(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		assertForwarded(t, forwarded)
+		assertForwarded(t, forwarded, false)
 	})
 }
 
@@ -3166,9 +3237,7 @@ func TestHandleExecutorExecuteCanonicalizesRequestAndResponseHeaders(t *testing.
 					t.Fatalf("method=%q, want %q", method, pluginabi.MethodHostModelExecute)
 				}
 				hostReq := payload.(hostModelExecutePayload)
-				if len(hostReq.Headers["Content-Length"]) != 0 || len(hostReq.Headers["content-length"]) != 0 {
-					t.Fatalf("forwarded headers=%#v, want no Content-Length", hostReq.Headers)
-				}
+				requireNoHeader(t, hostReq.Headers, "Content-Length")
 				return json.Marshal(pluginapi.HostModelExecutionResponse{
 					StatusCode: http.StatusOK,
 					Headers:    http.Header{"content-length": {"999"}, "x-request-id": {"request-1"}},
@@ -3182,7 +3251,9 @@ func TestHandleExecutorExecuteCanonicalizesRequestAndResponseHeaders(t *testing.
 			if err := json.Unmarshal(respRaw, &response); err != nil {
 				t.Fatalf("decode executor response: %v", err)
 			}
-			if got := response.Headers.Get("Content-Length"); got != tt.wantContentLength {
+			if tt.wantContentLength == "" {
+				requireNoHeader(t, response.Headers, "Content-Length")
+			} else if got := response.Headers.Get("Content-Length"); got != tt.wantContentLength {
 				t.Fatalf("response Content-Length=%q, want %q", got, tt.wantContentLength)
 			}
 			if got := response.Headers.Get("X-Request-Id"); got != "request-1" {
@@ -3220,7 +3291,9 @@ func TestHandleExecutorExecuteRequestContentLength(t *testing.T) {
 				if !ok {
 					t.Fatalf("payload type=%T, want hostModelExecutePayload", payload)
 				}
-				if got := hostReq.Headers.Get("Content-Length"); got != tt.wantContentLength {
+				if tt.wantContentLength == "" {
+					requireNoHeader(t, hostReq.Headers, "Content-Length")
+				} else if got := hostReq.Headers.Get("Content-Length"); got != tt.wantContentLength {
 					t.Fatalf("forwarded Content-Length=%q, want %q", got, tt.wantContentLength)
 				}
 				return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: http.StatusOK, Body: []byte(`{"id":"response"}`)})
@@ -3268,7 +3341,9 @@ func TestHandleExecutorExecuteResponseContentLength(t *testing.T) {
 			if err := json.Unmarshal(respRaw, &response); err != nil {
 				t.Fatalf("decode executor response: %v", err)
 			}
-			if got := response.Headers.Get("Content-Length"); got != tt.wantContentLength {
+			if tt.wantContentLength == "" {
+				requireNoHeader(t, response.Headers, "Content-Length")
+			} else if got := response.Headers.Get("Content-Length"); got != tt.wantContentLength {
 				t.Fatalf("response Content-Length=%q, want %q", got, tt.wantContentLength)
 			}
 			if tt.name == "unchanged" {
@@ -3277,7 +3352,7 @@ func TestHandleExecutorExecuteResponseContentLength(t *testing.T) {
 						t.Fatalf("unchanged response %s=%q, want retained stale value", name, got)
 					}
 				}
-				if response.Headers.Get("ETag") != "etag" || response.Headers.Get("Content-Range") != "bytes 0-1/2" {
+				if response.Headers.Get("ETag") != "etag" || response.Headers.Get("Accept-Ranges") != "bytes" || response.Headers.Get("Content-Range") != "bytes 0-1/2" {
 					t.Fatalf("unchanged response headers=%#v, want response validators retained", response.Headers)
 				}
 			}
@@ -3308,11 +3383,9 @@ func TestHandleExecutorExecuteChangedRequestBodyHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range append([]string{"Content-Length"}, staleBodyHeaders...) {
-		if got := forwarded.Get(name); got != "" {
-			t.Fatalf("request %s=%q, want removed", name, got)
-		}
+		requireNoHeader(t, forwarded, name)
 	}
-	if forwarded.Get("ETag") != "etag" || forwarded.Get("If-Match") != "if-match" || forwarded.Get("X-Keep") != "keep" {
+	if forwarded.Get("ETag") != "etag" || forwarded.Get("If-Match") != "if-match" || forwarded.Get("Accept-Ranges") != "bytes" || forwarded.Get("X-Keep") != "keep" {
 		t.Fatalf("request headers=%#v, want validators and X-Keep retained", forwarded)
 	}
 }
@@ -3337,11 +3410,9 @@ func TestPrepareExecutorStreamChangedRequestBodyHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range append([]string{"Content-Length"}, staleBodyHeaders...) {
-		if got := forwarded.Get(name); got != "" {
-			t.Fatalf("request %s=%q, want removed", name, got)
-		}
+		requireNoHeader(t, forwarded, name)
 	}
-	if forwarded.Get("ETag") != "etag" || forwarded.Get("If-Match") != "if-match" || forwarded.Get("X-Keep") != "keep" {
+	if forwarded.Get("ETag") != "etag" || forwarded.Get("If-Match") != "if-match" || forwarded.Get("Accept-Ranges") != "bytes" || forwarded.Get("X-Keep") != "keep" {
 		t.Fatalf("request headers=%#v, want validators and X-Keep retained", forwarded)
 	}
 }
@@ -3375,11 +3446,9 @@ func TestHandleExecutorExecuteChangedResponseBodyHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range append(append([]string{"Content-Length"}, staleBodyHeaders...), "ETag", "Content-Range") {
-		if got := response.Headers.Get(name); got != "" {
-			t.Fatalf("response %s=%q, want removed", name, got)
-		}
+		requireNoHeader(t, response.Headers, name)
 	}
-	if response.Headers.Get("X-Keep") != "keep" {
+	if response.Headers.Get("Accept-Ranges") != "bytes" || response.Headers.Get("X-Keep") != "keep" {
 		t.Fatalf("response headers=%#v, want X-Keep retained", response.Headers)
 	}
 }
@@ -3405,11 +3474,9 @@ func TestPrepareExecutorStreamChangedResponseBodyHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range append(append([]string{"Content-Length"}, staleBodyHeaders...), "ETag", "Content-Range", "Transfer-Encoding") {
-		if got := headers.Get(name); got != "" {
-			t.Fatalf("response %s=%q, want removed", name, got)
-		}
+		requireNoHeader(t, headers, name)
 	}
-	if headers.Get("Content-Type") != "application/json" || headers.Get("X-Keep") != "keep" {
+	if headers.Get("Content-Type") != "application/json" || headers.Get("Accept-Ranges") != "bytes" || headers.Get("X-Keep") != "keep" {
 		t.Fatalf("response headers=%#v, want Content-Type and X-Keep retained", headers)
 	}
 }
@@ -4105,7 +4172,9 @@ func TestHandleExecutorExecuteStreamRequestContentLength(t *testing.T) {
 			if err != nil {
 				t.Fatalf("handleExecutorExecuteStream error = %v", err)
 			}
-			if got := forwarded.Headers.Get("Content-Length"); got != tt.wantContentLength {
+			if tt.wantContentLength == "" {
+				requireNoHeader(t, forwarded.Headers, "Content-Length")
+			} else if got := forwarded.Headers.Get("Content-Length"); got != tt.wantContentLength {
 				t.Fatalf("forwarded Content-Length=%q, want %q", got, tt.wantContentLength)
 			}
 		})
@@ -4400,6 +4469,9 @@ func TestStreamChunkRewriterLeadingWhitespacePartitionInvariant(t *testing.T) {
 		return bytes.Join(append(chunks, flushed...), nil)
 	}
 	whole := rewrite(input)
+	if !bytes.Equal(whole, input) {
+		t.Fatalf("whole output=%q, want literal input %q", whole, input)
+	}
 	for split := 0; split <= len(input); split++ {
 		if got := rewrite(input[:split], input[split:]); !bytes.Equal(got, whole) {
 			t.Fatalf("split %d output=%q, want %q", split, got, whole)
@@ -5059,6 +5131,38 @@ func TestStreamChunkRewriterRawJSONArrayBuffersOnlyCurrentElement(t *testing.T) 
 	}
 	if got, want := string(r.pending), `{"unfinished":"`; got != want {
 		t.Fatalf("pending=%q, want %q", got, want)
+	}
+}
+
+func TestStreamChunkRewriterRawJSONArrayRetainsOwnedPendingCapacity(t *testing.T) {
+	r := newStreamChunkRewriter("client")
+	first := []byte(`[{"x":"` + strings.Repeat("a", 10))
+	second := []byte(strings.Repeat("b", 8))
+
+	chunks, err := r.Write(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	more, err := r.Write(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunks = append(chunks, more...)
+	if cap(r.pending) <= len(r.pending) {
+		t.Fatalf("pending capacity=%d, length=%d, want retained spare capacity after reallocation", cap(r.pending), len(r.pending))
+	}
+
+	first[2] = 'z'
+	second[0] = 'z'
+	for _, part := range [][]byte{[]byte(`"}`), []byte(`]`)} {
+		more, err = r.Write(part)
+		if err != nil {
+			t.Fatal(err)
+		}
+		chunks = append(chunks, more...)
+	}
+	if got, want := string(bytes.Join(chunks, nil)), `[{"x":"aaaaaaaaaabbbbbbbb"}]`; got != want {
+		t.Fatalf("output=%q, want %q", got, want)
 	}
 }
 
