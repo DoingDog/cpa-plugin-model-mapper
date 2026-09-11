@@ -2954,7 +2954,7 @@ func TestHandleMethodExecutorBodyIsDecodedOnce(t *testing.T) {
 		}
 		hostResponse, err := json.Marshal(pluginapi.HostModelExecutionResponse{
 			StatusCode: http.StatusOK,
-			Body: []byte(`{"model":"upstream","modelVersion":"upstream","opaque":"{\"model\":\"must-stay-upstream-text\"}","nested":{"model":"must-stay-upstream-nested"},"tools":[{"arguments":"{\"model\":\"must-stay-upstream-tool-text\"}"}],"response":{"model":"upstream","modelVersion":"upstream","nested":{"model":"must-stay-upstream-nested"}}}`),
+			Body: []byte(`{"model":"upstream","modelVersion":"upstream","opaque":"{\"model\":\"must-stay-upstream-text\"}","nested":{"model":"must-stay-upstream-nested"},"tools":[{"arguments":"{\"model\":\"must-stay-upstream-tool-text\"}"}],"response":{"model":"upstream","modelVersion":"upstream","nested":{"model":"must-stay-upstream-nested"}},"message":{"model":"upstream"},"interaction":{"model":"upstream"}}`),
 		})
 		if err != nil {
 			return nil, err
@@ -2986,7 +2986,7 @@ func TestHandleMethodExecutorBodyIsDecodedOnce(t *testing.T) {
 	if err := json.Unmarshal(envelope.Result, &response); err != nil {
 		t.Fatal(err)
 	}
-	requireMatchingTopLevelRawJSON(t, response.Payload, []byte(`{"model":"client","modelVersion":"client","opaque":"{\"model\":\"must-stay-upstream-text\"}","nested":{"model":"must-stay-upstream-nested"},"tools":[{"arguments":"{\"model\":\"must-stay-upstream-tool-text\"}"}],"response":{"model":"client","modelVersion":"client","nested":{"model":"must-stay-upstream-nested"}}}`))
+	requireMatchingTopLevelRawJSON(t, response.Payload, []byte(`{"model":"client","modelVersion":"client","opaque":"{\"model\":\"must-stay-upstream-text\"}","nested":{"model":"must-stay-upstream-nested"},"tools":[{"arguments":"{\"model\":\"must-stay-upstream-tool-text\"}"}],"response":{"model":"client","modelVersion":"client","nested":{"model":"must-stay-upstream-nested"}},"message":{"model":"client"},"interaction":{"model":"client"}}`))
 }
 
 func TestHandleExecutorExecuteStreamCrossProtocol(t *testing.T) {
