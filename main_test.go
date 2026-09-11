@@ -84,6 +84,48 @@ func TestPluginRegisterKeepsSchemaOneForNewerHost(t *testing.T) {
 	}
 }
 
+func TestRuleConfigFieldsRequireStrings(t *testing.T) {
+	fields := []string{"global_rules", "claude_messages_rules", "codex_responses_rules", "openai_completions_rules"}
+	for _, field := range fields {
+		t.Run(field+"/json-null", func(t *testing.T) {
+			if _, err := decodeConfig(json.RawMessage(`{"` + field + `":null}`)); err == nil || !strings.Contains(err.Error(), field+" must be a string") {
+				t.Fatalf("decodeConfig error=%v", err)
+			}
+		})
+		t.Run(field+"/yaml-null", func(t *testing.T) {
+			rawYAML := []byte(field + ": null\n")
+			raw, err := json.Marshal(map[string]string{"config_yaml": base64.StdEncoding.EncodeToString(rawYAML)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := decodeLifecycleConfig(raw); err == nil || !strings.Contains(err.Error(), field+" must be a string") {
+				t.Fatalf("decodeLifecycleConfig error=%v", err)
+			}
+		})
+	}
+
+	if _, err := decodeConfig(json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("omitted direct fields: %v", err)
+	}
+	if _, err := decodeConfig(json.RawMessage(`{"global_rules":"","claude_messages_rules":"","codex_responses_rules":"","openai_completions_rules":""}`)); err != nil {
+		t.Fatalf("empty direct fields: %v", err)
+	}
+	for name, source := range map[string]string{
+		"omitted": "rules_stack_mode: off\n",
+		"empty":   "global_rules: ''\nclaude_messages_rules: ''\ncodex_responses_rules: ''\nopenai_completions_rules: ''\n",
+	} {
+		t.Run(name+"/yaml-valid", func(t *testing.T) {
+			raw, err := json.Marshal(map[string]string{"config_yaml": base64.StdEncoding.EncodeToString([]byte(source))})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := decodeLifecycleConfig(raw); err != nil {
+				t.Fatalf("decodeLifecycleConfig error=%v", err)
+			}
+		})
+	}
+}
+
 func TestDecodeLifecycleConfigUnquotesYAMLEmptyRuleStrings(t *testing.T) {
 	rawYAML := []byte("enabled: true\nglobal_rules: \"\"\nclaude_messages_rules: 'literal\\*=>star'\ncodex_responses_rules: \"\"\nopenai_completions_rules: \"\"\n")
 	rawReq, err := json.Marshal(map[string]string{"config_yaml": base64.StdEncoding.EncodeToString(rawYAML)})
@@ -181,6 +223,27 @@ func TestApplyLifecycleConfigRejectsNonStringConfigYAMLAtomically(t *testing.T) 
 				t.Fatalf("decision=%#v, want old=>target", decision)
 			}
 		})
+	}
+}
+
+func TestInvalidLifecycleRuleTypeKeepsActiveConfig(t *testing.T) {
+	t.Cleanup(func() { setLoadedConfigForTest(defaultConfig()) })
+	setLoadedConfigForTest(Config{GlobalRules: "old=>target"})
+	raw, err := json.Marshal(map[string]string{
+		"config_yaml": base64.StdEncoding.EncodeToString([]byte("global_rules: null\n")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handlePluginReconfigure(raw); err == nil {
+		t.Fatal("handlePluginReconfigure error=nil")
+	}
+	decision, err := routeModel(loadedConfig(), "openai", "old", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decision.Handled || decision.UpstreamModel != "target" {
+		t.Fatalf("decision=%#v, want old config route to target", decision)
 	}
 }
 

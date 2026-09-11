@@ -902,10 +902,18 @@ func decodeConfig(raw json.RawMessage) (Config, error) {
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		return Config{}, err
 	}
-	if mode, ok := fields["rules_stack_mode"]; ok {
-		mode = bytes.TrimSpace(mode)
-		if len(mode) == 0 || mode[0] != '"' {
-			return Config{}, fmt.Errorf("rules_stack_mode must be a string")
+	for _, name := range []string{
+		"global_rules",
+		"claude_messages_rules",
+		"codex_responses_rules",
+		"openai_completions_rules",
+		"rules_stack_mode",
+	} {
+		if value, ok := fields[name]; ok {
+			value = bytes.TrimSpace(value)
+			if len(value) == 0 || value[0] != '"' {
+				return Config{}, fmt.Errorf("%s must be a string", name)
+			}
 		}
 	}
 	if err := json.Unmarshal(raw, &cfg); err != nil {
@@ -1679,11 +1687,21 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 }
 
 type lifecycleYAMLConfig struct {
-	GlobalRules            string    `yaml:"global_rules"`
-	ClaudeMessagesRules    string    `yaml:"claude_messages_rules"`
-	CodexResponsesRules    string    `yaml:"codex_responses_rules"`
-	OpenAICompletionsRules string    `yaml:"openai_completions_rules"`
+	GlobalRules            yaml.Node `yaml:"global_rules"`
+	ClaudeMessagesRules    yaml.Node `yaml:"claude_messages_rules"`
+	CodexResponsesRules    yaml.Node `yaml:"codex_responses_rules"`
+	OpenAICompletionsRules yaml.Node `yaml:"openai_completions_rules"`
 	RulesStackMode         yaml.Node `yaml:"rules_stack_mode"`
+}
+
+func yamlStringConfigField(node yaml.Node, name string) (string, error) {
+	if node.Kind == 0 {
+		return "", nil
+	}
+	if node.Kind != yaml.ScalarNode || node.Tag != "!!str" {
+		return "", fmt.Errorf("%s must be a string", name)
+	}
+	return node.Value, nil
 }
 
 func decodeLifecycleConfig(raw []byte) (json.RawMessage, bool, error) {
@@ -1723,18 +1741,31 @@ func decodeLifecycleConfig(raw []byte) (json.RawMessage, bool, error) {
 			return nil, true, fmt.Errorf("trailing YAML: %w", err)
 		}
 	}
-	rulesStackMode := ""
-	if node := yamlConfig.RulesStackMode; node.Kind != 0 {
-		if node.Kind != yaml.ScalarNode || node.Tag != "!!str" {
-			return nil, true, fmt.Errorf("rules_stack_mode must be a string")
-		}
-		rulesStackMode = node.Value
+	globalRules, err := yamlStringConfigField(yamlConfig.GlobalRules, "global_rules")
+	if err != nil {
+		return nil, true, err
+	}
+	claudeMessagesRules, err := yamlStringConfigField(yamlConfig.ClaudeMessagesRules, "claude_messages_rules")
+	if err != nil {
+		return nil, true, err
+	}
+	codexResponsesRules, err := yamlStringConfigField(yamlConfig.CodexResponsesRules, "codex_responses_rules")
+	if err != nil {
+		return nil, true, err
+	}
+	openAICompletionsRules, err := yamlStringConfigField(yamlConfig.OpenAICompletionsRules, "openai_completions_rules")
+	if err != nil {
+		return nil, true, err
+	}
+	rulesStackMode, err := yamlStringConfigField(yamlConfig.RulesStackMode, "rules_stack_mode")
+	if err != nil {
+		return nil, true, err
 	}
 	cfgRaw, err := json.Marshal(Config{
-		GlobalRules:            yamlConfig.GlobalRules,
-		ClaudeMessagesRules:    yamlConfig.ClaudeMessagesRules,
-		CodexResponsesRules:    yamlConfig.CodexResponsesRules,
-		OpenAICompletionsRules: yamlConfig.OpenAICompletionsRules,
+		GlobalRules:            globalRules,
+		ClaudeMessagesRules:    claudeMessagesRules,
+		CodexResponsesRules:    codexResponsesRules,
+		OpenAICompletionsRules: openAICompletionsRules,
 		RulesStackMode:         rulesStackMode,
 	})
 	if err != nil {
