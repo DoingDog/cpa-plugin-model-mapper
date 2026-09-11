@@ -190,6 +190,24 @@ func TestPackageLibraryWritesRootLibraryEntryAndChecksum(t *testing.T) {
 	}
 }
 
+func TestWriteChecksumFileAtomicallySetsMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix file modes are not available on Windows")
+	}
+
+	path := filepath.Join(t.TempDir(), "checksums.txt")
+	if err := writeChecksumFileAtomically(path, []byte("checksum\n")); err != nil {
+		t.Fatalf("writeChecksumFileAtomically: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat checksum: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o644 {
+		t.Fatalf("checksum mode = %04o, want 0644", got)
+	}
+}
+
 func TestSinglePlatformChecksumFailureRemovesStaleChecksum(t *testing.T) {
 	dir := t.TempDir()
 	library := filepath.Join(dir, "model-mapper.dll")

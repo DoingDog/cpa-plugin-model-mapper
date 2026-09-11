@@ -439,6 +439,9 @@ func writeChecksumFileAtomically(path string, data []byte) error {
 	if err := writeChecksumFile(temporaryPath, data, 0o644); err != nil {
 		return err
 	}
+	if err := os.Chmod(temporaryPath, 0o644); err != nil {
+		return err
+	}
 	return os.Rename(temporaryPath, path)
 }
 
