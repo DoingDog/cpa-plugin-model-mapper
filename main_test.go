@@ -5189,14 +5189,21 @@ func TestRawJSONIncompleteContainerFlushesUnchangedOwnedChunk(t *testing.T) {
 			original := bytes.Clone(tt.input)
 			input := bytes.Clone(original)
 			r := newStreamChunkRewriter("client")
-			chunks, err := r.Write(input)
-			if err != nil || len(chunks) != 0 {
-				t.Fatalf("Write = (%q, %v), want no output", chunks, err)
+			first, err := r.Write(input)
+			if err != nil {
+				t.Fatalf("Write error = %v", err)
+			}
+			if tt.name == "array" {
+				if len(first) != 1 || !bytes.Equal(first[0], []byte("[")) {
+					t.Fatalf("array Write = %q, want emitted opening bracket", first)
+				}
+			} else if len(first) != 0 {
+				t.Fatalf("object Write = %q, want no output", first)
 			}
 			input[0] ^= 1
-			chunks, err = r.Flush()
-			if err != nil || len(chunks) != 1 || !bytes.Equal(chunks[0], original) {
-				t.Fatalf("Flush = (%q, %v), want one unchanged owned chunk", chunks, err)
+			chunks, err := r.Flush()
+			if err != nil || !bytes.Equal(bytes.Join(append(first, chunks...), nil), original) {
+				t.Fatalf("Flush = (%q, %v), want unchanged owned bytes", chunks, err)
 			}
 
 			r = newStreamChunkRewriter("client")
