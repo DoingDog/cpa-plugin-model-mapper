@@ -2916,6 +2916,170 @@ type hostModelExecutionRequest struct {
 	HostCallbackID string `json:"host_callback_id,omitempty"`
 }
 
+func TestHandleMethodExecutorBodyIsDecodedOnce(t *testing.T) {
+	t.Cleanup(func() {
+		setHostCallbackForTest(nil)
+		setLoadedConfigForTest(defaultConfig())
+	})
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	originalRequest := []byte(`{"model":"client","opaque":"{\"model\":\"must-stay-client-text\"}","nested":{"model":"must-stay-client-nested"},"tools":[{"arguments":"{\"model\":\"must-stay-tool-text\"}"}]}`)
+	var captured hostModelExecutionRequest
+	setHostCallbackForTest(func(method string, request []byte) ([]byte, error) {
+		if method != pluginabi.MethodHostModelExecute {
+			return nil, fmt.Errorf("method=%q", method)
+		}
+		var wire struct {
+			Body string `json:"body"`
+		}
+		if err := json.Unmarshal(request, &wire); err != nil {
+			return nil, err
+		}
+		decoded, err := base64.StdEncoding.DecodeString(wire.Body)
+		if err != nil {
+			return nil, err
+		}
+		if !json.Valid(decoded) {
+			return nil, fmt.Errorf("decoded body is not provider JSON: %q", decoded)
+		}
+		if err := json.Unmarshal(request, &captured); err != nil {
+			return nil, err
+		}
+		if !bytes.Equal(captured.Body, decoded) {
+			return nil, fmt.Errorf("wire body=%q, decoded body=%q", captured.Body, decoded)
+		}
+		hostResponse, err := json.Marshal(pluginapi.HostModelExecutionResponse{
+			StatusCode: http.StatusOK,
+			Body: []byte(`{"model":"upstream","modelVersion":"upstream","opaque":"{\"model\":\"must-stay-upstream-text\"}","nested":{"model":"must-stay-upstream-nested"},"tools":[{"arguments":"{\"model\":\"must-stay-upstream-tool-text\"}"}],"response":{"model":"upstream","modelVersion":"upstream","nested":{"model":"must-stay-upstream-nested"}}}`),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(pluginabi.Envelope{OK: true, Result: json.RawMessage(hostResponse)})
+	})
+	raw, err := json.Marshal(rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+		Model:           "client",
+		Format:          "openai",
+		SourceFormat:    "openai",
+		OriginalRequest: originalRequest,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseRaw, err := handleMethod(pluginabi.MethodExecutorExecute, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope pluginabi.Envelope
+	if err := json.Unmarshal(responseRaw, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if !envelope.OK {
+		t.Fatalf("executor envelope=%s", responseRaw)
+	}
+	requireMatchingTopLevelRawJSON(t, captured.Body, []byte(`{"model":"upstream","opaque":"{\"model\":\"must-stay-client-text\"}","nested":{"model":"must-stay-client-nested"},"tools":[{"arguments":"{\"model\":\"must-stay-tool-text\"}"}]}`))
+	var response pluginapi.ExecutorResponse
+	if err := json.Unmarshal(envelope.Result, &response); err != nil {
+		t.Fatal(err)
+	}
+	requireMatchingTopLevelRawJSON(t, response.Payload, []byte(`{"model":"client","modelVersion":"client","opaque":"{\"model\":\"must-stay-upstream-text\"}","nested":{"model":"must-stay-upstream-nested"},"tools":[{"arguments":"{\"model\":\"must-stay-upstream-tool-text\"}"}],"response":{"model":"client","modelVersion":"client","nested":{"model":"must-stay-upstream-nested"}}}`))
+}
+
+func TestHandleExecutorExecuteStreamCrossProtocol(t *testing.T) {
+	t.Cleanup(func() { setLoadedConfigForTest(defaultConfig()) })
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	assertForwarded := func(t *testing.T, forwarded hostModelExecutePayload) {
+		t.Helper()
+		if forwarded.EntryProtocol != "claude" {
+			t.Fatalf("EntryProtocol=%q, want claude", forwarded.EntryProtocol)
+		}
+		if forwarded.ExitProtocol != "openai" {
+			t.Fatalf("ExitProtocol=%q, want openai", forwarded.ExitProtocol)
+		}
+		if forwarded.HostCallbackID != "callback-cross-stream" {
+			t.Fatalf("HostCallbackID=%q, want callback-cross-stream", forwarded.HostCallbackID)
+		}
+		if !reflect.DeepEqual(forwarded.Headers.Values("X-Test"), []string{"one", "two"}) {
+			t.Fatalf("Headers=%#v", forwarded.Headers)
+		}
+		if !reflect.DeepEqual(forwarded.Query["q"], []string{"one", "two"}) {
+			t.Fatalf("Query=%#v", forwarded.Query)
+		}
+	}
+	t.Run("stream", func(t *testing.T) {
+		var forwarded hostModelExecutePayload
+		done := make(chan struct{})
+		var closeOnce sync.Once
+		raw, err := json.Marshal(rpcExecutorRequest{
+			ExecutorRequest: pluginapi.ExecutorRequest{
+				Model:           "client",
+				Format:          "openai",
+				SourceFormat:    "claude",
+				Stream:          true,
+				Headers:         http.Header{"X-Test": {"one", "two"}},
+				Query:           url.Values{"q": {"one", "two"}},
+				OriginalRequest: []byte(`{"model":"client"}`),
+			},
+			HostCallbackID: "callback-cross-stream",
+			StreamID:       "plugin-cross-stream",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := handleExecutorExecuteStream(raw, func(method string, payload any) (json.RawMessage, error) {
+			switch method {
+			case pluginabi.MethodHostModelExecuteStream:
+				forwarded = payload.(hostModelExecutePayload)
+				return json.Marshal(pluginapi.HostModelStreamResponse{
+					StatusCode: http.StatusOK,
+					StreamID:   "host-cross-stream",
+					Headers:    http.Header{"Content-Type": {"application/json"}},
+				})
+			case pluginabi.MethodHostModelStreamRead:
+				return json.Marshal(pluginapi.HostModelStreamReadResponse{Done: true})
+			case pluginabi.MethodHostModelStreamClose:
+				return json.Marshal(map[string]any{})
+			case pluginabi.MethodHostStreamClose:
+				closeOnce.Do(func() { close(done) })
+				return json.Marshal(map[string]any{})
+			default:
+				return nil, fmt.Errorf("method=%q", method)
+			}
+		}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("stream did not close")
+		}
+		assertForwarded(t, forwarded)
+	})
+	t.Run("nonstream", func(t *testing.T) {
+		var forwarded hostModelExecutePayload
+		raw, err := json.Marshal(rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "client",
+			Format:          "openai",
+			SourceFormat:    "claude",
+			Headers:         http.Header{"X-Test": {"one", "two"}},
+			Query:           url.Values{"q": {"one", "two"}},
+			OriginalRequest: []byte(`{"model":"client"}`),
+		}, HostCallbackID: "callback-cross-stream"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := handleExecutorExecute(raw, func(method string, payload any) (json.RawMessage, error) {
+			if method != pluginabi.MethodHostModelExecute {
+				return nil, fmt.Errorf("method=%q", method)
+			}
+			forwarded = payload.(hostModelExecutePayload)
+			return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: http.StatusOK, Body: []byte(`{"model":"upstream"}`)})
+		}); err != nil {
+			t.Fatal(err)
+		}
+		assertForwarded(t, forwarded)
+	})
+}
+
 func TestHandleExecutorExecuteForwardsMappedRequestAndRestoresResponse(t *testing.T) {
 	setLoadedConfigForTest(Config{GlobalRules: "deepseek-v4-pro=>gpt-5.4-mini"})
 	req := rpcExecutorRequest{
