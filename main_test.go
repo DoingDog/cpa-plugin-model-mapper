@@ -4180,6 +4180,107 @@ func TestHandleExecutorExecuteStreamRestoresRawJSONNestedResponseModel(t *testin
 	}
 }
 
+func TestStreamChunkRewriterEmitsCompletedRawJSONArrayElements(t *testing.T) {
+	r := newStreamChunkRewriter("client")
+	r.format = "gemini"
+	first, err := r.Write([]byte(`[{"modelVersion":"upstream","id":1},`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstOutput := bytes.Join(first, nil)
+	if len(firstOutput) == 0 || !bytes.Contains(firstOutput, []byte(`"modelVersion":"client"`)) {
+		t.Fatalf("first output=%q", firstOutput)
+	}
+	second, err := r.Write([]byte(`{"modelVersion":"upstream","id":2}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := bytes.Join(append(first, second...), nil)
+	if !json.Valid(all) || bytes.Contains(all, []byte("upstream")) {
+		t.Fatalf("output=%q", all)
+	}
+}
+
+func TestStreamChunkRewriterRawJSONArrayPartitions(t *testing.T) {
+	tests := []struct {
+		name, input, want string
+		incomplete        bool
+	}{
+		{
+			name:  "strings with brackets and commas",
+			input: ` [ {"modelVersion":"upstream","text":"] , } ["}, {"modelVersion":"upstream"} ] `,
+			want:  ` [ {"modelVersion":"client","text":"] , } ["}, {"modelVersion":"client"} ] `,
+		},
+		{
+			name:  "nested array remains unchanged",
+			input: `["scalar",[ {"modelVersion":"must-stay-upstream"} ],{"modelVersion":"upstream"}]`,
+			want:  `["scalar",[ {"modelVersion":"must-stay-upstream"} ],{"modelVersion":"client"}]`,
+		},
+		{
+			name:       "incomplete tail",
+			input:      `[{"modelVersion":"upstream"}, {"unfinished":"value`,
+			want:       `[{"modelVersion":"client"}, {"unfinished":"value`,
+			incomplete: true,
+		},
+	}
+	writeAndFlush := func(t *testing.T, parts ...[]byte) []byte {
+		t.Helper()
+		r := newStreamChunkRewriter("client")
+		r.format = "gemini"
+		var chunks [][]byte
+		for _, part := range parts {
+			written, err := r.Write(part)
+			if err != nil {
+				t.Fatalf("Write(%q): %v", part, err)
+			}
+			chunks = append(chunks, written...)
+		}
+		flushed, err := r.Flush()
+		if err != nil {
+			t.Fatalf("Flush: %v", err)
+		}
+		return bytes.Join(append(chunks, flushed...), nil)
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := []byte(tt.input)
+			if got := string(writeAndFlush(t, input)); got != tt.want {
+				t.Fatalf("whole output=%q, want %q", got, tt.want)
+			}
+			for split := 0; split <= len(input); split++ {
+				if got := string(writeAndFlush(t, input[:split], input[split:])); got != tt.want {
+					t.Fatalf("split %d output=%q, want %q", split, got, tt.want)
+				}
+			}
+			for first := 0; first <= len(input); first++ {
+				for second := first; second <= len(input); second++ {
+					if got := string(writeAndFlush(t, input[:first], input[first:second], input[second:])); got != tt.want {
+						t.Fatalf("splits %d,%d output=%q, want %q", first, second, got, tt.want)
+					}
+				}
+			}
+			if tt.incomplete {
+				r := newStreamChunkRewriter("client")
+				r.format = "gemini"
+				first, err := r.Write(input)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := bytes.Join(first, nil); !bytes.Contains(got, []byte(`"modelVersion":"client"`)) {
+					t.Fatalf("completed element was not emitted: %q", got)
+				}
+				flushed, err := r.Flush()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := string(bytes.Join(append(first, flushed...), nil)); got != tt.want {
+					t.Fatalf("incomplete output=%q, want %q", got, tt.want)
+				}
+			}
+		})
+	}
+}
+
 func TestHandleExecutorExecuteStreamRestoresGeminiJSONStreamArray(t *testing.T) {
 	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
 	input := "[\n{\"modelVersion\":\"upstream\",\"id\":\"one\"}\n,\n{\"modelVersion\":\"upstream\",\"id\":\"two\"}\n]"
@@ -4618,6 +4719,21 @@ func TestStreamChunkRewriterPreservesUnframedRawJSONSeparators(t *testing.T) {
 	}
 }
 
+func TestStreamChunkRewriterRawJSONArrayBuffersOnlyCurrentElement(t *testing.T) {
+	r := newStreamChunkRewriter("client")
+	input := []byte(`[{"modelVersion":"upstream","payload":"` + strings.Repeat("x", 4<<20) + `"},{"unfinished":"`)
+	chunks, err := r.Write(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if emitted := len(bytes.Join(chunks, nil)); emitted < 4<<20 {
+		t.Fatalf("emitted bytes=%d, want completed 4 MiB element", emitted)
+	}
+	if got, want := string(r.pending), `{"unfinished":"`; got != want {
+		t.Fatalf("pending=%q, want %q", got, want)
+	}
+}
+
 func TestStreamChunkRewriterBuffersSplitRawJSON(t *testing.T) {
 	for _, framed := range []bool{false, true} {
 		t.Run(fmt.Sprintf("framed=%v", framed), func(t *testing.T) {
@@ -4656,17 +4772,18 @@ func TestStreamChunkRewriterBuffersSplitRawJSON(t *testing.T) {
 	}
 
 	arrayRewriter := newStreamChunkRewriter("client")
-	chunks, err := arrayRewriter.Write([]byte(`["partial`))
-	if err != nil || len(chunks) != 0 {
-		t.Fatalf("array first Write = (%q, %v), want no output", chunks, err)
+	first, err := arrayRewriter.Write([]byte(`["partial`))
+	if err != nil || len(first) != 1 || string(first[0]) != "[" {
+		t.Fatalf("array first Write = (%q, %v), want emitted opening bracket", first, err)
 	}
-	chunks, err = arrayRewriter.Write([]byte(`"]`))
-	if err != nil || len(chunks) != 1 || !json.Valid(chunks[0]) || string(chunks[0]) != `["partial"]` {
-		t.Fatalf("array second Write = (%q, %v)", chunks, err)
+	second, err := arrayRewriter.Write([]byte(`"]`))
+	array := bytes.Join(append(first, second...), nil)
+	if err != nil || !json.Valid(array) || string(array) != `["partial"]` {
+		t.Fatalf("array second Write = (%q, %v)", second, err)
 	}
 
 	passthrough := newStreamChunkRewriter("client")
-	chunks, err = passthrough.Write([]byte("not-json"))
+	chunks, err := passthrough.Write([]byte("not-json"))
 	if err != nil || len(chunks) != 1 || string(chunks[0]) != "not-json" {
 		t.Fatalf("non-JSON Write = (%q, %v)", chunks, err)
 	}

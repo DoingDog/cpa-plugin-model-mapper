@@ -45,6 +45,7 @@ type streamChunkRewriter struct {
 	framedRawJSON     bool
 	sse               *sseRewriter
 	pending           []byte
+	rawJSONArray      bool
 }
 
 func newSSERewriter(originalModel string) *sseRewriter {
@@ -474,6 +475,13 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 	if len(r.sse.buf) > 0 {
 		return r.sse.Write(p)
 	}
+	if r.rawJSONArray {
+		return r.writeRawJSONArray(p, false)
+	}
+	start := skipTopLevelModelJSONSpace(p, 0)
+	if !r.frameRawJSONAsSSE && start < len(p) && p[start] == '[' {
+		return r.writeRawJSONArray(p, true)
+	}
 	if r.frameRawJSONAsSSE && !couldStartJSONValue(p) && completeSSEEvents(p) && !mightContainResponseModelField(p) {
 		if r.sse.trackDone {
 			r.sse.sawDone = r.sse.sawDone || hasSSEDoneEvent(p)
@@ -546,6 +554,86 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 		return nil, nil
 	}
 	return r.rawJSONChunks(p)
+}
+
+func (r *streamChunkRewriter) writeRawJSONArray(p []byte, opening bool) ([][]byte, error) {
+	var out [][]byte
+	cursor := 0
+	if opening {
+		start := skipTopLevelModelJSONSpace(p, 0)
+		out = append(out, bytes.Clone(p[:start+1]))
+		cursor = start + 1
+		r.rawJSONArray = true
+	}
+	for cursor < len(p) {
+		start := skipTopLevelModelJSONSpace(p, cursor)
+		if start == len(p) {
+			out = append(out, bytes.Clone(p[cursor:start]))
+			return out, nil
+		}
+		if p[start] == ',' {
+			out = append(out, bytes.Clone(p[cursor:start+1]))
+			cursor = start + 1
+			continue
+		}
+		if p[start] == ']' {
+			out = append(out, bytes.Clone(p[cursor:start+1]))
+			r.rawJSONArray = false
+			if start+1 < len(p) {
+				suffix, err := r.Write(p[start+1:])
+				return append(out, suffix...), err
+			}
+			return out, nil
+		}
+
+		end := skipTopLevelModelJSONValue(p, start)
+		next := skipTopLevelModelJSONSpace(p, end)
+		complete := next < len(p)
+		if !complete && (p[start] == '{' || p[start] == '[' || p[start] == '"') {
+			complete = json.Valid(p[start:end])
+		}
+		if !complete {
+			r.pending = bytes.Clone(p[cursor:])
+			return out, nil
+		}
+		if !json.Valid(p[start:end]) || next < len(p) && p[next] != ',' && p[next] != ']' {
+			out = append(out, bytes.Clone(p[cursor:]))
+			r.rawJSONArray = false
+			return out, nil
+		}
+
+		restored := bytes.Clone(p[start:end])
+		if p[start] == '{' {
+			var err error
+			restored, _, err = r.sse.restoreResponseModel(p[start:end])
+			if err != nil {
+				return nil, err
+			}
+		}
+		capacity := start - cursor + len(restored) + next - end
+		if next < len(p) {
+			capacity++
+		}
+		chunk := make([]byte, 0, capacity)
+		chunk = append(chunk, p[cursor:start]...)
+		chunk = append(chunk, restored...)
+		chunk = append(chunk, p[end:next]...)
+		cursor = next
+		if cursor < len(p) {
+			chunk = append(chunk, p[cursor])
+			cursor++
+		}
+		out = append(out, chunk)
+		if next < len(p) && p[next] == ']' {
+			r.rawJSONArray = false
+			if cursor < len(p) {
+				suffix, err := r.Write(p[cursor:])
+				return append(out, suffix...), err
+			}
+			return out, nil
+		}
+	}
+	return out, nil
 }
 
 func (r *streamChunkRewriter) rawJSONChunks(p []byte) ([][]byte, error) {
@@ -691,6 +779,16 @@ func splitJSONValues(p []byte) ([][]byte, int, bool, bool) {
 }
 
 func (r *streamChunkRewriter) Flush() ([][]byte, error) {
+	if r.rawJSONArray {
+		r.rawJSONArray = false
+		pending := bytes.Clone(r.pending)
+		r.pending = nil
+		flushed, err := r.sse.Flush()
+		if len(pending) > 0 {
+			return append([][]byte{pending}, flushed...), err
+		}
+		return flushed, err
+	}
 	if len(r.pending) > 0 {
 		pending := append([]byte(nil), r.pending...)
 		r.pending = nil
