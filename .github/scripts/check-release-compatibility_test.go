@@ -88,7 +88,7 @@ func TestMakeDryRunNormalizesReleaseVersion(t *testing.T) {
 			target: "build-platform",
 			wants: []string{
 				"-X main.pluginVersion=0.5.2",
-				"printf '%s\\n' \"0.5.2\" > \"$out.version\"",
+				"rm -f \"$out.version\"",
 			},
 		},
 		{
@@ -114,7 +114,34 @@ func TestMakeDryRunNormalizesReleaseVersion(t *testing.T) {
 			if strings.Contains(string(output), "pluginVersion=v0.5.2") || strings.Contains(string(output), "model-mapper_v0.5.2_") {
 				t.Fatalf("make -n %s did not normalize version:\n%s", tt.target, output)
 			}
+			if tt.target == "build-platform" && strings.Contains(string(output), "printf '%s\\n' \"0.5.2\" > \"$out.version\"") {
+				t.Fatalf("make -n %s still writes a version sidecar:\n%s", tt.target, output)
+			}
 		})
+	}
+}
+
+func TestMakeSmokeLocalBuildsCurrentHostPlatform(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoRoot := wd
+	if _, err := os.Stat(filepath.Join(repoRoot, "Makefile")); err != nil {
+		repoRoot = filepath.Clean(filepath.Join(wd, "..", ".."))
+	}
+	body, err := os.ReadFile(filepath.Join(repoRoot, "Makefile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, want := range []string{"go env GOOS", "go env GOARCH", "build-platform", `GOOS="$$host_goos"`, `GOARCH="$$host_goarch"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("Makefile missing %q", want)
+		}
+	}
+	if strings.Contains(text, "smoke-local: build-windows-amd64") {
+		t.Fatal("smoke-local still has a fixed Windows amd64 prerequisite")
 	}
 }
 
@@ -157,6 +184,16 @@ func TestPackagePlatformStopsAfterCompatibilityFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	build := exec.Command(makePath,
+		"--no-print-directory", "build-platform",
+		"VERSION=0.5.1", "GOOS=linux", "GOARCH=amd64",
+		"DIST_DIR="+filepath.ToSlash(distDir), "GO=true",
+	)
+	build.Dir = repoRoot
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("fake raw build: %v\n%s", err, output)
+	}
+
 	cmd := exec.Command(makePath,
 		"--no-print-directory", "package-platform",
 		"VERSION=0.5.1", "GOOS=linux", "GOARCH=amd64",
@@ -175,6 +212,66 @@ func TestPackagePlatformStopsAfterCompatibilityFailure(t *testing.T) {
 	archive := filepath.Join(distDir, "model-mapper_0.5.1_linux_amd64.zip")
 	if _, statErr := os.Stat(archive); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("archive exists after compatibility rejection: %v", statErr)
+	}
+	if _, statErr := os.Stat(libraryPath + ".version"); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("version sidecar exists after failed compatibility check: %v", statErr)
+	}
+}
+
+func TestPackagePlatformStopsAfterInspectorFailure(t *testing.T) {
+	makePath, err := exec.LookPath("make")
+	if err != nil {
+		t.Skip("make is not available")
+	}
+
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoRoot := wd
+	if _, err := os.Stat(filepath.Join(repoRoot, "Makefile")); err != nil {
+		repoRoot = filepath.Clean(filepath.Join(wd, "..", ".."))
+	}
+	if _, err := os.Stat(filepath.Join(repoRoot, "Makefile")); err != nil {
+		t.Fatalf("locate repository Makefile: %v", err)
+	}
+
+	tempDir := t.TempDir()
+	distDir := filepath.Join(tempDir, "dist")
+	libraryDir := filepath.Join(distDir, "linux_amd64")
+	if err := os.MkdirAll(libraryDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	libraryPath := filepath.Join(libraryDir, "model-mapper.so")
+	if err := os.WriteFile(libraryPath, []byte("test library"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	readelf := filepath.Join(tempDir, "readelf")
+	if err := os.WriteFile(readelf, []byte("#!/bin/sh\nprintf '%s\\n' 'Name: GLIBC_2.17'\nexit 7\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(readelf, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(makePath,
+		"--no-print-directory", "package-platform",
+		"VERSION=0.5.1", "GOOS=linux", "GOARCH=amd64",
+		"DIST_DIR="+filepath.ToSlash(distDir),
+		"READELF="+filepath.ToSlash(readelf),
+		"MAKE=true",
+	)
+	cmd.Dir = repoRoot
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Errorf("package-platform succeeded after inspector failure:\n%s", output)
+	}
+	archive := filepath.Join(distDir, "model-mapper_0.5.1_linux_amd64.zip")
+	if _, statErr := os.Stat(archive); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("archive exists after inspector failure: %v", statErr)
+	}
+	if _, statErr := os.Stat(libraryPath + ".version"); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("version sidecar exists after inspector failure: %v", statErr)
 	}
 }
 

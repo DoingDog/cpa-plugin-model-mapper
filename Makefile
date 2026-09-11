@@ -31,9 +31,10 @@ build-platform:
 	@case "$(GOOS)" in windows) ext=".dll" ;; darwin) ext=".dylib" ;; *) ext=".so" ;; esac; \
 	out="$(DIST_DIR)/$(GOOS)_$(GOARCH)/$(PLUGIN_NAME)$$ext"; \
 	mkdir -p "$$(dirname "$$out")"; \
+	rm -f "$$out.version"; \
 	if [ -n "$(BUILD_CC)" ]; then export CC="$(BUILD_CC)"; fi; \
 	if [ "$(GOOS)" = "darwin" ]; then export MACOSX_DEPLOYMENT_TARGET="$(MACOSX_DEPLOYMENT_TARGET)"; fi; \
-	CGO_ENABLED=1 GOOS="$(GOOS)" GOARCH="$(GOARCH)" $(GO) build -trimpath -buildmode=c-shared -ldflags='$(LDFLAGS) $(VERSION_LDFLAGS)' -o "$$out" . && printf '%s\n' "$(BUILD_VERSION)" > "$$out.version"
+	CGO_ENABLED=1 GOOS="$(GOOS)" GOARCH="$(GOARCH)" $(GO) build -trimpath -buildmode=c-shared -ldflags='$(LDFLAGS) $(VERSION_LDFLAGS)' -o "$$out" .
 
 build-windows-amd64:
 	$(MAKE) --no-print-directory build-platform GOOS=windows GOARCH=amd64 GO="$(GO)" DIST_DIR="$(DIST_DIR)" PLUGIN_NAME="$(PLUGIN_NAME)"
@@ -55,11 +56,14 @@ package-platform:
 	case "$(GOOS)" in \
 		linux) \
 			if ! command -v "$(READELF)" >/dev/null 2>&1; then echo "readelf is required for Linux release checks"; exit 1; fi; \
-			"$(READELF)" --version-info "$$library" | GOOS= GOARCH= CGO_ENABLED= $(GO) run .github/scripts/check-release-compatibility.go -format glibc -max "$(GLIBC_MAX_VERSION)" ;; \
+			compatibility_output="$$("$(READELF)" --version-info "$$library")"; \
+			printf '%s\n' "$$compatibility_output" | GOOS= GOARCH= CGO_ENABLED= $(GO) run .github/scripts/check-release-compatibility.go -format glibc -max "$(GLIBC_MAX_VERSION)" ;; \
 		darwin) \
 			if ! command -v "$(OTOOL)" >/dev/null 2>&1; then echo "otool is required for macOS release checks"; exit 1; fi; \
-			"$(OTOOL)" -l "$$library" | GOOS= GOARCH= CGO_ENABLED= $(GO) run .github/scripts/check-release-compatibility.go -format macos -max "$(MACOSX_DEPLOYMENT_TARGET)" ;; \
+			compatibility_output="$$("$(OTOOL)" -l "$$library")"; \
+			printf '%s\n' "$$compatibility_output" | GOOS= GOARCH= CGO_ENABLED= $(GO) run .github/scripts/check-release-compatibility.go -format macos -max "$(MACOSX_DEPLOYMENT_TARGET)" ;; \
 	esac; \
+	printf '%s\n' "$(BUILD_VERSION)" > "$$library.version"; \
 	archive="$(DIST_DIR)/$(PLUGIN_NAME)_$(RELEASE_VERSION)_$(GOOS)_$(GOARCH).zip"; \
 	GOOS= GOARCH= CGO_ENABLED= $(GO) run .github/scripts/package-release.go -library "$$library" -archive "$$archive" -checksum "$$archive.sha256"
 
@@ -80,7 +84,10 @@ install-linux-amd64: build-linux-amd64
 	mkdir -p "$(CPA_PLUGINS_DIR)"
 	cp $(LINUX_AMD64_OUT) "$(CPA_PLUGINS_DIR)/$(PLUGIN_NAME).so"
 
-smoke-local: build-windows-amd64
+smoke-local:
+	@host_goos="$$( go env GOOS )"; \
+	host_goarch="$$( go env GOARCH )"; \
+	$(MAKE) --no-print-directory build-platform GOOS="$$host_goos" GOARCH="$$host_goarch" GO="$(GO)" DIST_DIR="$(DIST_DIR)" PLUGIN_NAME="$(PLUGIN_NAME)"
 	$(GO) run .github/scripts/smoke-local.go
 
 clean:
