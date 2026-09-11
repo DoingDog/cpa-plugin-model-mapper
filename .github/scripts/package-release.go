@@ -19,6 +19,8 @@ const pluginName = "model-mapper"
 
 var releaseVersionPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$`)
 
+var writeChecksumFile = os.WriteFile
+
 type artifactSpec struct {
 	osName string
 	arch   string
@@ -56,7 +58,13 @@ func run(args []string) error {
 		if err := validateDistinctPaths(*libraryPath, *archivePath, *checksumPath); err != nil {
 			return err
 		}
+		if err := os.Remove(*checksumPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove old checksum %s: %w", filepath.ToSlash(*checksumPath), err)
+		}
 		if err := packageLibrary(*libraryPath, *archivePath); err != nil {
+			return err
+		}
+		if err := validateDistinctPaths(*archivePath, *checksumPath); err != nil {
 			return err
 		}
 		return writeChecksum(*checksumPath, *archivePath)
@@ -234,6 +242,10 @@ func packageExistingArtifacts(version, distDir, outDir string) error {
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return fmt.Errorf("create output dir %s: %w", outDir, err)
 	}
+	checksumsPath := filepath.Join(outDir, "checksums.txt")
+	if err := os.Remove(checksumsPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove old checksums %s: %w", filepath.ToSlash(checksumsPath), err)
+	}
 
 	zipPaths := make([]string, 0, len(artifacts))
 	for _, artifact := range artifacts {
@@ -245,7 +257,7 @@ func packageExistingArtifacts(version, distDir, outDir string) error {
 		}
 		zipPaths = append(zipPaths, zipPath)
 	}
-	if err := writeChecksums(filepath.Join(outDir, "checksums.txt"), zipPaths); err != nil {
+	if err := writeChecksums(checksumsPath, zipPaths); err != nil {
 		return err
 	}
 	for _, artifact := range artifactSpecs() {
@@ -408,7 +420,8 @@ func writeChecksum(checksumPath, archivePath string) error {
 		return err
 	}
 	line := fmt.Sprintf("%s  %s\n", checksum, filepath.Base(archivePath))
-	if err := os.WriteFile(checksumPath, []byte(line), 0o644); err != nil {
+	if err := writeChecksumFile(checksumPath, []byte(line), 0o644); err != nil {
+		_ = os.Remove(checksumPath)
 		return fmt.Errorf("write checksum %s: %w", filepath.ToSlash(checksumPath), err)
 	}
 	return nil
@@ -426,7 +439,8 @@ func writeChecksums(path string, zipPaths []string) error {
 		builder.WriteString(filepath.Base(zipPath))
 		builder.WriteByte('\n')
 	}
-	if err := os.WriteFile(path, []byte(builder.String()), 0o644); err != nil {
+	if err := writeChecksumFile(path, []byte(builder.String()), 0o644); err != nil {
+		_ = os.Remove(path)
 		return fmt.Errorf("write checksums %s: %w", path, err)
 	}
 	return nil

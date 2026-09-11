@@ -149,6 +149,41 @@ func TestPackageLibraryWritesRootLibraryEntryAndChecksum(t *testing.T) {
 	}
 }
 
+func TestSinglePlatformChecksumFailureRemovesStaleChecksum(t *testing.T) {
+	dir := t.TempDir()
+	library := filepath.Join(dir, "model-mapper.dll")
+	archive := filepath.Join(dir, "model-mapper.zip")
+	checksum := archive + ".sha256"
+	if err := os.WriteFile(library, []byte("old library"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"-library", library, "-archive", archive, "-checksum", checksum}
+	if err := run(args); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(library, []byte("new library"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	original := writeChecksumFile
+	writeChecksumFile = func(path string, data []byte, perm os.FileMode) error {
+		if path == checksum {
+			if err := os.WriteFile(path, []byte("partial"), perm); err != nil {
+				return err
+			}
+			return errors.New("injected checksum failure")
+		}
+		return os.WriteFile(path, data, perm)
+	}
+	t.Cleanup(func() { writeChecksumFile = original })
+	if err := run(args); err == nil || !strings.Contains(err.Error(), "injected checksum failure") {
+		t.Fatalf("run error=%v", err)
+	}
+	if _, err := os.Stat(checksum); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("checksum remains after failure: %v", err)
+	}
+}
+
 func TestRunRejectsAliasedSinglePlatformPathsBeforeWriting(t *testing.T) {
 	for _, tt := range []struct {
 		name  string
@@ -305,6 +340,39 @@ func TestRunRejectsAliasedAbsentOutputsBeforeWriting(t *testing.T) {
 				t.Fatalf("archive exists after rejected run: %v", err)
 			}
 		})
+	}
+}
+
+func TestRunRevalidatesCaseInsensitiveArchiveChecksumAliases(t *testing.T) {
+	dir := t.TempDir()
+	archive := filepath.Join(dir, "Archive.zip")
+	checksum := filepath.Join(dir, "archive.zip")
+	if err := os.WriteFile(archive, []byte("case probe"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	probe, err := os.ReadFile(checksum)
+	if err != nil || !bytes.Equal(probe, []byte("case probe")) {
+		t.Skip("temporary filesystem is case-sensitive")
+	}
+	if err := os.Remove(archive); err != nil {
+		t.Fatal(err)
+	}
+
+	library := filepath.Join(dir, "model-mapper.so")
+	if err := os.WriteFile(library, []byte("plugin"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err = run([]string{"-library", library, "-archive", archive, "-checksum", checksum})
+	if err == nil || !strings.Contains(err.Error(), "must be distinct") {
+		t.Fatalf("run error = %v, want distinct path error", err)
+	}
+	archiveBytes, err := os.ReadFile(archive)
+	if err == nil {
+		if _, err := zip.NewReader(bytes.NewReader(archiveBytes), int64(len(archiveBytes))); err != nil {
+			t.Fatalf("archive became a checksum text file: %v", err)
+		}
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("read archive: %v", err)
 	}
 }
 
@@ -486,7 +554,7 @@ func TestPackageExistingArtifactsUsesSha256sumFormat(t *testing.T) {
 	}
 }
 
-func TestPackageExistingArtifactsPreservesStaleArchivesWhenChecksumWriteFails(t *testing.T) {
+func TestPackageExistingArtifactsChecksumFailureRemovesStaleManifest(t *testing.T) {
 	dir := t.TempDir()
 	dist := filepath.Join(dir, "dist")
 	out := filepath.Join(dir, "release")
@@ -511,31 +579,33 @@ func TestPackageExistingArtifactsPreservesStaleArchivesWhenChecksumWriteFails(t 
 		t.Fatalf("first packageExistingArtifacts error = %v", err)
 	}
 
-	staleArchive := filepath.Join(out, "model-mapper_0.5.3_windows_amd64.zip")
-	checksumsPath := filepath.Join(out, "checksums.txt")
+	if err := os.WriteFile(linuxPath, []byte("new linux"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	for _, path := range []string{windowsPath, windowsPath + ".version"} {
 		if err := os.Remove(path); err != nil {
 			t.Fatalf("remove Windows artifact %s: %v", path, err)
 		}
 	}
-	if err := os.Chmod(checksumsPath, 0o444); err != nil {
-		t.Fatalf("make checksum manifest read-only: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(checksumsPath, 0o644) })
 
-	err := packageExistingArtifacts("0.5.3", dist, out)
-	if err == nil || !strings.Contains(err.Error(), "write checksums") {
-		t.Fatalf("second packageExistingArtifacts error = %v, want checksum write error", err)
+	checksumsPath := filepath.Join(out, "checksums.txt")
+	original := writeChecksumFile
+	writeChecksumFile = func(path string, data []byte, perm os.FileMode) error {
+		if path == checksumsPath {
+			if err := os.WriteFile(path, []byte("partial"), perm); err != nil {
+				return err
+			}
+			return errors.New("injected checksums failure")
+		}
+		return os.WriteFile(path, data, perm)
 	}
-	checksums, err := os.ReadFile(checksumsPath)
-	if err != nil {
-		t.Fatal(err)
+	t.Cleanup(func() { writeChecksumFile = original })
+	if err := packageExistingArtifacts("0.5.3", dist, out); err == nil || !strings.Contains(err.Error(), "injected checksums failure") {
+		t.Fatalf("packageExistingArtifacts error=%v", err)
 	}
-	if !strings.Contains(string(checksums), filepath.Base(staleArchive)) {
-		t.Fatalf("checksums.txt does not contain stale archive: %q", checksums)
-	}
-	if _, err := os.Stat(staleArchive); err != nil {
-		t.Fatalf("stale archive was removed while checksums.txt references it: %v", err)
+	manifest := filepath.Join(out, "checksums.txt")
+	if _, err := os.Stat(manifest); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("checksum manifest remains after failure: %v", err)
 	}
 }
 
