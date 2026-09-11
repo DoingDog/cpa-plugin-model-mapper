@@ -1231,6 +1231,22 @@ func canonicalizeHeaders(headers http.Header) {
 	}
 }
 
+func removeChangedBodyHeaders(headers http.Header, response bool) {
+	for _, name := range []string{
+		"Content-Length",
+		"Content-Digest",
+		"Repr-Digest",
+		"Digest",
+		"Content-MD5",
+	} {
+		headers.Del(name)
+	}
+	if response {
+		headers.Del("ETag")
+		headers.Del("Content-Range")
+	}
+}
+
 func handleModelRoute(raw []byte) ([]byte, error) {
 	var req modelRouteRPCRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
@@ -1491,7 +1507,7 @@ func prepareExecutorStream(req *executorRPCRequest, call hostCaller) (*executorS
 		return nil, nil, fmt.Errorf("rewrite stream request: %w", err)
 	}
 	if changed {
-		req.Headers.Del("Content-Length")
+		removeChangedBodyHeaders(req.Headers, false)
 	}
 	hostRaw, err := call(pluginabi.MethodHostModelExecuteStream, hostModelExecutePayload{
 		HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
@@ -1553,12 +1569,16 @@ func prepareExecutorStream(req *executorRPCRequest, call hostCaller) (*executorS
 		headers = make(http.Header)
 	}
 	canonicalizeHeaders(headers)
-	headers.Del("Content-Length")
+	removeChangedBodyHeaders(headers, true)
 	headers.Del("Transfer-Encoding")
 	if headers.Get("Content-Type") == "" {
-		headers.Set("Content-Type", "text/event-stream")
+		contentType := "text/event-stream"
+		if req.Format == "gemini" && req.Alt != "" {
+			contentType = "application/json"
+		}
+		headers.Set("Content-Type", contentType)
 	}
-	stream.frameRawJSONAsSSE = isEventStreamContentType(headers.Get("Content-Type"))
+	stream.frameRawJSONAsSSE = req.Format != "gemini" && isEventStreamContentType(headers.Get("Content-Type"))
 	return stream, headers, nil
 }
 
@@ -1711,7 +1731,7 @@ func handleExecutorExecute(raw []byte, call hostCaller) ([]byte, error) {
 		return nil, err
 	}
 	if changed {
-		req.Headers.Del("Content-Length")
+		removeChangedBodyHeaders(req.Headers, false)
 	}
 	hostRaw, err := call(pluginabi.MethodHostModelExecute, hostModelExecutePayload{
 		HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
@@ -1742,7 +1762,7 @@ func handleExecutorExecute(raw []byte, call hostCaller) ([]byte, error) {
 		return nil, err
 	}
 	if changed {
-		hostResp.Headers.Del("Content-Length")
+		removeChangedBodyHeaders(hostResp.Headers, true)
 	}
 	return json.Marshal(pluginapi.ExecutorResponse{Payload: payload, Headers: hostResp.Headers})
 }

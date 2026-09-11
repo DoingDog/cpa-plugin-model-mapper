@@ -22,6 +22,26 @@ import (
 
 var applyASCIIModelCaseSink string
 
+var staleBodyHeaders = []string{
+	"Content-Digest", "Repr-Digest", "Digest", "Content-MD5",
+}
+
+func headersWithStaleBodyFields() http.Header {
+	return http.Header{
+		"Content-Length":    {"999"},
+		"Content-Digest":    {"stale"},
+		"Repr-Digest":       {"stale"},
+		"Digest":            {"stale"},
+		"Content-Md5":       {"stale"},
+		"Etag":              {"etag"},
+		"If-Match":          {"if-match"},
+		"Content-Range":     {"bytes 0-1/2"},
+		"Transfer-Encoding": {"chunked"},
+		"Content-Type":      {"application/json"},
+		"X-Keep":            {"keep"},
+	}
+}
+
 func TestPluginRegistrationMetadataAndConfigFields(t *testing.T) {
 	got := pluginRegistration()
 	if got.SchemaVersion != 1 {
@@ -3068,7 +3088,7 @@ func TestHandleExecutorExecuteResponseContentLength(t *testing.T) {
 				}
 				return json.Marshal(pluginapi.HostModelExecutionResponse{
 					StatusCode: http.StatusOK,
-					Headers:    http.Header{"Content-Length": []string{"999"}},
+					Headers:    headersWithStaleBodyFields(),
 					Body:       []byte(tt.body),
 				})
 			})
@@ -3082,7 +3102,146 @@ func TestHandleExecutorExecuteResponseContentLength(t *testing.T) {
 			if got := response.Headers.Get("Content-Length"); got != tt.wantContentLength {
 				t.Fatalf("response Content-Length=%q, want %q", got, tt.wantContentLength)
 			}
+			if tt.name == "unchanged" {
+				for _, name := range staleBodyHeaders {
+					if got := response.Headers.Get(name); got != "stale" {
+						t.Fatalf("unchanged response %s=%q, want retained stale value", name, got)
+					}
+				}
+				if response.Headers.Get("ETag") != "etag" || response.Headers.Get("Content-Range") != "bytes 0-1/2" {
+					t.Fatalf("unchanged response headers=%#v, want response validators retained", response.Headers)
+				}
+			}
 		})
+	}
+}
+
+func TestHandleExecutorExecuteChangedRequestBodyHeaders(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	var forwarded http.Header
+	raw, err := json.Marshal(rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+		Model:           "client",
+		Format:          "openai",
+		SourceFormat:    "openai",
+		Headers:         headersWithStaleBodyFields(),
+		OriginalRequest: []byte(`{"model":"client"}`),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handleExecutorExecute(raw, func(method string, payload any) (json.RawMessage, error) {
+		if method != pluginabi.MethodHostModelExecute {
+			return nil, fmt.Errorf("method=%q", method)
+		}
+		forwarded = payload.(hostModelExecutePayload).Headers.Clone()
+		return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: http.StatusOK})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range append([]string{"Content-Length"}, staleBodyHeaders...) {
+		if got := forwarded.Get(name); got != "" {
+			t.Fatalf("request %s=%q, want removed", name, got)
+		}
+	}
+	if forwarded.Get("ETag") != "etag" || forwarded.Get("If-Match") != "if-match" || forwarded.Get("X-Keep") != "keep" {
+		t.Fatalf("request headers=%#v, want validators and X-Keep retained", forwarded)
+	}
+}
+
+func TestPrepareExecutorStreamChangedRequestBodyHeaders(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	var forwarded http.Header
+	_, _, err := prepareExecutorStream(&executorRPCRequest{
+		Model:           "client",
+		Format:          "openai",
+		SourceFormat:    "openai",
+		Headers:         headersWithStaleBodyFields(),
+		OriginalRequest: []byte(`{"model":"client"}`),
+	}, func(method string, payload any) (json.RawMessage, error) {
+		if method != pluginabi.MethodHostModelExecuteStream {
+			return nil, fmt.Errorf("method=%q", method)
+		}
+		forwarded = payload.(hostModelExecutePayload).Headers.Clone()
+		return json.Marshal(pluginapi.HostModelStreamResponse{StatusCode: http.StatusOK, StreamID: "host-stream"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range append([]string{"Content-Length"}, staleBodyHeaders...) {
+		if got := forwarded.Get(name); got != "" {
+			t.Fatalf("request %s=%q, want removed", name, got)
+		}
+	}
+	if forwarded.Get("ETag") != "etag" || forwarded.Get("If-Match") != "if-match" || forwarded.Get("X-Keep") != "keep" {
+		t.Fatalf("request headers=%#v, want validators and X-Keep retained", forwarded)
+	}
+}
+
+func TestHandleExecutorExecuteChangedResponseBodyHeaders(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	raw, err := json.Marshal(rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+		Model:           "client",
+		Format:          "openai",
+		SourceFormat:    "openai",
+		OriginalRequest: []byte(`{"model":"client"}`),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseRaw, err := handleExecutorExecute(raw, func(method string, payload any) (json.RawMessage, error) {
+		if method != pluginabi.MethodHostModelExecute {
+			return nil, fmt.Errorf("method=%q", method)
+		}
+		return json.Marshal(pluginapi.HostModelExecutionResponse{
+			StatusCode: http.StatusOK,
+			Headers:    headersWithStaleBodyFields(),
+			Body:       []byte(`{"model":"upstream"}`),
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response pluginapi.ExecutorResponse
+	if err := json.Unmarshal(responseRaw, &response); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range append(append([]string{"Content-Length"}, staleBodyHeaders...), "ETag", "Content-Range") {
+		if got := response.Headers.Get(name); got != "" {
+			t.Fatalf("response %s=%q, want removed", name, got)
+		}
+	}
+	if response.Headers.Get("X-Keep") != "keep" {
+		t.Fatalf("response headers=%#v, want X-Keep retained", response.Headers)
+	}
+}
+
+func TestPrepareExecutorStreamChangedResponseBodyHeaders(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	_, headers, err := prepareExecutorStream(&executorRPCRequest{
+		Model:           "client",
+		Format:          "openai",
+		SourceFormat:    "openai",
+		OriginalRequest: []byte(`{"model":"client"}`),
+	}, func(method string, payload any) (json.RawMessage, error) {
+		if method != pluginabi.MethodHostModelExecuteStream {
+			return nil, fmt.Errorf("method=%q", method)
+		}
+		return json.Marshal(pluginapi.HostModelStreamResponse{
+			StatusCode: http.StatusOK,
+			StreamID:   "host-stream",
+			Headers:    headersWithStaleBodyFields(),
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range append(append([]string{"Content-Length"}, staleBodyHeaders...), "ETag", "Content-Range", "Transfer-Encoding") {
+		if got := headers.Get(name); got != "" {
+			t.Fatalf("response %s=%q, want removed", name, got)
+		}
+	}
+	if headers.Get("Content-Type") != "application/json" || headers.Get("X-Keep") != "keep" {
+		t.Fatalf("response headers=%#v, want Content-Type and X-Keep retained", headers)
 	}
 }
 
@@ -5009,6 +5168,64 @@ func TestSplitJSONValuesKeepsDecoderOwnedPayload(t *testing.T) {
 	referenceAllocs := testing.AllocsPerRun(50, reference)
 	if productionAllocs > referenceAllocs+2 {
 		t.Fatalf("splitJSONValues allocations=%v, decoder reference allocations=%v", productionAllocs, referenceAllocs)
+	}
+}
+
+func TestPrepareExecutorStreamGeminiKeepsCoreChunksRaw(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	for _, tt := range []struct {
+		name, alt, hostContentType, wantContentType string
+	}{
+		{name: "default SSE", alt: "", wantContentType: "text/event-stream"},
+		{name: "direct JSON", alt: "json", wantContentType: "application/json"},
+		{name: "explicit upstream SSE", alt: "", hostContentType: "text/event-stream", wantContentType: "text/event-stream"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			headers := make(http.Header)
+			if tt.hostContentType != "" {
+				headers.Set("Content-Type", tt.hostContentType)
+			}
+			stream, responseHeaders, err := prepareExecutorStream(&executorRPCRequest{
+				Model:           "client",
+				Format:          "gemini",
+				SourceFormat:    "gemini",
+				Alt:             tt.alt,
+				OriginalRequest: []byte(`{"model":"client"}`),
+			}, func(method string, payload any) (json.RawMessage, error) {
+				if method != pluginabi.MethodHostModelExecuteStream {
+					return nil, fmt.Errorf("method=%q", method)
+				}
+				return json.Marshal(pluginapi.HostModelStreamResponse{
+					StatusCode: http.StatusOK,
+					StreamID:   "host-stream",
+					Headers:    headers,
+				})
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if responseHeaders.Get("Content-Type") != tt.wantContentType {
+				t.Fatalf("Content-Type=%q, want %q", responseHeaders.Get("Content-Type"), tt.wantContentType)
+			}
+			if stream.frameRawJSONAsSSE {
+				t.Fatal("frameRawJSONAsSSE=true, want false")
+			}
+			r := newStreamChunkRewriter("client")
+			r.format = stream.format
+			r.frameRawJSONAsSSE = stream.frameRawJSONAsSSE
+			chunks, err := r.Write([]byte(`{"modelVersion":"upstream"}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			flushed, err := r.Flush()
+			if err != nil {
+				t.Fatal(err)
+			}
+			output := bytes.Join(append(chunks, flushed...), nil)
+			if !bytes.Contains(output, []byte(`"modelVersion":"client"`)) || bytes.HasPrefix(output, []byte("data:")) || bytes.HasPrefix(output, []byte("event:")) {
+				t.Fatalf("output=%q", output)
+			}
+		})
 	}
 }
 
