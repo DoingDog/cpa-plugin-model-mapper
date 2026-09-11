@@ -49,6 +49,9 @@ build: build-windows-amd64 build-linux-amd64
 package-platform:
 	@if [ -z "$(VERSION)" ]; then echo "VERSION is required"; exit 1; fi
 	@GOOS= GOARCH= CGO_ENABLED= $(GO) run .github/scripts/package-release.go -validate-only -version "$(VERSION)"
+	@set -e; \
+	archive="$(DIST_DIR)/$(PLUGIN_NAME)_$(RELEASE_VERSION)_$(GOOS)_$(GOARCH).zip"; \
+	rm -f "$$archive" "$$archive.sha256"
 	@$(MAKE) --no-print-directory build-platform
 	@set -e; \
 	case "$(GOOS)" in windows) ext=".dll" ;; darwin) ext=".dylib" ;; *) ext=".so" ;; esac; \
@@ -85,8 +88,8 @@ install-linux-amd64: build-linux-amd64
 	cp $(LINUX_AMD64_OUT) "$(CPA_PLUGINS_DIR)/$(PLUGIN_NAME).so"
 
 smoke-local:
-	@host_goos="$$( $(GO) env GOOS )"; \
-	host_goarch="$$( $(GO) env GOARCH )"; \
+	@host_goos="$$( $(GO) env GOHOSTOS )"; \
+	host_goarch="$$( $(GO) env GOHOSTARCH )"; \
 	$(MAKE) --no-print-directory build-platform GOOS="$$host_goos" GOARCH="$$host_goarch" GO="$(GO)" DIST_DIR="$(DIST_DIR)" PLUGIN_NAME="$(PLUGIN_NAME)"
 	$(GO) run .github/scripts/smoke-local.go
 

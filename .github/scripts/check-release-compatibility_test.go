@@ -144,13 +144,66 @@ func TestMakeSmokeLocalBuildsCurrentHostPlatform(t *testing.T) {
 		t.Fatal("Makefile missing end of smoke-local target")
 	}
 	target := text[targetStart : targetStart+targetEnd]
-	for _, want := range []string{"$(GO) env GOOS", "$(GO) env GOARCH", "build-platform", `GOOS="$$host_goos"`, `GOARCH="$$host_goarch"`} {
+	for _, want := range []string{"$(GO) env GOHOSTOS", "$(GO) env GOHOSTARCH", "build-platform", `GOOS="$$host_goos"`, `GOARCH="$$host_goarch"`} {
 		if !strings.Contains(target, want) {
 			t.Fatalf("smoke-local missing %q", want)
 		}
 	}
+	for _, forbidden := range []string{"$(GO) env GOOS", "$(GO) env GOARCH"} {
+		if strings.Contains(target, forbidden) {
+			t.Fatalf("smoke-local selects host from target variable %q", forbidden)
+		}
+	}
 	if strings.Contains(text, "smoke-local: build-windows-amd64") {
 		t.Fatal("smoke-local still has a fixed Windows amd64 prerequisite")
+	}
+}
+
+func TestMakeSmokeLocalIgnoresExportedTargetVariables(t *testing.T) {
+	makePath, err := exec.LookPath("make")
+	if err != nil {
+		t.Skip("make is not available")
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoRoot := wd
+	if _, err := os.Stat(filepath.Join(repoRoot, "Makefile")); err != nil {
+		repoRoot = filepath.Clean(filepath.Join(wd, "..", ".."))
+	}
+
+	tempDir := t.TempDir()
+	fakeGo := filepath.Join(tempDir, "go")
+	logPath := filepath.Join(tempDir, "build-platform")
+	if err := os.WriteFile(fakeGo, []byte(`#!/bin/sh
+case "$1:$2" in
+env:GOHOSTOS) printf '%s\n' linux ;;
+env:GOHOSTARCH) printf '%s\n' amd64 ;;
+env:GOOS) printf '%s\n' windows ;;
+env:GOARCH) printf '%s\n' arm64 ;;
+build:*) printf '%s/%s\n' "$GOOS" "$GOARCH" > "$SMOKE_LOG" ;;
+esac
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(makePath,
+		"--no-print-directory", "smoke-local",
+		"GO="+filepath.ToSlash(fakeGo),
+		"DIST_DIR="+filepath.ToSlash(filepath.Join(tempDir, "dist")),
+	)
+	cmd.Dir = repoRoot
+	cmd.Env = append(os.Environ(), "GOOS=windows", "GOARCH=arm64", "SMOKE_LOG="+filepath.ToSlash(logPath))
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("make smoke-local: %v\n%s", err, output)
+	}
+	got, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read build target: %v", err)
+	}
+	if string(got) != "linux/amd64\n" {
+		t.Fatalf("build target = %q, want host linux/amd64", got)
 	}
 }
 
@@ -239,6 +292,14 @@ func TestPackagePlatformStopsAfterCompatibilityFailure(t *testing.T) {
 		t.Fatalf("fake raw build: %v\n%s", err, output)
 	}
 
+	archive := filepath.Join(distDir, "model-mapper_0.5.1_linux_amd64.zip")
+	checksum := archive + ".sha256"
+	for _, path := range []string{archive, checksum} {
+		if err := os.WriteFile(path, []byte("stale"), 0o644); err != nil {
+			t.Fatalf("write stale output %s: %v", path, err)
+		}
+	}
+
 	cmd := exec.Command(makePath,
 		"--no-print-directory", "package-platform",
 		"VERSION=0.5.1", "GOOS=linux", "GOARCH=amd64",
@@ -254,9 +315,10 @@ func TestPackagePlatformStopsAfterCompatibilityFailure(t *testing.T) {
 	if err == nil {
 		t.Fatalf("package-platform succeeded after compatibility rejection:\n%s", output)
 	}
-	archive := filepath.Join(distDir, "model-mapper_0.5.1_linux_amd64.zip")
-	if _, statErr := os.Stat(archive); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("archive exists after compatibility rejection: %v", statErr)
+	for _, path := range []string{archive, checksum} {
+		if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("stale output exists after compatibility rejection %s: %v", path, statErr)
+		}
 	}
 	if _, statErr := os.Stat(libraryPath + ".version"); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("version sidecar exists after failed compatibility check: %v", statErr)
@@ -298,6 +360,13 @@ func TestPackagePlatformStopsAfterInspectorFailure(t *testing.T) {
 	if err := os.Chmod(readelf, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	archive := filepath.Join(distDir, "model-mapper_0.5.1_linux_amd64.zip")
+	checksum := archive + ".sha256"
+	for _, path := range []string{archive, checksum} {
+		if err := os.WriteFile(path, []byte("stale"), 0o644); err != nil {
+			t.Fatalf("write stale output %s: %v", path, err)
+		}
+	}
 
 	cmd := exec.Command(makePath,
 		"--no-print-directory", "package-platform",
@@ -311,9 +380,10 @@ func TestPackagePlatformStopsAfterInspectorFailure(t *testing.T) {
 	if err == nil {
 		t.Errorf("package-platform succeeded after inspector failure:\n%s", output)
 	}
-	archive := filepath.Join(distDir, "model-mapper_0.5.1_linux_amd64.zip")
-	if _, statErr := os.Stat(archive); !errors.Is(statErr, os.ErrNotExist) {
-		t.Errorf("archive exists after inspector failure: %v", statErr)
+	for _, path := range []string{archive, checksum} {
+		if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Errorf("stale output exists after inspector failure %s: %v", path, statErr)
+		}
 	}
 	if _, statErr := os.Stat(libraryPath + ".version"); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("version sidecar exists after inspector failure: %v", statErr)

@@ -58,8 +58,8 @@ func run(args []string) error {
 		if err := validateDistinctPaths(*libraryPath, *archivePath, *checksumPath); err != nil {
 			return err
 		}
-		if err := os.Remove(*checksumPath); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove old checksum %s: %w", filepath.ToSlash(*checksumPath), err)
+		if err := removeChecksum(*checksumPath); err != nil {
+			return err
 		}
 		if err := packageLibrary(*libraryPath, *archivePath); err != nil {
 			return err
@@ -213,6 +213,23 @@ func rawPackagePathDir(path string) string {
 	return path[:end]
 }
 
+func removeChecksum(path string) error {
+	info, err := os.Lstat(path)
+	if err == nil {
+		if info.IsDir() {
+			return fmt.Errorf("checksum path %s is a directory", filepath.ToSlash(path))
+		}
+	} else if os.IsNotExist(err) {
+		return nil
+	} else {
+		return fmt.Errorf("stat old checksum %s: %w", filepath.ToSlash(path), err)
+	}
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("remove old checksum %s: %w", filepath.ToSlash(path), err)
+	}
+	return nil
+}
+
 func packageExistingArtifacts(version, distDir, outDir string) error {
 	artifacts := make([]artifactSpec, 0, len(artifactSpecs()))
 	found := make(map[artifactSpec]bool, len(artifactSpecs()))
@@ -243,8 +260,8 @@ func packageExistingArtifacts(version, distDir, outDir string) error {
 		return fmt.Errorf("create output dir %s: %w", outDir, err)
 	}
 	checksumsPath := filepath.Join(outDir, "checksums.txt")
-	if err := os.Remove(checksumsPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove old checksums %s: %w", filepath.ToSlash(checksumsPath), err)
+	if err := removeChecksum(checksumsPath); err != nil {
+		return err
 	}
 
 	zipPaths := make([]string, 0, len(artifacts))
@@ -257,9 +274,6 @@ func packageExistingArtifacts(version, distDir, outDir string) error {
 		}
 		zipPaths = append(zipPaths, zipPath)
 	}
-	if err := writeChecksums(checksumsPath, zipPaths); err != nil {
-		return err
-	}
 	for _, artifact := range artifactSpecs() {
 		if found[artifact] {
 			continue
@@ -270,7 +284,7 @@ func packageExistingArtifacts(version, distDir, outDir string) error {
 			return fmt.Errorf("remove stale archive %s: %w", filepath.ToSlash(zipPath), err)
 		}
 	}
-	return nil
+	return writeChecksums(checksumsPath, zipPaths)
 }
 
 func artifactSpecs() []artifactSpec {
@@ -411,6 +425,23 @@ func addOptionalFile(writer *zip.Writer, path string) error {
 	return nil
 }
 
+func writeChecksumFileAtomically(path string, data []byte) error {
+	temporary, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	if err := temporary.Close(); err != nil {
+		_ = os.Remove(temporaryPath)
+		return err
+	}
+	defer os.Remove(temporaryPath)
+	if err := writeChecksumFile(temporaryPath, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
+}
+
 func writeChecksum(checksumPath, archivePath string) error {
 	if err := os.MkdirAll(filepath.Dir(checksumPath), 0o755); err != nil {
 		return fmt.Errorf("create checksum directory: %w", err)
@@ -420,8 +451,7 @@ func writeChecksum(checksumPath, archivePath string) error {
 		return err
 	}
 	line := fmt.Sprintf("%s  %s\n", checksum, filepath.Base(archivePath))
-	if err := writeChecksumFile(checksumPath, []byte(line), 0o644); err != nil {
-		_ = os.Remove(checksumPath)
+	if err := writeChecksumFileAtomically(checksumPath, []byte(line)); err != nil {
 		return fmt.Errorf("write checksum %s: %w", filepath.ToSlash(checksumPath), err)
 	}
 	return nil
@@ -439,8 +469,7 @@ func writeChecksums(path string, zipPaths []string) error {
 		builder.WriteString(filepath.Base(zipPath))
 		builder.WriteByte('\n')
 	}
-	if err := writeChecksumFile(path, []byte(builder.String()), 0o644); err != nil {
-		_ = os.Remove(path)
+	if err := writeChecksumFileAtomically(path, []byte(builder.String())); err != nil {
 		return fmt.Errorf("write checksums %s: %w", path, err)
 	}
 	return nil
