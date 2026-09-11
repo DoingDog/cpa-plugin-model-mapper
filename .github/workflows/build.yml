@@ -284,11 +284,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          prerelease_args=()
+          if [[ "${GITHUB_REF_NAME#v}" == *-* ]]; then
+            prerelease_args+=(--prerelease)
+          fi
           sort dist/*.sha256 > dist/checksums.txt
           if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            if ((${#prerelease_args[@]})); then
+              gh release edit "${GITHUB_REF_NAME}" "${prerelease_args[@]}" --repo "${GITHUB_REPOSITORY}"
+            fi
             gh release upload "${GITHUB_REF_NAME}" dist/*.zip dist/checksums.txt --clobber --repo "${GITHUB_REPOSITORY}"
           else
             gh release create "${GITHUB_REF_NAME}" dist/*.zip dist/checksums.txt \
+              "${prerelease_args[@]}" \
               --repo "${GITHUB_REPOSITORY}" \
               --verify-tag \
               --title "${GITHUB_REF_NAME}" \

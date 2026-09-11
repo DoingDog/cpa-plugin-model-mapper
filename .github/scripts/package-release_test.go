@@ -68,6 +68,30 @@ func TestRunValidateOnly(t *testing.T) {
 	}
 }
 
+func TestReleaseWorkflowMarksPrereleaseTags(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "workflows", "build.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, want := range []string{
+		`if [[ "${GITHUB_REF_NAME#v}" == *-* ]]`,
+		"prerelease_args+=(--prerelease)",
+		`gh release edit "${GITHUB_REF_NAME}" "${prerelease_args[@]}"`,
+		"gh release create",
+		`"${prerelease_args[@]}"`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("release workflow missing %q", want)
+		}
+	}
+	publishStep := strings.Index(text, "- name: Publish GitHub release")
+	prereleaseCondition := strings.Index(text, `if [[ "${GITHUB_REF_NAME#v}" == *-* ]]`)
+	if publishStep == -1 || prereleaseCondition < publishStep {
+		t.Fatal("prerelease condition is not in the publish step")
+	}
+}
+
 func TestArtifactSpecsCoverFullPlatformMatrix(t *testing.T) {
 	got := map[string]bool{}
 	for _, spec := range artifactSpecs() {
