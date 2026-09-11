@@ -36,7 +36,7 @@ The plugin supports the same CPA input and output formats: `openai`, `openai-res
 | `gemini` | `global_rules` | `global_rules` | `global_rules` |
 | `interactions` | `global_rules` | `global_rules` | `global_rules` |
 
-`gemini` and `interactions` always use only `global_rules`. An empty or comments-only dedicated rules field is absent: `off` falls back to `global_rules`, while either stacking mode runs only the remaining non-empty slice.
+`gemini` always uses only `global_rules`. Interactions requests with a non-empty `agent` remain native and are not model-mapped; other Interactions requests use only `global_rules`. An empty or comments-only dedicated rules field is absent: `off` falls back to `global_rules`, while either stacking mode runs only the remaining non-empty slice.
 
 ## Rule syntax
 
@@ -179,7 +179,7 @@ This maps every model to `kimi` only when the authenticated key does not match `
 
 ## Rewrite boundaries
 
-Request rewriting changes only a top-level string JSON `model` field. It does not rewrite nested request objects. The plugin removes `Content-Length` only when the rewritten request body changed.
+Request rewriting changes only a top-level string JSON `model` field. It does not rewrite nested request objects. When the rewritten request body changes, the plugin removes `Content-Length`, `Content-MD5`, and `Digest`.
 
 Response restoration changes only these paths:
 
@@ -190,11 +190,11 @@ Response restoration changes only these paths:
 - `message.model`
 - `interaction.model`
 
-For nonstream responses, remove `Content-Length` only when model restoration changes body bytes; preserve it when unchanged.
+When model restoration changes nonstream response bytes, the plugin removes `Content-Length`, `Content-MD5`, `Digest`, `ETag`, `Accept-Ranges`, and `Content-Range`; it preserves them when unchanged. Mapped streams remove the same stale response metadata before forwarding.
 
 Opaque response content and tool text are not recursively rewritten. Before closing the plugin stream after a read error, the plugin flushes pending rewritten bytes.
 
-Unframed raw JSON stream chunks preserve the bytes that separate complete JSON values. Gemini streamed JSON arrays restore the top-level `modelVersion` of each object element.
+Unframed raw JSON stream chunks preserve the bytes that separate complete JSON values. Gemini streamed JSON arrays restore the top-level `modelVersion` of each object element. Gemini raw core chunks are not double-framed.
 
 When raw JSON is framed as SSE, `openai-response` and `claude` include an `event:` line from the top-level `type`. A clean `openai` Chat completion appends `data: [DONE]`, while Gemini does not append `[DONE]`.
 
@@ -217,12 +217,12 @@ Add a scoped mapping for that inbound client API key before an unscoped mapping.
 ```powershell
 make test
 make vet
-make build-windows-amd64 VERSION=0.5.3
-make build-linux-amd64 VERSION=0.5.3 LINUX_AMD64_CC="zig cc -target x86_64-linux-gnu"
-make package VERSION=0.5.3
+make package VERSION=0.5.4 GOOS=windows GOARCH=amd64
+make package VERSION=0.5.4 GOOS=linux GOARCH=amd64 BUILD_CC="zig cc -target x86_64-linux-gnu.2.17"
+make package VERSION=0.5.4
 ```
 
-Aggregate packaging verifies each discovered binary's adjacent `.version` sidecar and fails if the built version differs from the requested release version.
+Raw `build-platform` removes its `.version` sidecar. Successful `package-platform` writes `.version` only after compatibility inspection, and aggregate packaging accepts only matching checked sidecars for the requested release version.
 
 Full-platform release builds run in GitHub Actions for:
 
@@ -255,7 +255,7 @@ Linux amd64 CPA:
 
 ## Smoke test
 
-Live smoke uses only local ignored state under `.test-cpa/`. Each live smoke case deletes its generated config before it finishes.
+Live smoke uses only local ignored state under `.test-cpa/`. Each live smoke case deletes its generated config before it finishes. `make smoke-local` builds and copies the current `go env GOOS/GOARCH` artifact. Relative path-like `CPA_SMOKE_CPA_BIN` values are resolved from the repository root.
 
 Required environment variables:
 

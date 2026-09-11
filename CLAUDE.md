@@ -13,7 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Build Linux amd64 plugin from Windows with Zig: `make build-linux-amd64 LINUX_AMD64_CC="zig cc -target x86_64-linux-gnu"`
 - Build/package one platform: `make package VERSION=0.1.2 GOOS=windows GOARCH=amd64`
 - Package already-built artifacts into `dist/release/`: `make package VERSION=0.1.2`
-- Run live local smoke: set `CPA_SMOKE_API_KEY` and `CPA_SMOKE_CPA_BIN`, then `make smoke-local`
+- Run live local smoke: `make smoke-local` builds and copies the current `go env GOOS/GOARCH` artifact; set `CPA_SMOKE_API_KEY` and `CPA_SMOKE_CPA_BIN`, whose relative path-like values resolve from the repository root
 - Clean build output: `make clean`
 
 Do not run `go test ./.github/scripts`; that directory contains multiple `package main` scripts and will collide on duplicate `main`/`run` symbols. Test script files explicitly as shown above.
@@ -26,17 +26,17 @@ This is a single-package Go `c-shared` CLIProxyAPI native plugin. `abi_cgo.go` i
 
 - `pluginRegistration` advertises `model_router`, `executor`, and `executor.execute_stream` support for `openai`, `openai-response`, `claude`, `gemini`, and `interactions`. Logo is registration metadata and has no configuration field.
 - `decodeLifecycleConfig` and `decodeConfig` load plugin config from CPA lifecycle payloads. Plugin-owned config fields are `global_rules`, `claude_messages_rules`, `codex_responses_rules`, `openai_completions_rules`, and `rules_stack_mode`; CPA owns global and per-instance `enabled` plus per-instance `priority`.
-- `selectRules` follows `rules_stack_mode`: `off` selects a non-empty dedicated `claude`, `openai-response`, or `openai` slice, otherwise `global_rules`; `specific_first` selects the dedicated slice then `global_rules`; `global_first` selects `global_rules` then the dedicated slice. Empty or comments-only dedicated slices are absent. `gemini` and `interactions` always select only `global_rules`.
+- `selectRules` follows `rules_stack_mode`: `off` selects a non-empty dedicated `claude`, `openai-response`, or `openai` slice, otherwise `global_rules`; `specific_first` selects the dedicated slice then `global_rules`; `global_first` selects `global_rules` then the dedicated slice. Empty or comments-only dedicated slices are absent. `gemini` always selects only `global_rules`. An `interactions` request with a non-empty `agent` remains native and is not model-mapped; other `interactions` requests select only `global_rules`.
 - `parseRules` / `applyRules` implement an ordered entry DSL: entries have an optional positive authenticated caller pattern (`api-key-pattern#`) or inverse pattern (`#api-key-pattern#`), followed by a `find=>replace` mapping or exact standalone `\a` / `\A` ASCII case operation. An unescaped `!` comments out its complete entry before syntax validation; `\!` is literal, and leading, trailing, or doubled semicolons remain invalid unless their corresponding entry contains an unescaped `!`. In caller patterns, unescaped `*` is a wildcard without captures and `\*` / `\#` are literals. Model `find` wildcards alone create `$1` captures. Entries run left-to-right exactly once.
 - Exact caller scopes compare the metadata-derived `caller_scope` digest. Wildcard caller scopes recover an authenticated Principal only from a raw inbound credential whose digest equals `caller_scope`; client-controlled headers alone are not trusted. Caller credential recovery covers rules in both selected slices. If an access provider's Principal differs from every presented credential, wildcard entries skip. Missing or unbound caller identity skips positive and inverse scopes. `handleModelRoute` caches only the boolean result for `caller_scope + pattern`, and executor paths reuse it if request interceptors changed the credential headers before execution. A route is handled only when an entry ran and the final model differs from the original.
 - `handleExecutorExecute` and `runStreamForward` rewrite the outbound request body to the upstream model, call CPA host execution callbacks, then restore selected response model fields to the client-requested model.
 
 Important model-rewrite invariants:
 
-- Request rewriting intentionally changes only the top-level JSON `model` field. Delete stale `Content-Length` only when that rewrite changes the request body.
-- Response restoration is deliberately whitelisted to `model`, `modelVersion`, `response.model`, `response.modelVersion`, `message.model`, and `interaction.model`. Do not replace recursively through arbitrary content/tool text. For nonstream responses, remove `Content-Length` only when model restoration changes body bytes; preserve it when unchanged.
+- Request rewriting intentionally changes only the top-level JSON `model` field. When that rewrite changes the request body, remove `Content-Length`, `Content-MD5`, and `Digest`.
+- Response restoration is deliberately whitelisted to `model`, `modelVersion`, `response.model`, `response.modelVersion`, `message.model`, and `interaction.model`. Do not replace recursively through arbitrary content/tool text. When model restoration changes nonstream response bytes, remove `Content-Length`, `Content-MD5`, `Digest`, `ETag`, `Accept-Ranges`, and `Content-Range`; preserve them when unchanged.
 - Case operations change ASCII English letters only and do not make later mappings case-insensitive.
-- Streaming responses pass through `streamChunkRewriter`, which handles complete SSE events, split SSE prefixes, unterminated SSE data at flush time, raw JSON chunks, line/space-delimited JSON values, and raw JSON that must be framed as SSE for Responses SSE clients.
+- Mapped streams remove the same stale response metadata before forwarding. Streaming responses pass through `streamChunkRewriter`, which handles complete SSE events, split SSE prefixes, unterminated SSE data at flush time, raw JSON chunks, line/space-delimited JSON values, and raw JSON that must be framed as SSE for Responses SSE clients. Gemini raw core chunks are not double-framed.
 - On a host stream read error, flush pending rewritten bytes before closing the plugin stream so clients do not hang waiting for buffered output.
 
 ## Release and packaging
@@ -47,6 +47,8 @@ Important model-rewrite invariants:
 
 - single-platform mode with `-library`, `-archive`, and `-checksum`
 - aggregate mode with `-version`, `-dist`, and `-out`
+
+Raw `build-platform` removes its `.version` sidecar. Successful `package-platform` writes `.version` only after compatibility inspection, and aggregate packaging accepts only matching checked sidecars.
 
 Release zip files are named `model-mapper_<version>_<goos>_<goarch>.zip`, contain the dynamic library at zip root plus optional root `LICENSE`, and use sha256sum-format checksum lines with only the archive basename.
 
