@@ -24,8 +24,8 @@ var applyASCIIModelCaseSink string
 
 func TestPluginRegistrationMetadataAndConfigFields(t *testing.T) {
 	got := pluginRegistration()
-	if got.SchemaVersion != pluginabi.SchemaVersion {
-		t.Fatalf("schema version=%d, want %d", got.SchemaVersion, pluginabi.SchemaVersion)
+	if got.SchemaVersion != 1 {
+		t.Fatalf("schema version=%d, want 1", got.SchemaVersion)
 	}
 	if got.Metadata.Name != "model-mapper" {
 		t.Fatalf("plugin name=%q", got.Metadata.Name)
@@ -61,6 +61,26 @@ func TestPluginRegistrationMetadataAndConfigFields(t *testing.T) {
 	}
 	if !strings.Contains(field.Description, "off") || !strings.Contains(strings.ToLower(field.Description), "default") {
 		t.Fatalf("description = %q", field.Description)
+	}
+}
+
+func TestPluginRegisterKeepsSchemaOneForNewerHost(t *testing.T) {
+	t.Cleanup(func() { setLoadedConfigForTest(defaultConfig()) })
+	rawYAML := base64.StdEncoding.EncodeToString([]byte("global_rules: a=>b\n"))
+	raw, err := json.Marshal(map[string]any{"config_yaml": rawYAML, "schema_version": 6})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := handlePluginRegister(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got registration
+	if err := json.Unmarshal(response, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.SchemaVersion != 1 {
+		t.Fatalf("schema version=%d, want 1", got.SchemaVersion)
 	}
 }
 
@@ -1610,7 +1630,12 @@ func TestHandleModelRouteHandledSelfForChangedModel(t *testing.T) {
 
 func TestHandleModelRouteIgnoresUnusedBody(t *testing.T) {
 	setLoadedConfigForTest(Config{GlobalRules: "a=>b"})
-	raw := []byte(`{"SourceFormat":"openai","RequestedModel":"a","Body":{"unused":true}}`)
+	raw, err := json.Marshal(pluginapi.ModelRouteRequest{
+		SourceFormat: "openai", RequestedModel: "a", Body: []byte(`{"unused":true}`),
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
 	respRaw, err := handleModelRoute(raw)
 	if err != nil {
 		t.Fatalf("handleModelRoute error = %v", err)
@@ -1621,6 +1646,40 @@ func TestHandleModelRouteIgnoresUnusedBody(t *testing.T) {
 	}
 	if !resp.Handled || resp.TargetKind != pluginapi.ModelRouteTargetSelf {
 		t.Fatalf("route response=%#v, want handled self route", resp)
+	}
+}
+
+func TestHandleModelRouteLeavesInteractionsAgentsNative(t *testing.T) {
+	t.Cleanup(func() { setLoadedConfigForTest(defaultConfig()) })
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	for _, tt := range []struct {
+		name    string
+		body    string
+		handled bool
+	}{
+		{name: "agent", body: `{"agent":"client"}`, handled: false},
+		{name: "empty agent with model", body: `{"agent":"","model":"client"}`, handled: true},
+		{name: "model", body: `{"model":"client"}`, handled: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, err := json.Marshal(pluginapi.ModelRouteRequest{
+				SourceFormat: "interactions", RequestedModel: "client", Body: []byte(tt.body),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			responseRaw, err := handleModelRoute(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var response pluginapi.ModelRouteResponse
+			if err := json.Unmarshal(responseRaw, &response); err != nil {
+				t.Fatal(err)
+			}
+			if response.Handled != tt.handled {
+				t.Fatalf("Handled=%v, want %v", response.Handled, tt.handled)
+			}
+		})
 	}
 }
 

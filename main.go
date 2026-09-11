@@ -825,6 +825,8 @@ func isIncompleteSSEPrefix(p []byte) bool {
 	return false
 }
 
+const pluginRPCSchemaVersion uint32 = 1
+
 const (
 	rulesStackModeOff           = "off"
 	rulesStackModeSpecificFirst = "specific_first"
@@ -861,7 +863,7 @@ type registrationCapabilities struct {
 
 func pluginRegistration() registration {
 	return registration{
-		SchemaVersion: pluginabi.SchemaVersion,
+		SchemaVersion: pluginRPCSchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             "model-mapper",
 			Version:          pluginVersion,
@@ -1096,7 +1098,15 @@ type modelRouteRPCRequest struct {
 	RequestedModel string
 	Headers        http.Header
 	Query          url.Values
+	Body           []byte
 	Metadata       map[string]any
+}
+
+func interactionsUsesAgent(body []byte) bool {
+	var request struct {
+		Agent string `json:"agent"`
+	}
+	return json.Unmarshal(body, &request) == nil && request.Agent != ""
 }
 
 func canonicalizeHeaders(headers http.Header) {
@@ -1114,6 +1124,9 @@ func handleModelRoute(raw []byte) ([]byte, error) {
 	var req modelRouteRPCRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
+	}
+	if req.SourceFormat == "interactions" && interactionsUsesAgent(req.Body) {
+		return json.Marshal(pluginapi.ModelRouteResponse{Handled: false})
 	}
 	canonicalizeHeaders(req.Headers)
 	scope := callerScopeFromMetadata(req.Metadata)
