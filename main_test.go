@@ -123,6 +123,11 @@ func TestRuleConfigFieldsRequireStrings(t *testing.T) {
 			}
 		})
 	}
+	t.Run("GLOBAL_RULES/json-null", func(t *testing.T) {
+		if _, err := decodeConfig(json.RawMessage(`{"GLOBAL_RULES":null}`)); err == nil || !strings.Contains(err.Error(), "global_rules must be a string") {
+			t.Fatalf("decodeConfig error=%v", err)
+		}
+	})
 
 	if _, err := decodeConfig(json.RawMessage(`{}`)); err != nil {
 		t.Fatalf("omitted direct fields: %v", err)

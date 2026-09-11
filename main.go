@@ -1005,17 +1005,20 @@ func decodeConfig(raw json.RawMessage) (Config, error) {
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		return Config{}, err
 	}
-	for _, name := range []string{
-		"global_rules",
-		"claude_messages_rules",
-		"codex_responses_rules",
-		"openai_completions_rules",
-		"rules_stack_mode",
-	} {
-		if value, ok := fields[name]; ok {
-			value = bytes.TrimSpace(value)
-			if len(value) == 0 || value[0] != '"' {
-				return Config{}, fmt.Errorf("%s must be a string", name)
+	for key, value := range fields {
+		for _, name := range []string{
+			"global_rules",
+			"claude_messages_rules",
+			"codex_responses_rules",
+			"openai_completions_rules",
+			"rules_stack_mode",
+		} {
+			if strings.EqualFold(key, name) {
+				value = bytes.TrimSpace(value)
+				if len(value) == 0 || value[0] != '"' {
+					return Config{}, fmt.Errorf("%s must be a string", name)
+				}
+				break
 			}
 		}
 	}
