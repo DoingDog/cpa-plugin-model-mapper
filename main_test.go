@@ -4034,6 +4034,37 @@ func TestHandleExecutorExecuteReturnsErrorForHostHTTPStatus(t *testing.T) {
 	}
 }
 
+func TestHandleExecutorExecutePropagatesHostHTTPStatus(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "a=>b"})
+	req := rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{Model: "a", Format: "openai", SourceFormat: "openai", OriginalRequest: []byte(`{"model":"a"}`)}, HostCallbackID: "callback-1"}
+	rawReq, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal req: %v", err)
+	}
+	for _, status := range []int{http.StatusBadRequest, http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			_, hostErr := handleExecutorExecute(rawReq, func(string, any) (json.RawMessage, error) {
+				return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: status, Body: []byte("upstream failed")})
+			})
+			if hostErr == nil {
+				t.Fatal("handleExecutorExecute error=nil")
+			}
+			raw, err := wrapEnvelope(nil, hostErr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got pluginabi.Envelope
+			if err := json.Unmarshal(raw, &got); err != nil {
+				t.Fatal(err)
+			}
+			want := pluginabi.Error{Code: "plugin_error", Message: fmt.Sprintf("host.model.execute status %d: upstream failed", status), HTTPStatus: status}
+			if got.OK || got.Error == nil || *got.Error != want {
+				t.Fatalf("envelope=%s, want %#v", raw, want)
+			}
+		})
+	}
+}
+
 func TestHandleExecutorExecuteStreamUsesCallerScope(t *testing.T) {
 	tests := []struct {
 		name, rules, key, upstream string
@@ -6803,6 +6834,98 @@ func TestRunStreamForwardClosesHostStreamOnHTTPError(t *testing.T) {
 		})
 	}
 }
+
+func TestPrepareExecutorStreamPropagatesHostHTTPStatus(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "a=>b"})
+	for _, status := range []int{http.StatusBadRequest, http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			closeCalls := 0
+			req := executorRPCRequest{
+				Model:           "a",
+				Format:          "openai",
+				SourceFormat:    "openai",
+				OriginalRequest: []byte(`{"model":"a","stream":true}`),
+				StreamID:        "plugin-stream",
+			}
+			_, _, hostErr := prepareExecutorStream(&req, func(method string, _ any) (json.RawMessage, error) {
+				switch method {
+				case pluginabi.MethodHostModelExecuteStream:
+					return json.Marshal(struct {
+						pluginapi.HostModelStreamResponse
+						Body []byte `json:"body"`
+					}{
+						HostModelStreamResponse: pluginapi.HostModelStreamResponse{StatusCode: status, StreamID: "host-stream"},
+						Body:                    []byte("upstream failed"),
+					})
+				case pluginabi.MethodHostModelStreamClose:
+					closeCalls++
+					return nil, nil
+				default:
+					return nil, fmt.Errorf("unexpected method %q", method)
+				}
+			})
+			if hostErr == nil {
+				t.Fatal("prepareExecutorStream error=nil")
+			}
+			if closeCalls != 1 {
+				t.Fatalf("host close calls=%d, want 1", closeCalls)
+			}
+			raw, err := wrapEnvelope(nil, hostErr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got pluginabi.Envelope
+			if err := json.Unmarshal(raw, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.OK || got.Error == nil || got.Error.Code != "plugin_error" || got.Error.HTTPStatus != status || got.Error.Retryable || !strings.Contains(got.Error.Message, fmt.Sprint(status)) || !strings.Contains(got.Error.Message, "upstream failed") {
+				t.Fatalf("envelope=%s", raw)
+			}
+		})
+	}
+
+	t.Run("close failure preserves status", func(t *testing.T) {
+		closeErr := errors.New("close failed")
+		req := executorRPCRequest{
+			Model:           "a",
+			Format:          "openai",
+			SourceFormat:    "openai",
+			OriginalRequest: []byte(`{"model":"a","stream":true}`),
+			StreamID:        "plugin-stream",
+		}
+		_, _, hostErr := prepareExecutorStream(&req, func(method string, _ any) (json.RawMessage, error) {
+			switch method {
+			case pluginabi.MethodHostModelExecuteStream:
+				return json.Marshal(struct {
+					pluginapi.HostModelStreamResponse
+					Body []byte `json:"body"`
+				}{
+					HostModelStreamResponse: pluginapi.HostModelStreamResponse{StatusCode: http.StatusServiceUnavailable, StreamID: "host-stream"},
+					Body:                    []byte("upstream failed"),
+				})
+			case pluginabi.MethodHostModelStreamClose:
+				return nil, closeErr
+			default:
+				return nil, fmt.Errorf("unexpected method %q", method)
+			}
+		})
+		if !errors.Is(hostErr, closeErr) {
+			t.Fatalf("prepareExecutorStream error=%v, want close error %v", hostErr, closeErr)
+		}
+		raw, err := wrapEnvelope(nil, hostErr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got pluginabi.Envelope
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.OK || got.Error == nil || got.Error.Code != "plugin_error" || got.Error.HTTPStatus != http.StatusServiceUnavailable || got.Error.Retryable || !strings.Contains(got.Error.Message, "503") || !strings.Contains(got.Error.Message, "upstream failed") {
+			t.Fatalf("envelope=%s", raw)
+		}
+	})
+}
+
 func TestHandleExecutorExecuteStreamRestoresKnownSSEModelFields(t *testing.T) {
 	setLoadedConfigForTest(Config{ClaudeMessagesRules: "claude-*=>gpt-5.5"})
 	req := rpcExecutorRequest{
@@ -7436,6 +7559,21 @@ func TestWrapEnvelopeAvoidsPayloadSizedIntermediate(t *testing.T) {
 	}
 }
 
+func TestWrapEnvelopeKeepsGenericErrorsStatusless(t *testing.T) {
+	raw, err := wrapEnvelope(nil, errors.New("internal failure"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got pluginabi.Envelope
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	want := pluginabi.Error{Code: "plugin_error", Message: "internal failure"}
+	if got.OK || got.Error == nil || *got.Error != want {
+		t.Fatalf("envelope=%s, want %#v", raw, want)
+	}
+}
+
 func TestCallHostReturnsDecoderOwnedResult(t *testing.T) {
 	resultPayload := json.RawMessage(`{"data":"` + strings.Repeat("x", 256<<10) + `"}`)
 	responseBytes, err := json.Marshal(pluginabi.Envelope{OK: true, Result: resultPayload})
@@ -7471,6 +7609,31 @@ func TestCallHostReturnsDecoderOwnedResult(t *testing.T) {
 	})
 	if got, limit := production.AllocedBytesPerOp(), reference.AllocedBytesPerOp()+int64(len(resultPayload))/4; got > limit {
 		t.Fatalf("callHost bytes/op=%d, single-decode reference bytes/op=%d", got, reference.AllocedBytesPerOp())
+	}
+}
+
+func TestCallHostPreservesStructuredErrorEnvelope(t *testing.T) {
+	want := pluginabi.Error{Code: "rate_limit_error", Message: "retry later", Retryable: true, HTTPStatus: http.StatusTooManyRequests}
+	response, err := json.Marshal(pluginabi.Envelope{OK: false, Error: &want})
+	if err != nil {
+		t.Fatal(err)
+	}
+	setHostCallbackForTest(func(string, []byte) ([]byte, error) { return response, nil })
+	t.Cleanup(func() { setHostCallbackForTest(nil) })
+	_, hostErr := callHost("host.model.execute", map[string]any{})
+	if hostErr == nil {
+		t.Fatal("callHost error=nil")
+	}
+	raw, err := wrapEnvelope(nil, fmt.Errorf("execute: %w", hostErr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got pluginabi.Envelope
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.OK || got.Error == nil || *got.Error != want {
+		t.Fatalf("envelope=%s, want %#v", raw, want)
 	}
 }
 

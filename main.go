@@ -1392,6 +1392,28 @@ func restoreResponseModel(body []byte, originalModel string) ([]byte, bool, erro
 
 type hostCaller func(method string, payload any) (json.RawMessage, error)
 
+type structuredPluginError struct {
+	detail pluginabi.Error
+	cause  error
+}
+
+func (e *structuredPluginError) Error() string { return e.detail.Message }
+
+func (e *structuredPluginError) Unwrap() error { return e.cause }
+
+func newStructuredPluginError(detail pluginabi.Error, cause error) error {
+	return &structuredPluginError{detail: detail, cause: cause}
+}
+
+func structuredError(code, message string, retryable bool, httpStatus int, cause error) error {
+	return newStructuredPluginError(pluginabi.Error{
+		Code:       code,
+		Message:    message,
+		Retryable:  retryable,
+		HTTPStatus: httpStatus,
+	}, cause)
+}
+
 type executorRPCRequest struct {
 	Model           string
 	Format          string
@@ -1637,13 +1659,15 @@ func prepareExecutorStream(req *executorRPCRequest, call hostCaller) (*executorS
 		call:           call,
 	}
 	if hostResp.StatusCode >= http.StatusBadRequest {
-		statusErr := fmt.Errorf("execute stream status %d: %s", hostResp.StatusCode, string(hostResp.Body))
+		message := fmt.Sprintf("execute stream status %d: %s", hostResp.StatusCode, string(hostResp.Body))
+		var cause error
 		if stream.hostStreamID != "" {
 			if closeErr := stream.closeHost(); closeErr != nil {
-				return nil, nil, errors.Join(statusErr, fmt.Errorf("close host stream: %w", closeErr))
+				cause = closeErr
+				message = errors.Join(errors.New(message), fmt.Errorf("close host stream: %w", closeErr)).Error()
 			}
 		}
-		return nil, nil, statusErr
+		return nil, nil, structuredError("plugin_error", message, false, hostResp.StatusCode, cause)
 	}
 	if stream.hostStreamID == "" {
 		return nil, nil, fmt.Errorf("missing host stream id")
@@ -1839,7 +1863,8 @@ func handleExecutorExecute(raw []byte, call hostCaller) ([]byte, error) {
 	}
 	canonicalizeHeaders(hostResp.Headers)
 	if hostResp.StatusCode >= 400 {
-		return nil, fmt.Errorf("host.model.execute status %d: %s", hostResp.StatusCode, string(hostResp.Body))
+		message := fmt.Sprintf("host.model.execute status %d: %s", hostResp.StatusCode, string(hostResp.Body))
+		return nil, structuredError("plugin_error", message, false, hostResp.StatusCode, nil)
 	}
 	payload, changed, err := restoreResponseModel(hostResp.Body, decision.OriginalModel)
 	if err != nil {
@@ -1853,6 +1878,10 @@ func handleExecutorExecute(raw []byte, call hostCaller) ([]byte, error) {
 
 func wrapEnvelope(payload []byte, err error) ([]byte, error) {
 	if err != nil {
+		var structured *structuredPluginError
+		if errors.As(err, &structured) {
+			return marshalErrorEnvelope(structured.detail), nil
+		}
 		return errorEnvelope("plugin_error", err.Error()), nil
 	}
 	if len(payload) == 0 {
@@ -1861,15 +1890,16 @@ func wrapEnvelope(payload []byte, err error) ([]byte, error) {
 	return json.Marshal(pluginabi.Envelope{OK: true, Result: json.RawMessage(payload)})
 }
 
-func errorEnvelope(code, message string) []byte {
-	raw, err := json.Marshal(pluginabi.Envelope{
-		OK:    false,
-		Error: &pluginabi.Error{Code: code, Message: message},
-	})
+func marshalErrorEnvelope(detail pluginabi.Error) []byte {
+	raw, err := json.Marshal(pluginabi.Envelope{OK: false, Error: &detail})
 	if err != nil {
 		return []byte(`{"ok":false,"error":{"code":"plugin_error","message":"failed to encode error envelope"}}`)
 	}
 	return raw
+}
+
+func errorEnvelope(code, message string) []byte {
+	return marshalErrorEnvelope(pluginabi.Error{Code: code, Message: message})
 }
 
 func handleMethod(method string, request []byte) ([]byte, error) {
@@ -2010,7 +2040,8 @@ func callHost(method string, payload any) (json.RawMessage, error) {
 		if env.Error == nil {
 			return nil, fmt.Errorf("host callback %s failed", method)
 		}
-		return nil, fmt.Errorf("host callback %s failed: %s", method, env.Error.Message)
+		detail := *env.Error
+		return nil, newStructuredPluginError(detail, nil)
 	}
 	return env.Result, nil
 }
