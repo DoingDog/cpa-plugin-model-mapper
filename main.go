@@ -208,7 +208,7 @@ func (r *sseRewriter) drain(eof bool) ([][]byte, error) {
 		if len(r.buf) == 0 {
 			r.buf = nil
 			r.scanFrom = 0
-		} else if bufferCap > 2*len(r.buf) {
+		} else if bufferCap > maxPendingStreamBytes || bufferCap > 2*len(r.buf) {
 			r.buf = bytes.Clone(r.buf)
 		}
 	}

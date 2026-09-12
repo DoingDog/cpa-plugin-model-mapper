@@ -5393,9 +5393,15 @@ func TestStreamChunkRewriterPendingLimitAllowsLargeCompleteTraffic(t *testing.T)
 		r.format = "openai-response"
 		r.frameRawJSONAsSSE = framed
 		payload := []byte(`{"type":"response.output_text.delta","delta":"` + largeText + `"}`)
-		out, err := r.Write(payload)
-		if err != nil || len(out) == 0 {
-			t.Fatalf("framed=%v large complete Write=(%d chunks,%v)", framed, len(out), err)
+		var total int
+		for total <= maxPendingStreamBytes {
+			out, err := r.Write(payload)
+			if err != nil || len(out) == 0 {
+				t.Fatalf("framed=%v total=%d complete raw Write=(%d chunks,%v)", framed, total, len(out), err)
+			}
+			for _, chunk := range out {
+				total += len(chunk)
+			}
 		}
 	}
 
@@ -6649,9 +6655,10 @@ func TestRunStreamForwardClosesOnlyOversizedIncompleteStream(t *testing.T) {
 	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
 	const prefix = "data: {\"type\":\"response.output_text.delta\",\"delta\":\""
 	fragment := append([]byte(prefix), bytes.Repeat([]byte("x"), 1<<20-len(prefix))...)
-	var emitCalls, hostCloseCalls, pluginCloseCalls, readCalls int
-	pluginCloseError := ""
-	pluginClosed := make(chan struct{})
+	var emitCalls, hostCloseCalls, directPluginCloseCalls, outerPluginCloseCalls, readCalls int
+	directPluginCloseError := ""
+	directPluginClosed := make(chan struct{})
+	var directPluginCloseOnce sync.Once
 	call := func(method string, payload any) (json.RawMessage, error) {
 		switch method {
 		case pluginabi.MethodHostModelExecuteStream:
@@ -6669,6 +6676,21 @@ func TestRunStreamForwardClosesOnlyOversizedIncompleteStream(t *testing.T) {
 		case pluginabi.MethodHostModelStreamClose:
 			hostCloseCalls++
 			return json.Marshal(map[string]any{})
+		case pluginabi.MethodHostStreamClose:
+			directPluginCloseCalls++
+			raw, err := json.Marshal(payload)
+			if err != nil {
+				return nil, err
+			}
+			var closePayload struct {
+				Error string `json:"error"`
+			}
+			if err := json.Unmarshal(raw, &closePayload); err != nil {
+				return nil, err
+			}
+			directPluginCloseError = closePayload.Error
+			directPluginCloseOnce.Do(func() { close(directPluginClosed) })
+			return json.Marshal(map[string]any{})
 		default:
 			return nil, fmt.Errorf("unexpected method %q", method)
 		}
@@ -6680,27 +6702,25 @@ func TestRunStreamForwardClosesOnlyOversizedIncompleteStream(t *testing.T) {
 		OriginalRequest: []byte(`{"model":"client","stream":true}`),
 		StreamID:        "plugin-stream-pending-limit-1",
 	}
-	if _, err := startExecutorStream(req, call, func(_ string, errText string) error {
-		pluginCloseCalls++
-		pluginCloseError = errText
-		close(pluginClosed)
+	if _, err := startExecutorStream(req, call, func(_ string, _ string) error {
+		outerPluginCloseCalls++
 		return nil
 	}); err != nil {
 		t.Fatalf("startExecutorStream error = %v", err)
 	}
 	select {
-	case <-pluginClosed:
+	case <-directPluginClosed:
 	case <-time.After(2 * time.Second):
-		t.Fatal("worker did not close oversized stream")
+		t.Fatal("worker did not directly close oversized stream")
 	}
 	if emitCalls != 0 {
 		t.Fatalf("emit calls=%d, want 0", emitCalls)
 	}
-	if hostCloseCalls != 1 || pluginCloseCalls != 1 {
-		t.Fatalf("close calls host=%d plugin=%d", hostCloseCalls, pluginCloseCalls)
+	if hostCloseCalls != 1 || directPluginCloseCalls != 1 || outerPluginCloseCalls != 0 {
+		t.Fatalf("close calls host=%d direct-plugin=%d outer-plugin=%d, want 1, 1, 0", hostCloseCalls, directPluginCloseCalls, outerPluginCloseCalls)
 	}
-	if !strings.Contains(pluginCloseError, "stream pending data exceeds 16777216 bytes") {
-		t.Fatalf("plugin close error=%q", pluginCloseError)
+	if !strings.Contains(directPluginCloseError, "stream pending data exceeds 16777216 bytes") || strings.Contains(directPluginCloseError, "unexpected method") {
+		t.Fatalf("direct plugin close error=%q", directPluginCloseError)
 	}
 	if readCalls != 17 {
 		t.Fatalf("read calls=%d, want 17", readCalls)
