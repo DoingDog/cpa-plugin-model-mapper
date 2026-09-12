@@ -202,7 +202,7 @@ Delimiterless OpenAI Responses logical events produced by CPA's provider transla
 
 The plugin retains at most 16 MiB for one incomplete SSE event or raw JSON value per stream. This limit does not apply to cumulative stream traffic or batches of complete events. Exceeding it closes only that stream with an error and emits no partial oversized unit.
 
-Structured host callback errors preserve their plugin ABI `code`, `message`, `retryable`, and `http_status`. Status-only mapped execution failures preserve the HTTP status with `plugin_error`; the ABI has no error-header field, so response headers such as `Retry-After` are not synthesized.
+When a host callback error returns through a synchronous plugin ABI error envelope, its structured `code`, `message`, `retryable`, and `http_status` fields are preserved. Failures after stream setup are forwarded through `host.stream.close` as an error string because that ABI path has no structured error fields. Status-only mapped execution failures preserve the HTTP status with `plugin_error`; the ABI has no error-header field, so response headers such as `Retry-After` are not synthesized.
 
 ## Common use cases
 

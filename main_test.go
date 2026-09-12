@@ -4425,6 +4425,29 @@ func TestStreamChunkRewriterDelimiterlessResponsesPartitionInvariant(t *testing.
 	}
 }
 
+func TestStreamChunkRewriterScansFragmentedDelimiterlessResponsesEventLinearly(t *testing.T) {
+	input := []byte("event: response.created\ndata: {\"type\":\"response.created\",\"payload\":\"" + strings.Repeat("x", 2<<20) + "\"}")
+	const fragmentSize = 8 << 10
+	allocations := testing.AllocsPerRun(1, func() {
+		r := newStreamChunkRewriter("client")
+		r.format = "openai-response"
+		r.frameRawJSONAsSSE = true
+		for start := 0; start < len(input); start += fragmentSize {
+			end := min(start+fragmentSize, len(input))
+			if chunks, err := r.Write(input[start:end]); err != nil || len(chunks) != 0 {
+				panic(fmt.Sprintf("Write(%d:%d)=(%d chunks,%v)", start, end, len(chunks), err))
+			}
+		}
+		chunks, err := r.Finish()
+		if err != nil || len(chunks) == 0 {
+			panic(fmt.Sprintf("Finish()=(%d chunks,%v)", len(chunks), err))
+		}
+	})
+	if allocations > 200 {
+		t.Fatalf("fragmented delimiterless event allocations=%v, want at most 200", allocations)
+	}
+}
+
 func TestStreamChunkRewriterDoesNotEndOrdinarySSEAtReadBoundary(t *testing.T) {
 	r := newStreamChunkRewriter("client")
 	r.format = "openai-response"
@@ -5414,6 +5437,61 @@ func TestStreamChunkRewriterRejectsOversizedIncompleteUnit(t *testing.T) {
 				t.Fatalf("Flush after overflow=(%q,%v), want cleared", flushed, flushErr)
 			}
 		})
+	}
+}
+
+func TestStreamChunkRewriterRejectsOversizedUnframedGeminiJSONArrayElement(t *testing.T) {
+	r := newStreamChunkRewriter("client")
+	r.format = "gemini"
+	var emitted [][]byte
+	out, err := r.Write([]byte(`[{"unfinished":"`))
+	if err != nil {
+		t.Fatalf("opening Write: %v", err)
+	}
+	emitted = append(emitted, out...)
+	if got := bytes.Join(emitted, nil); string(got) != "[" {
+		t.Fatalf("opening output=%q, want only array opener", got)
+	}
+
+	remaining := maxPendingStreamBytes - len(r.pending)
+	for remaining > 0 {
+		n := min(1<<20, remaining)
+		out, err = r.Write(bytes.Repeat([]byte("x"), n))
+		if err != nil {
+			t.Fatalf("early overflow with %d bytes remaining: %v", remaining, err)
+		}
+		if len(out) != 0 {
+			t.Fatalf("emitted partial array element: %q", out)
+		}
+		remaining -= n
+	}
+	out, err = r.Write([]byte("x"))
+	if err == nil || !strings.Contains(err.Error(), "stream pending data exceeds") {
+		t.Fatalf("overflow Write=(%q,%v)", out, err)
+	}
+	if len(out) != 0 || string(bytes.Join(emitted, nil)) != "[" {
+		t.Fatalf("emitted partial oversized array element: %q", append(emitted, out...))
+	}
+	if len(r.pending) != 0 {
+		t.Fatalf("pending after overflow=%d bytes, want cleared", len(r.pending))
+	}
+
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	emittedStream, _, _, _, err := runExecutorStreamTestWithHostContentType(rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "client",
+			Format:          "gemini",
+			SourceFormat:    "gemini",
+			Stream:          true,
+			OriginalRequest: []byte(`{"contents":[]}`),
+		},
+		StreamID: "plugin-stream-gemini-after-overflow",
+	}, []pluginapi.HostModelStreamReadResponse{
+		{Payload: []byte(`[{"modelVersion":"upstream"}]`)},
+		{Done: true},
+	}, "application/json")
+	if err != nil || len(emittedStream) == 0 || strings.Contains(strings.Join(emittedStream, ""), "upstream") {
+		t.Fatalf("subsequent forwarded stream=(%q,%v), want restored normal response", emittedStream, err)
 	}
 }
 
@@ -6686,79 +6764,139 @@ func TestRunStreamForwardClosesOnlyOversizedIncompleteStream(t *testing.T) {
 	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
 	const prefix = "data: {\"type\":\"response.output_text.delta\",\"delta\":\""
 	fragment := append([]byte(prefix), bytes.Repeat([]byte("x"), 1<<20-len(prefix))...)
-	var emitCalls, hostCloseCalls, directPluginCloseCalls, readCalls int
-	directPluginCloseError := ""
-	call := func(method string, payload any) (json.RawMessage, error) {
-		switch method {
-		case pluginabi.MethodHostModelExecuteStream:
-			return json.Marshal(pluginapi.HostModelStreamResponse{
-				StatusCode: http.StatusOK,
-				Headers:    http.Header{"Content-Type": []string{"text/event-stream"}},
-				StreamID:   "host-stream-pending-limit-1",
-			})
-		case pluginabi.MethodHostModelStreamRead:
-			readCalls++
-			return json.Marshal(pluginapi.HostModelStreamReadResponse{Payload: fragment})
-		case pluginabi.MethodHostStreamEmit:
-			emitCalls++
-			return json.Marshal(map[string]any{})
-		case pluginabi.MethodHostModelStreamClose:
-			hostCloseCalls++
-			return json.Marshal(map[string]any{})
-		case pluginabi.MethodHostStreamClose:
-			directPluginCloseCalls++
-			raw, err := json.Marshal(payload)
-			if err != nil {
-				return nil, err
+	sentinelReadError := errors.New("unexpected read after pending limit")
+	type streamState struct {
+		pluginID, hostID string
+		overflow         bool
+		readCalls        int
+		emitCalls        int
+		hostCloseCalls   int
+		pluginCloseCalls int
+		pluginCloseError string
+		emitted          []string
+	}
+	newCall := func(state *streamState) hostCaller {
+		return func(method string, payload any) (json.RawMessage, error) {
+			switch method {
+			case pluginabi.MethodHostModelExecuteStream:
+				return json.Marshal(pluginapi.HostModelStreamResponse{
+					StatusCode: http.StatusOK,
+					Headers:    http.Header{"Content-Type": []string{"text/event-stream"}},
+					StreamID:   state.hostID,
+				})
+			case pluginabi.MethodHostModelStreamRead:
+				state.readCalls++
+				if state.overflow {
+					if state.readCalls <= 17 {
+						return json.Marshal(pluginapi.HostModelStreamReadResponse{Payload: fragment})
+					}
+					return nil, sentinelReadError
+				}
+				switch state.readCalls {
+				case 1:
+					return json.Marshal(pluginapi.HostModelStreamReadResponse{Payload: []byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"upstream\",\"output\":[]}}\n\n")})
+				case 2:
+					return json.Marshal(pluginapi.HostModelStreamReadResponse{Done: true})
+				default:
+					return nil, sentinelReadError
+				}
+			case pluginabi.MethodHostStreamEmit:
+				raw, err := json.Marshal(payload)
+				if err != nil {
+					return nil, err
+				}
+				var emit struct {
+					StreamID string `json:"stream_id"`
+					Payload  []byte `json:"payload"`
+				}
+				if err := json.Unmarshal(raw, &emit); err != nil {
+					return nil, err
+				}
+				if emit.StreamID != state.pluginID {
+					return nil, fmt.Errorf("emit stream id=%q, want %q", emit.StreamID, state.pluginID)
+				}
+				state.emitCalls++
+				state.emitted = append(state.emitted, string(emit.Payload))
+				return json.Marshal(map[string]any{})
+			case pluginabi.MethodHostModelStreamClose:
+				raw, err := json.Marshal(payload)
+				if err != nil {
+					return nil, err
+				}
+				var close struct {
+					StreamID string `json:"stream_id"`
+				}
+				if err := json.Unmarshal(raw, &close); err != nil {
+					return nil, err
+				}
+				if close.StreamID != state.hostID {
+					return nil, fmt.Errorf("host close stream id=%q, want %q", close.StreamID, state.hostID)
+				}
+				state.hostCloseCalls++
+				return json.Marshal(map[string]any{})
+			case pluginabi.MethodHostStreamClose:
+				raw, err := json.Marshal(payload)
+				if err != nil {
+					return nil, err
+				}
+				var close struct {
+					StreamID string `json:"stream_id"`
+					Error    string `json:"error"`
+				}
+				if err := json.Unmarshal(raw, &close); err != nil {
+					return nil, err
+				}
+				if close.StreamID != state.pluginID {
+					return nil, fmt.Errorf("plugin close stream id=%q, want %q", close.StreamID, state.pluginID)
+				}
+				state.pluginCloseCalls++
+				state.pluginCloseError = close.Error
+				return json.Marshal(map[string]any{})
+			default:
+				return nil, fmt.Errorf("unexpected method %q", method)
 			}
-			var closePayload struct {
-				Error string `json:"error"`
-			}
-			if err := json.Unmarshal(raw, &closePayload); err != nil {
-				return nil, err
-			}
-			directPluginCloseError = closePayload.Error
-			return json.Marshal(map[string]any{})
-		default:
-			return nil, fmt.Errorf("unexpected method %q", method)
 		}
 	}
-	req := executorRPCRequest{
-		Model:           "client",
-		Format:          "openai-response",
-		SourceFormat:    "openai-response",
-		OriginalRequest: []byte(`{"model":"client","stream":true}`),
-		StreamID:        "plugin-stream-pending-limit-1",
-	}
-	stream, _, err := prepareExecutorStream(&req, call)
-	if err != nil {
-		t.Fatalf("prepareExecutorStream error = %v", err)
-	}
-	if err := runStreamForward(stream); err != nil {
-		t.Fatalf("runStreamForward error = %v, want nil after direct plugin close", err)
-	}
-	if emitCalls != 0 {
-		t.Fatalf("emit calls=%d, want 0", emitCalls)
-	}
-	if readCalls != 17 {
-		t.Fatalf("read calls=%d, want 17", readCalls)
-	}
-	if hostCloseCalls != 1 || directPluginCloseCalls != 1 {
-		t.Fatalf("close calls host=%d direct-plugin=%d, want 1, 1", hostCloseCalls, directPluginCloseCalls)
-	}
-	if !strings.Contains(directPluginCloseError, "stream pending data exceeds 16777216 bytes") || strings.Contains(directPluginCloseError, "unexpected method") {
-		t.Fatalf("direct plugin close error=%q", directPluginCloseError)
+	newRequest := func(pluginID string) executorRPCRequest {
+		return executorRPCRequest{
+			Model:           "client",
+			Format:          "openai-response",
+			SourceFormat:    "openai-response",
+			OriginalRequest: []byte(`{"model":"client","stream":true}`),
+			StreamID:        pluginID,
+		}
 	}
 
-	next := newStreamChunkRewriter("client")
-	next.format = "openai-response"
-	next.frameRawJSONAsSSE = true
-	out, err := next.Write([]byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"upstream\",\"output\":[]}}\n\n"))
-	if err != nil || len(out) == 0 {
-		t.Fatalf("next stream Write=(%d chunks,%v)", len(out), err)
+	overflow := &streamState{pluginID: "plugin-stream-pending-limit-1", hostID: "host-stream-pending-limit-1", overflow: true}
+	overflowRequest := newRequest(overflow.pluginID)
+	stream, _, err := prepareExecutorStream(&overflowRequest, newCall(overflow))
+	if err != nil {
+		t.Fatalf("prepareExecutorStream overflow error = %v", err)
 	}
-	if flushed, err := next.Finish(); err != nil || len(flushed) != 0 {
-		t.Fatalf("next stream Finish=(%q,%v)", flushed, err)
+	if err := runStreamForward(stream); err != nil {
+		t.Fatalf("runStreamForward overflow error = %v, want nil after plugin close", err)
+	}
+	if overflow.emitCalls != 0 || overflow.readCalls != 17 || overflow.hostCloseCalls != 1 || overflow.pluginCloseCalls != 1 {
+		t.Fatalf("overflow calls emit=%d read=%d host-close=%d plugin-close=%d, want 0,17,1,1", overflow.emitCalls, overflow.readCalls, overflow.hostCloseCalls, overflow.pluginCloseCalls)
+	}
+	if want := "rewrite stream chunk: stream pending data exceeds 16777216 bytes"; overflow.pluginCloseError != want {
+		t.Fatalf("overflow plugin close error=%q, want %q", overflow.pluginCloseError, want)
+	}
+
+	next := &streamState{pluginID: "plugin-stream-after-overflow", hostID: "host-stream-after-overflow"}
+	nextRequest := newRequest(next.pluginID)
+	stream, _, err = prepareExecutorStream(&nextRequest, newCall(next))
+	if err != nil {
+		t.Fatalf("prepareExecutorStream subsequent error = %v", err)
+	}
+	if err := runStreamForward(stream); err != nil {
+		t.Fatalf("runStreamForward subsequent error = %v", err)
+	}
+	if next.readCalls != 2 || next.emitCalls != 1 || next.hostCloseCalls != 1 || next.pluginCloseCalls != 1 || next.pluginCloseError != "" {
+		t.Fatalf("subsequent calls read=%d emit=%d host-close=%d plugin-close=%d error=%q, want 2,1,1,1,empty", next.readCalls, next.emitCalls, next.hostCloseCalls, next.pluginCloseCalls, next.pluginCloseError)
+	}
+	if got := strings.Join(next.emitted, ""); !strings.Contains(got, `"model":"client"`) || strings.Contains(got, "upstream") {
+		t.Fatalf("subsequent emitted=%q, want restored normal response", got)
 	}
 }
 

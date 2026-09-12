@@ -39,6 +39,25 @@ type sseRewriter struct {
 	trackDone              bool
 	sawDone                bool
 	recoverResponsesEvents bool
+	delimiterless          delimiterlessResponsesEventScanner
+}
+
+type delimiterlessResponsesEventScanner struct {
+	disabled            bool
+	headerPrefixChecked bool
+	headerComplete      bool
+	headerScan          int
+	eventType           string
+	dataStart           int
+	dataPrefixChecked   bool
+	valueReady          bool
+	valueStart          int
+	jsonScan            int
+	jsonStarted         bool
+	jsonDepth           int
+	inString            bool
+	escaped             bool
+	completeEnd         int
 }
 
 type streamChunkRewriter struct {
@@ -53,6 +72,10 @@ type streamChunkRewriter struct {
 
 func newSSERewriter(originalModel string) *sseRewriter {
 	return &sseRewriter{originalModel: originalModel}
+}
+
+func (r *sseRewriter) resetDelimiterlessResponsesEventScanner() {
+	r.delimiterless = delimiterlessResponsesEventScanner{}
 }
 
 var utf8SSEBOM = [...]byte{0xef, 0xbb, 0xbf}
@@ -139,6 +162,7 @@ func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
 	if len(r.buf) > maxPendingStreamBytes {
 		r.buf = nil
 		r.scanFrom = 0
+		r.resetDelimiterlessResponsesEventScanner()
 		return nil, fmt.Errorf("stream pending data exceeds %d bytes", maxPendingStreamBytes)
 	}
 	return out, nil
@@ -147,6 +171,7 @@ func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
 func (r *sseRewriter) Flush() ([][]byte, error) {
 	r.flushLeadingBOM()
 	if len(r.buf) == 0 {
+		r.resetDelimiterlessResponsesEventScanner()
 		return nil, nil
 	}
 	return r.drain(true)
@@ -159,13 +184,14 @@ func (r *sseRewriter) drain(eof bool) ([][]byte, error) {
 	for {
 		logicalEnd, logical := 0, false
 		if r.recoverResponsesEvents {
-			logicalEnd, logical = findDelimiterlessResponsesEventEnd(r.buf, eof)
+			logicalEnd, logical = r.findDelimiterlessResponsesEventEnd(eof)
 		}
 		standardEnd, n, next := findSSEEventDelimiter(r.buf, r.scanFrom, eof)
 		if logical && (n == 0 || logicalEnd < standardEnd) {
 			event := r.buf[:logicalEnd]
 			r.buf = r.buf[logicalEnd:]
 			r.scanFrom = 0
+			r.resetDelimiterlessResponsesEventScanner()
 			consumed = true
 			var err error
 			out, err = r.rewriteEvent(out, event)
@@ -186,6 +212,7 @@ func (r *sseRewriter) drain(eof bool) ([][]byte, error) {
 		}
 		r.buf = r.buf[standardEnd+n:]
 		r.scanFrom = 0
+		r.resetDelimiterlessResponsesEventScanner()
 		consumed = true
 		var err error
 		out, err = r.rewriteEvent(out, event)
@@ -198,6 +225,7 @@ func (r *sseRewriter) drain(eof bool) ([][]byte, error) {
 		event := r.buf
 		r.buf = nil
 		r.scanFrom = 0
+		r.resetDelimiterlessResponsesEventScanner()
 		var err error
 		out, err = r.rewriteEvent(out, event)
 		if err != nil {
@@ -207,6 +235,7 @@ func (r *sseRewriter) drain(eof bool) ([][]byte, error) {
 	if len(r.buf) == 0 {
 		r.buf = nil
 		r.scanFrom = 0
+		r.resetDelimiterlessResponsesEventScanner()
 	} else if bufferCap > maxPendingStreamBytes || (consumed && bufferCap > 2*len(r.buf)) {
 		r.buf = bytes.Clone(r.buf)
 	}
@@ -426,46 +455,144 @@ func findSSEEventDelimiter(buf []byte, start int, eof bool) (eventLen, delimLen,
 	}
 }
 
-func findDelimiterlessResponsesEventEnd(buf []byte, eof bool) (int, bool) {
-	lineEnd, lineBreakLen, _ := sseLineEnding(buf, 0, false)
-	if lineBreakLen == 0 || !bytes.HasPrefix(buf[:lineEnd], []byte("event:")) {
+func (r *sseRewriter) findDelimiterlessResponsesEventEnd(eof bool) (int, bool) {
+	buf := r.buf
+	s := &r.delimiterless
+	if s.disabled {
 		return 0, false
 	}
-	eventType := strings.TrimSpace(string(buf[len("event:"):lineEnd]))
-	if !strings.HasPrefix(eventType, "response.") {
-		return 0, false
+	if !s.headerPrefixChecked {
+		const eventField = "event:"
+		if len(buf) < len(eventField) {
+			if !bytes.Equal(buf, []byte(eventField[:len(buf)])) {
+				s.disabled = true
+			}
+			return 0, false
+		}
+		if !bytes.HasPrefix(buf, []byte(eventField)) {
+			s.disabled = true
+			return 0, false
+		}
+		s.headerPrefixChecked = true
+		s.headerScan = len(eventField)
 	}
-	dataStart := lineEnd + lineBreakLen
-	dataLine := buf[dataStart:]
-	if !bytes.HasPrefix(dataLine, []byte("data:")) {
-		return 0, false
+	if !s.headerComplete {
+		for s.headerScan < len(buf) {
+			switch buf[s.headerScan] {
+			case '\n':
+				s.dataStart = s.headerScan + 1
+			case '\r':
+				if s.headerScan+1 == len(buf) {
+					return 0, false
+				}
+				s.dataStart = s.headerScan + 1
+				if buf[s.headerScan+1] == '\n' {
+					s.dataStart++
+				}
+			default:
+				s.headerScan++
+				continue
+			}
+			s.eventType = strings.TrimSpace(string(buf[len("event:"):s.headerScan]))
+			if !strings.HasPrefix(s.eventType, "response.") {
+				s.disabled = true
+				return 0, false
+			}
+			s.headerComplete = true
+			break
+		}
+		if !s.headerComplete {
+			return 0, false
+		}
 	}
-	valueStart := dataStart + len("data:")
-	if valueStart < len(buf) && buf[valueStart] == ' ' {
-		valueStart++
+	if !s.dataPrefixChecked {
+		const dataField = "data:"
+		if len(buf) < s.dataStart+len(dataField) {
+			return 0, false
+		}
+		if !bytes.HasPrefix(buf[s.dataStart:], []byte(dataField)) {
+			s.disabled = true
+			return 0, false
+		}
+		s.dataPrefixChecked = true
 	}
-	dec := json.NewDecoder(bytes.NewReader(buf[valueStart:]))
-	var raw json.RawMessage
-	if err := dec.Decode(&raw); err != nil {
-		return 0, false
+	if !s.valueReady {
+		s.valueStart = s.dataStart + len("data:")
+		if s.valueStart == len(buf) {
+			return 0, false
+		}
+		if buf[s.valueStart] == ' ' {
+			s.valueStart++
+		}
+		s.jsonScan = s.valueStart
+		s.valueReady = true
 	}
-	var typed struct {
-		Type string `json:"type"`
+	if s.completeEnd == 0 {
+		for s.jsonScan < len(buf) {
+			b := buf[s.jsonScan]
+			if !s.jsonStarted {
+				if b == ' ' || b == '\t' || b == '\r' || b == '\n' {
+					s.jsonScan++
+					continue
+				}
+				if b != '{' {
+					s.disabled = true
+					return 0, false
+				}
+				s.jsonStarted = true
+				s.jsonDepth = 1
+				s.jsonScan++
+				continue
+			}
+			if s.inString {
+				if s.escaped {
+					s.escaped = false
+				} else if b == '\\' {
+					s.escaped = true
+				} else if b == '"' {
+					s.inString = false
+				}
+				s.jsonScan++
+				continue
+			}
+			switch b {
+			case '"':
+				s.inString = true
+			case '{', '[':
+				s.jsonDepth++
+			case '}', ']':
+				s.jsonDepth--
+				if s.jsonDepth == 0 {
+					s.completeEnd = s.jsonScan + 1
+				}
+			}
+			s.jsonScan++
+			if s.completeEnd != 0 {
+				break
+			}
+		}
+		if s.completeEnd == 0 {
+			return 0, false
+		}
+		var typed struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(buf[s.valueStart:s.completeEnd], &typed) != nil || typed.Type != s.eventType {
+			s.disabled = true
+			return 0, false
+		}
 	}
-	if json.Unmarshal(raw, &typed) != nil || typed.Type != eventType {
-		return 0, false
-	}
-	end := valueStart + int(dec.InputOffset())
-	suffix := buf[end:]
+	suffix := buf[s.completeEnd:]
 	if len(suffix) == 0 {
-		return end, eof
+		return s.completeEnd, eof
 	}
 	if bytes.HasPrefix(suffix, []byte("event:")) {
-		return end, true
+		return s.completeEnd, true
 	}
 	if bytes.HasPrefix([]byte("event:"), suffix) {
 		return 0, false
 	}
+	s.disabled = true
 	return 0, false
 }
 
@@ -898,6 +1025,7 @@ func (r *streamChunkRewriter) Finish() ([][]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	r.sse.resetDelimiterlessResponsesEventScanner()
 	if r.format == "openai" && r.frameRawJSONAsSSE && r.framedRawJSON && !r.sse.sawDone {
 		chunks = append(chunks, []byte("data: [DONE]\n\n"))
 	}
