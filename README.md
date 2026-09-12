@@ -198,6 +198,12 @@ Unframed raw JSON stream chunks preserve the bytes that separate complete JSON v
 
 When raw JSON is framed as SSE, `openai-response` and `claude` include an `event:` line from the top-level `type`. A clean `openai` Chat completion appends `data: [DONE]`, while Gemini does not append `[DONE]`.
 
+Delimiterless OpenAI Responses logical events produced by CPA's provider translators are separated by their complete JSON `data:` values before model restoration; host stream-read boundaries alone are never treated as SSE delimiters.
+
+The plugin retains at most 16 MiB for one incomplete SSE event or raw JSON value per stream. This limit does not apply to cumulative stream traffic or batches of complete events. Exceeding it closes only that stream with an error and emits no partial oversized unit.
+
+Structured host callback errors preserve their plugin ABI `code`, `message`, `retryable`, and `http_status`. Status-only mapped execution failures preserve the HTTP status with `plugin_error`; the ABI has no error-header field, so response headers such as `Retry-After` are not synthesized.
+
 ## Common use cases
 
 ### 1. Use another Upstream Model from Claude Code and similar clients without changing the Client-Requested Model
@@ -217,9 +223,9 @@ Add a scoped mapping for that inbound client API key before an unscoped mapping.
 ```powershell
 make test
 make vet
-make package VERSION=0.5.5 GOOS=windows GOARCH=amd64
-make package VERSION=0.5.5 GOOS=linux GOARCH=amd64 BUILD_CC="zig cc -target x86_64-linux-gnu.2.17"
-make package VERSION=0.5.5
+make package VERSION=0.5.6 GOOS=windows GOARCH=amd64
+make package VERSION=0.5.6 GOOS=linux GOARCH=amd64 BUILD_CC="zig cc -target x86_64-linux-gnu.2.17"
+make package VERSION=0.5.6
 ```
 
 Raw `build-platform` removes its `.version` sidecar. Successful `package-platform` writes `.version` only after compatibility inspection, and aggregate packaging accepts only matching checked sidecars for the requested release version.
