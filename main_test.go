@@ -3593,6 +3593,45 @@ func TestHandleExecutorExecuteIgnoresUnusedPayload(t *testing.T) {
 	}
 }
 
+func TestModelRouteDoesNotReuseCallerPatternWithoutBoundCredential(t *testing.T) {
+	tests := []struct {
+		name, rules, key string
+	}{
+		{name: "positive wildcard", rules: "sk-*#client=>target", key: "sk-team"},
+		{name: "inverse wildcard", rules: "#sk-*#client=>target", key: "ak-team"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setLoadedConfigForTest(Config{GlobalRules: tt.rules})
+			metadata := map[string]any{callerScopeMetadataKey: callerScope(tt.key)}
+			route := func(model string, headers http.Header) pluginapi.ModelRouteResponse {
+				raw, err := json.Marshal(pluginapi.ModelRouteRequest{
+					SourceFormat: "openai", RequestedModel: model,
+					Headers: headers, Metadata: metadata,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				responseRaw, err := handleModelRoute(raw)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var response pluginapi.ModelRouteResponse
+				if err := json.Unmarshal(responseRaw, &response); err != nil {
+					t.Fatal(err)
+				}
+				return response
+			}
+			if route("other", http.Header{"Authorization": {"Bearer " + tt.key}}).Handled {
+				t.Fatal("warm-up model unexpectedly routed")
+			}
+			if route("client", nil).Handled {
+				t.Fatal("unbound request reused a caller-pattern cache entry")
+			}
+		})
+	}
+}
+
 func TestExecutorReusesCallerPatternAfterHeadersChange(t *testing.T) {
 	tests := []struct {
 		name, rules, key, upstream string
@@ -3831,8 +3870,11 @@ func TestReconfigureRulesStackModeIsAtomic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cached route: %v", err)
 	}
-	if err := json.Unmarshal(responseRaw, &response); err != nil || !response.Handled {
-		t.Fatalf("cached route response=%s err=%v, want handled", responseRaw, err)
+	if err := json.Unmarshal(responseRaw, &response); err != nil {
+		t.Fatalf("decode cached route response: %v", err)
+	}
+	if response.Handled {
+		t.Fatal("unbound cached route unexpectedly handled")
 	}
 }
 
@@ -4359,6 +4401,33 @@ func TestStreamChunkRewriterFramesRawJSONBeforeSSEDoneInSameWrite(t *testing.T) 
 		}
 		if got := string(bytes.Join(append(chunks, finished...), nil)); got != want {
 			t.Fatalf("output=%q, want %q", got, want)
+		}
+	}
+}
+
+func TestStreamChunkRewriterFramesRawJSONBeforeSSEDoneAcrossPartitions(t *testing.T) {
+	jsonPrefix := []byte(`{"model":"upstream","choices":[]}` + "\n\n")
+	sseSuffix := []byte("data: [DONE]\n\n")
+	want := "data: {\"choices\":[],\"model\":\"client\"}\n\ndata: [DONE]\n\n"
+	for split := 0; split <= len(sseSuffix); split++ {
+		r := newStreamChunkRewriter("client")
+		r.format = "openai"
+		r.frameRawJSONAsSSE = true
+		first, err := r.Write(append(bytes.Clone(jsonPrefix), sseSuffix[:split]...))
+		if err != nil {
+			t.Fatalf("split %d first: %v", split, err)
+		}
+		second, err := r.Write(sseSuffix[split:])
+		if err != nil {
+			t.Fatalf("split %d second: %v", split, err)
+		}
+		finished, err := r.Finish()
+		if err != nil {
+			t.Fatalf("split %d finish: %v", split, err)
+		}
+		got := string(bytes.Join(append(append(first, second...), finished...), nil))
+		if got != want {
+			t.Fatalf("split %d output=%q, want %q", split, got, want)
 		}
 	}
 }
@@ -5264,24 +5333,19 @@ func TestStreamChunkRewriterEmitsCompleteJSONPrefixBeforeIncompleteTail(t *testi
 	}
 }
 
-func TestStreamChunkRewriterFlushFramesIncompleteJSONTailWhenSSE(t *testing.T) {
+func TestStreamChunkRewriterRejectsIncompleteRawJSONAtSSEFlush(t *testing.T) {
 	r := newStreamChunkRewriter("client")
+	r.format = "openai-response"
 	r.frameRawJSONAsSSE = true
-	if chunks, err := r.Write([]byte(`{"model":"upstream"`)); err != nil || len(chunks) != 0 {
-		t.Fatalf("Write=(%q,%v), want no output", chunks, err)
+	if chunks, err := r.Write([]byte(`{"type":"response.output_text.delta","delta":"hel`)); err != nil || len(chunks) != 0 {
+		t.Fatalf("Write=(%q,%v), want buffered", chunks, err)
 	}
 	chunks, err := r.Flush()
-	if err != nil {
-		t.Fatalf("Flush: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "incomplete raw JSON stream") {
+		t.Fatalf("Flush=(%q,%v), want incomplete raw JSON error", chunks, err)
 	}
-	got := flattenChunks(chunks)
-	if !strings.Contains(got, `{"model":"upstream"`) {
-		t.Fatalf("Flush output=%q, want incomplete bytes", got)
-	}
-	for _, line := range strings.Split(strings.TrimSuffix(got, "\n\n"), "\n") {
-		if !strings.HasPrefix(line, "data: ") {
-			t.Fatalf("Flush output has unframed line %q", line)
-		}
+	if len(chunks) != 0 {
+		t.Fatalf("Flush chunks=%q, want no dispatchable SSE event", chunks)
 	}
 }
 

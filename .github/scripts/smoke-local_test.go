@@ -527,3 +527,27 @@ func TestRunStreamCaseAcceptsValidData(t *testing.T) {
 		t.Fatalf("runStreamCase error = %v", err)
 	}
 }
+
+func TestRunStreamCaseRejectsDataLinesWithoutEventBoundary(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"model\":\"client\"}\ndata: [DONE]\n\n"))
+	}))
+	defer server.Close()
+	port := server.Listener.Addr().(*net.TCPAddr).Port
+	if err := runStreamCase(port, caseConfig{requestModel: "client", requestAPIKey: localAPIKey, wantOriginalModel: "client"}); err == nil {
+		t.Fatal("runStreamCase accepted two data fields as separate events")
+	}
+}
+
+func TestRunStreamCaseAcceptsMultiDataJSONEvent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"model\":\ndata: \"client\"}\n\ndata: [DONE]\n\n"))
+	}))
+	defer server.Close()
+	port := server.Listener.Addr().(*net.TCPAddr).Port
+	if err := runStreamCase(port, caseConfig{requestModel: "client", requestAPIKey: localAPIKey, wantOriginalModel: "client"}); err != nil {
+		t.Fatalf("runStreamCase error = %v", err)
+	}
+}

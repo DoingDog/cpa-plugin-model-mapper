@@ -192,7 +192,7 @@ Response restoration changes only these paths:
 
 When model restoration changes nonstream response bytes, the plugin removes `Content-Length`, `Content-Digest`, `Repr-Digest`, `Digest`, `Content-MD5`, `ETag`, and `Content-Range`; it preserves them when unchanged. Mapped streams remove that response body-dependent set plus `Transfer-Encoding` before forwarding.
 
-Opaque response content and tool text are not recursively rewritten. Before closing the plugin stream after a read error, the plugin flushes pending rewritten bytes.
+Opaque response content and tool text are not recursively rewritten. Before closing the plugin stream after a read error, the plugin flushes complete pending SSE bytes; incomplete raw JSON is rejected instead of being emitted as an invalid SSE event.
 
 Unframed raw JSON stream chunks preserve the bytes that separate complete JSON values. Gemini streamed JSON arrays restore the top-level `modelVersion` of each object element. Gemini raw core chunks are not double-framed.
 
@@ -217,9 +217,9 @@ Add a scoped mapping for that inbound client API key before an unscoped mapping.
 ```powershell
 make test
 make vet
-make package VERSION=0.5.4 GOOS=windows GOARCH=amd64
-make package VERSION=0.5.4 GOOS=linux GOARCH=amd64 BUILD_CC="zig cc -target x86_64-linux-gnu.2.17"
-make package VERSION=0.5.4
+make package VERSION=0.5.5 GOOS=windows GOARCH=amd64
+make package VERSION=0.5.5 GOOS=linux GOARCH=amd64 BUILD_CC="zig cc -target x86_64-linux-gnu.2.17"
+make package VERSION=0.5.5
 ```
 
 Raw `build-platform` removes its `.version` sidecar. Successful `package-platform` writes `.version` only after compatibility inspection, and aggregate packaging accepts only matching checked sidecars for the requested release version.

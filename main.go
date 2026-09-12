@@ -525,7 +525,7 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 		var raw json.RawMessage
 		if dec.Decode(&raw) == nil {
 			suffix := bytes.TrimLeft(p[dec.InputOffset():], " \t\r\n")
-			if len(suffix) > 0 && isSSEChunk(suffix) {
+			if len(suffix) > 0 && (isSSEChunk(suffix) || isIncompleteSSEPrefix(suffix)) {
 				restored, _, err := r.sse.restoreResponseModel(raw)
 				if err != nil {
 					return nil, err
@@ -649,11 +649,10 @@ func (r *streamChunkRewriter) rawJSONChunks(p []byte) ([][]byte, error) {
 		return [][]byte{bytes.Clone(p)}, nil
 	}
 	if incomplete {
-		fallback := bytes.Clone(p)
 		if r.frameRawJSONAsSSE {
-			fallback = frameSSEData(fallback)
+			return nil, fmt.Errorf("incomplete raw JSON stream")
 		}
-		return [][]byte{fallback}, nil
+		return [][]byte{bytes.Clone(p)}, nil
 	}
 	return chunks, nil
 }
@@ -1276,6 +1275,10 @@ func handleModelRoute(raw []byte) ([]byte, error) {
 }
 
 func routeModel(cfg Config, format, model, scope, key string) (routeDecision, error) {
+	return routeModelWithCallerCache(cfg, format, model, scope, key, false)
+}
+
+func routeModelWithCallerCache(cfg Config, format, model, scope, key string, allowUnboundCache bool) (routeDecision, error) {
 	if !cfg.compiled {
 		var err error
 		cfg, err = compileConfig(cfg)
@@ -1287,13 +1290,13 @@ func routeModel(cfg Config, format, model, scope, key string) (routeDecision, er
 	if len(selection.first) == 0 {
 		return routeDecision{}, nil
 	}
-	mapped, matched, err := applyRules(model, scope, key, selection.first)
+	mapped, matched, err := applyRulesWithCallerCache(model, scope, key, selection.first, allowUnboundCache)
 	if err != nil {
 		return routeDecision{}, err
 	}
 	if len(selection.second) > 0 {
 		var secondMatched bool
-		mapped, secondMatched, err = applyRules(mapped, scope, key, selection.second)
+		mapped, secondMatched, err = applyRulesWithCallerCache(mapped, scope, key, selection.second, allowUnboundCache)
 		if err != nil {
 			return routeDecision{}, err
 		}
@@ -1502,7 +1505,7 @@ func (s *executorStream) emit(payload []byte) error {
 func prepareExecutorStream(req *executorRPCRequest, call hostCaller) (*executorStream, http.Header, error) {
 	scope := callerScopeFromMetadata(req.Metadata)
 	cfg := loadedConfig()
-	decision, err := routeModel(cfg, req.SourceFormat, req.Model, scope, callerAPIKeyForSelectedRules(cfg, req.SourceFormat, req.Headers, req.Query, scope))
+	decision, err := routeModelWithCallerCache(cfg, req.SourceFormat, req.Model, scope, callerAPIKeyForSelectedRules(cfg, req.SourceFormat, req.Headers, req.Query, scope), true)
 	if err != nil {
 		return nil, nil, fmt.Errorf("route stream: %w", err)
 	}
@@ -1726,7 +1729,7 @@ func handleExecutorExecute(raw []byte, call hostCaller) ([]byte, error) {
 	canonicalizeHeaders(req.Headers)
 	scope := callerScopeFromMetadata(req.Metadata)
 	cfg := loadedConfig()
-	decision, err := routeModel(cfg, req.SourceFormat, req.Model, scope, callerAPIKeyForSelectedRules(cfg, req.SourceFormat, req.Headers, req.Query, scope))
+	decision, err := routeModelWithCallerCache(cfg, req.SourceFormat, req.Model, scope, callerAPIKeyForSelectedRules(cfg, req.SourceFormat, req.Headers, req.Query, scope), true)
 	if err != nil {
 		return nil, err
 	}
@@ -2784,6 +2787,14 @@ func applyASCIIModelCase(model string, operation caseOperation) string {
 }
 
 func callerPatternMatch(r *rule, scope, key string) (bool, bool) {
+	return callerPatternMatchWithCallerCache(r, scope, key, false)
+}
+
+func callerPatternMatchWithCallerCache(r *rule, scope, key string, allowUnboundCache bool) (bool, bool) {
+	authenticated := key != "" && callerScope(key) == scope
+	if !allowUnboundCache && !authenticated {
+		return false, false
+	}
 	cacheKey := callerPatternCacheKey{scope: scope, pattern: r.callerPatternText}
 	callerPatternCacheMu.RLock()
 	matched, ok := callerPatternCache.current[cacheKey]
@@ -2794,7 +2805,7 @@ func callerPatternMatch(r *rule, scope, key string) (bool, bool) {
 	if ok {
 		return matched, true
 	}
-	if key == "" || callerScope(key) != scope {
+	if !authenticated {
 		return false, false
 	}
 	_, matched = matchTokens(key, r.callerPattern)
@@ -2815,6 +2826,10 @@ func callerPatternMatch(r *rule, scope, key string) (bool, bool) {
 }
 
 func callerMatchesRule(r *rule, scope, key string) bool {
+	return callerMatchesRuleWithCallerCache(r, scope, key, false)
+}
+
+func callerMatchesRuleWithCallerCache(r *rule, scope, key string, allowUnboundCache bool) bool {
 	if r.callerScope == "" && len(r.callerPattern) == 0 {
 		return true
 	}
@@ -2824,7 +2839,7 @@ func callerMatchesRule(r *rule, scope, key string) bool {
 	matched := r.callerScope == scope
 	if len(r.callerPattern) > 0 {
 		var ok bool
-		matched, ok = callerPatternMatch(r, scope, key)
+		matched, ok = callerPatternMatchWithCallerCache(r, scope, key, allowUnboundCache)
 		if !ok {
 			return false
 		}
@@ -2833,11 +2848,15 @@ func callerMatchesRule(r *rule, scope, key string) bool {
 }
 
 func applyRules(model, scope, key string, rules []rule) (string, bool, error) {
+	return applyRulesWithCallerCache(model, scope, key, rules, false)
+}
+
+func applyRulesWithCallerCache(model, scope, key string, rules []rule, allowUnboundCache bool) (string, bool, error) {
 	current := model
 	matchedAny := false
 	for i := range rules {
 		r := &rules[i]
-		if !callerMatchesRule(r, scope, key) {
+		if !callerMatchesRuleWithCallerCache(r, scope, key, allowUnboundCache) {
 			continue
 		}
 		if r.caseOperation != caseOperationNone {

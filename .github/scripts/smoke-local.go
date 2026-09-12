@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -507,24 +506,23 @@ func runStreamCase(port int, tc caseConfig) error {
 	if status/100 != 2 {
 		return fmt.Errorf("want stream success, got status=%d body=%s", status, body)
 	}
+	return validateOpenAIStream(body, tc)
+}
+
+func validateOpenAIStream(body []byte, tc caseConfig) error {
 	sawDone := false
 	sawOriginal := false
-	scanner := bufio.NewScanner(bytes.NewReader(body))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if !strings.HasPrefix(line, "data:") {
-			continue
+	dispatch := func(payload string) error {
+		trimmed := strings.TrimSpace(payload)
+		if trimmed == "" {
+			return nil
 		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if payload == "" {
-			continue
-		}
-		if payload == "[DONE]" {
+		if trimmed == "[DONE]" {
 			sawDone = true
-			continue
+			return nil
 		}
 		var parsed openAIResponse
-		if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+		if err := json.Unmarshal([]byte(trimmed), &parsed); err != nil {
 			return fmt.Errorf("decode streamed data %q: %w", payload, err)
 		}
 		hasError := len(parsed.Error) != 0 && !bytes.Equal(bytes.TrimSpace(parsed.Error), []byte("null"))
@@ -537,9 +535,38 @@ func runStreamCase(port int, tc caseConfig) error {
 		if tc.forbidModel != "" && parsed.Model == tc.forbidModel {
 			return fmt.Errorf("forbid streamed model %q in payload=%s", tc.forbidModel, payload)
 		}
+		return nil
 	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("scan stream: %w", err)
+
+	normalized := bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
+	normalized = bytes.ReplaceAll(normalized, []byte("\r"), []byte("\n"))
+	lines := bytes.Split(normalized, []byte("\n"))
+	var data []string
+	for i, line := range lines {
+		if i == len(lines)-1 && len(line) == 0 {
+			break
+		}
+		if len(line) == 0 {
+			if err := dispatch(strings.Join(data, "\n")); err != nil {
+				return err
+			}
+			data = nil
+			continue
+		}
+		if bytes.Equal(line, []byte("data")) {
+			data = append(data, "")
+			continue
+		}
+		if bytes.HasPrefix(line, []byte("data:")) {
+			value := line[len("data:"):]
+			if len(value) > 0 && value[0] == ' ' {
+				value = value[1:]
+			}
+			data = append(data, string(value))
+		}
+	}
+	if len(data) > 0 {
+		return fmt.Errorf("unterminated SSE data event")
 	}
 	if !sawOriginal {
 		return fmt.Errorf("missing original streamed model %q in body=%s", tc.wantOriginalModel, body)

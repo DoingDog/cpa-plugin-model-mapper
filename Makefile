@@ -91,7 +91,7 @@ smoke-local:
 	@host_goos="$$( $(GO) env GOHOSTOS )"; \
 	host_goarch="$$( $(GO) env GOHOSTARCH )"; \
 	$(MAKE) --no-print-directory build-platform GOOS="$$host_goos" GOARCH="$$host_goarch" GO="$(GO)" DIST_DIR="$(DIST_DIR)" PLUGIN_NAME="$(PLUGIN_NAME)"
-	$(GO) run .github/scripts/smoke-local.go
+	GOOS= GOARCH= CGO_ENABLED= $(GO) run .github/scripts/smoke-local.go
 
 clean:
 	rm -rf $(DIST_DIR)

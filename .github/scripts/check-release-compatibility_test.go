@@ -176,6 +176,7 @@ func TestMakeSmokeLocalIgnoresExportedTargetVariables(t *testing.T) {
 	tempDir := t.TempDir()
 	fakeGo := filepath.Join(tempDir, "go")
 	logPath := filepath.Join(tempDir, "build-platform")
+	runLogPath := filepath.Join(tempDir, "smoke-run")
 	if err := os.WriteFile(fakeGo, []byte(`#!/bin/sh
 case "$1:$2" in
 env:GOHOSTOS) printf '%s\n' linux ;;
@@ -183,6 +184,7 @@ env:GOHOSTARCH) printf '%s\n' amd64 ;;
 env:GOOS) printf '%s\n' windows ;;
 env:GOARCH) printf '%s\n' arm64 ;;
 build:*) printf '%s/%s\n' "$GOOS" "$GOARCH" > "$SMOKE_LOG" ;;
+run:*) printf 'GOOS=%s GOARCH=%s CGO_ENABLED=%s\n' "$GOOS" "$GOARCH" "$CGO_ENABLED" > "$SMOKE_RUN_LOG" ;;
 esac
 `), 0o755); err != nil {
 		t.Fatal(err)
@@ -194,7 +196,7 @@ esac
 		"DIST_DIR="+filepath.ToSlash(filepath.Join(tempDir, "dist")),
 	)
 	cmd.Dir = repoRoot
-	cmd.Env = append(os.Environ(), "GOOS=windows", "GOARCH=arm64", "SMOKE_LOG="+filepath.ToSlash(logPath))
+	cmd.Env = append(os.Environ(), "GOOS=windows", "GOARCH=arm64", "CGO_ENABLED=1", "SMOKE_LOG="+filepath.ToSlash(logPath), "SMOKE_RUN_LOG="+filepath.ToSlash(runLogPath))
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("make smoke-local: %v\n%s", err, output)
 	}
@@ -204,6 +206,13 @@ esac
 	}
 	if string(got) != "linux/amd64\n" {
 		t.Fatalf("build target = %q, want host linux/amd64", got)
+	}
+	runGot, err := os.ReadFile(runLogPath)
+	if err != nil {
+		t.Fatalf("read smoke run: %v", err)
+	}
+	if string(runGot) != "GOOS= GOARCH= CGO_ENABLED=\n" {
+		t.Fatalf("smoke run environment = %q, want cleared target variables", runGot)
 	}
 }
 

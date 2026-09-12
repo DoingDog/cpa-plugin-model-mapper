@@ -37,7 +37,7 @@ Important model-rewrite invariants:
 - Response restoration is deliberately whitelisted to `model`, `modelVersion`, `response.model`, `response.modelVersion`, `message.model`, and `interaction.model`. Do not replace recursively through arbitrary content/tool text. When model restoration changes nonstream response bytes, remove `Content-Length`, `Content-Digest`, `Repr-Digest`, `Digest`, `Content-MD5`, `ETag`, and `Content-Range`; preserve them when unchanged.
 - Case operations change ASCII English letters only and do not make later mappings case-insensitive.
 - Mapped streams remove that response body-dependent set plus `Transfer-Encoding` before forwarding. Streaming responses pass through `streamChunkRewriter`, which handles complete SSE events, split SSE prefixes, unterminated SSE data at flush time, raw JSON chunks, line/space-delimited JSON values, and raw JSON that must be framed as SSE for Responses SSE clients. Gemini raw core chunks are not double-framed.
-- On a host stream read error, flush pending rewritten bytes before closing the plugin stream so clients do not hang waiting for buffered output.
+- On a host stream read error, flush valid pending SSE bytes before closing the plugin stream so clients do not hang waiting for buffered output. Framed incomplete raw JSON returns an error and emits no SSE event.
 
 ## Release and packaging
 
