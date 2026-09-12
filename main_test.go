@@ -4308,6 +4308,111 @@ func TestStreamChunkRewriterDoesNotTreatReadBoundaryAsLineEnding(t *testing.T) {
 	}
 }
 
+func requireValidResponsesSSE(t *testing.T, stream []byte, wantEvents int) {
+	t.Helper()
+	frames := bytes.Split(bytes.TrimSuffix(stream, []byte("\n\n")), []byte("\n\n"))
+	if len(frames) != wantEvents {
+		t.Fatalf("SSE frames=%d, want %d: %q", len(frames), wantEvents, stream)
+	}
+	for _, frame := range frames {
+		var data [][]byte
+		for _, line := range bytes.Split(frame, []byte("\n")) {
+			if bytes.HasPrefix(line, []byte("data:")) {
+				data = append(data, bytes.TrimPrefix(bytes.TrimPrefix(line, []byte("data:")), []byte(" ")))
+			}
+		}
+		payload := bytes.Join(data, []byte("\n"))
+		if !json.Valid(payload) {
+			t.Fatalf("invalid SSE data JSON %q in frame %q", payload, frame)
+		}
+	}
+}
+
+func TestStreamChunkRewriterSeparatesDelimiterlessKimiResponsesEvents(t *testing.T) {
+	parts := [][]byte{
+		[]byte("event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":1,\"response\":{\"status\":\"in_progress\",\"model\":\"kimi-k3\"}}"),
+		[]byte("event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"sequence_number\":2,\"response\":{\"status\":\"in_progress\",\"model\":\"kimi-k3\"}}"),
+	}
+	r := newStreamChunkRewriter("claude-opus-5")
+	r.format = "openai-response"
+	r.frameRawJSONAsSSE = true
+	var chunks [][]byte
+	for _, part := range parts {
+		written, err := r.Write(part)
+		if err != nil {
+			t.Fatal(err)
+		}
+		chunks = append(chunks, written...)
+	}
+	finished, err := r.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := bytes.Join(append(chunks, finished...), nil)
+	requireValidResponsesSSE(t, got, 2)
+	if bytes.Contains(got, []byte("kimi-k3")) || bytes.Count(got, []byte(`"model":"claude-opus-5"`)) != 2 || bytes.Contains(got, []byte("}event:")) {
+		t.Fatalf("rewritten stream=%q", got)
+	}
+}
+
+func rewriteResponsesParts(t *testing.T, parts ...[]byte) []byte {
+	t.Helper()
+	r := newStreamChunkRewriter("claude-opus-5")
+	r.format = "openai-response"
+	r.frameRawJSONAsSSE = true
+	var chunks [][]byte
+	for _, part := range parts {
+		written, err := r.Write(part)
+		if err != nil {
+			t.Fatal(err)
+		}
+		chunks = append(chunks, written...)
+	}
+	finished, err := r.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bytes.Join(append(chunks, finished...), nil)
+}
+
+func TestStreamChunkRewriterDelimiterlessResponsesPartitionInvariant(t *testing.T) {
+	input := []byte("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"model\":\"kimi-k3\"}}event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{\"model\":\"kimi-k3\"}}")
+	want := rewriteResponsesParts(t, input)
+	requireValidResponsesSSE(t, want, 2)
+	for split := 0; split <= len(input); split++ {
+		got := rewriteResponsesParts(t, input[:split], input[split:])
+		if !bytes.Equal(got, want) {
+			t.Fatalf("split=%d output=%q, want %q", split, got, want)
+		}
+	}
+	parts := make([][]byte, len(input))
+	for i := range input {
+		parts[i] = input[i : i+1]
+	}
+	if got := rewriteResponsesParts(t, parts...); !bytes.Equal(got, want) {
+		t.Fatalf("one-byte output=%q, want %q", got, want)
+	}
+}
+
+func TestStreamChunkRewriterDoesNotEndOrdinarySSEAtReadBoundary(t *testing.T) {
+	r := newStreamChunkRewriter("client")
+	r.format = "openai-response"
+	r.frameRawJSONAsSSE = true
+	first := []byte("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"model\":\"upstream\"}}")
+	if out, err := r.Write(first); err != nil || len(out) != 0 {
+		t.Fatalf("first Write=(%q,%v), want buffered", out, err)
+	}
+	second := []byte("\nid: event-1\n\n")
+	out, err := r.Write(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := bytes.Join(out, nil)
+	if !bytes.Contains(got, []byte("id: event-1")) || !bytes.Contains(got, []byte(`"model":"client"`)) {
+		t.Fatalf("output=%q", got)
+	}
+}
+
 func TestFrameSSEDataSupportsAllSSELineEndings(t *testing.T) {
 	cases := []struct{ input, want string }{
 		{`{"a":1}` + "\n" + `{"b":2}`, "data: {\"a\":1}\ndata: {\"b\":2}\n\n"},
@@ -5876,6 +5981,152 @@ func TestRunStreamForwardTerminatesReframedOpenAIChat(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRunStreamForwardSeparatesDelimiterlessKimiResponsesLifecycle(t *testing.T) {
+	setLoadedConfigForTest(Config{CodexResponsesRules: "claude-opus-5=>kimi-k3"})
+	eventTypes := []string{
+		"response.created",
+		"response.in_progress",
+		"response.output_item.added",
+		"response.content_part.added",
+		"response.output_text.delta",
+		"response.output_text.done",
+		"response.content_part.done",
+		"response.output_item.done",
+		"response.completed",
+	}
+	payloads := []string{
+		`{"type":"response.created","response":{"id":"resp_1","status":"in_progress","model":"kimi-k3"}}`,
+		`{"type":"response.in_progress","response":{"id":"resp_1","status":"in_progress","model":"kimi-k3"}}`,
+		`{"type":"response.output_item.added","output_index":0,"item":{"id":"item_1","type":"message","role":"assistant","status":"in_progress"}}`,
+		`{"type":"response.content_part.added","item_id":"item_1","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}`,
+		`{"type":"response.output_text.delta","item_id":"item_1","output_index":0,"content_index":0,"delta":"x"}`,
+		`{"type":"response.output_text.done","item_id":"item_1","output_index":0,"content_index":0,"text":"x"}`,
+		`{"type":"response.content_part.done","item_id":"item_1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"x"}}`,
+		`{"type":"response.output_item.done","output_index":0,"item":{"id":"item_1","type":"message","role":"assistant","status":"completed"}}`,
+		`{"type":"response.completed","response":{"id":"resp_1","status":"completed","model":"kimi-k3"}}`,
+	}
+	newRequest := func() rpcExecutorRequest {
+		return rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "claude-opus-5",
+			Format:          "openai-response",
+			SourceFormat:    "openai-response",
+			Stream:          true,
+			OriginalRequest: []byte(`{"model":"claude-opus-5","stream":true}`),
+		}, StreamID: "plugin-stream-kimi-responses"}
+	}
+	newReads := func(lastError string) []pluginapi.HostModelStreamReadResponse {
+		reads := make([]pluginapi.HostModelStreamReadResponse, len(payloads))
+		for i := range payloads {
+			reads[i].Payload = []byte("event: " + eventTypes[i] + "\ndata: " + payloads[i])
+		}
+		reads[len(reads)-1].Done = lastError == ""
+		reads[len(reads)-1].Error = lastError
+		return reads
+	}
+	assertLifecycle := func(t *testing.T, emitted []string) {
+		t.Helper()
+		joined := []byte(strings.Join(emitted, ""))
+		requireValidResponsesSSE(t, joined, 9)
+		if bytes.Contains(joined, []byte("kimi-k3")) || bytes.Count(joined, []byte(`"model":"claude-opus-5"`)) != 3 {
+			t.Fatalf("emitted=%q", joined)
+		}
+	}
+
+	t.Run("complete", func(t *testing.T) {
+		emitted, closedHost, closedPlugin, _, err := runExecutorStreamTest(newRequest(), newReads(""))
+		if err != nil {
+			t.Fatalf("handleExecutorExecuteStream error = %v", err)
+		}
+		if !closedHost || !closedPlugin {
+			t.Fatalf("closedHost=%v, closedPlugin=%v", closedHost, closedPlugin)
+		}
+		assertLifecycle(t, emitted)
+	})
+
+	t.Run("error with payload", func(t *testing.T) {
+		reads := newReads("upstream failed")
+		var emitted []string
+		var closedHost bool
+		var closedPlugin bool
+		var closeError string
+		pluginDone := make(chan struct{})
+		var closeOnce sync.Once
+		closePlugin := func(errText string) {
+			closeOnce.Do(func() {
+				closedPlugin = true
+				closeError = errText
+				close(pluginDone)
+			})
+		}
+		call := func(method string, payload any) (json.RawMessage, error) {
+			switch method {
+			case pluginabi.MethodHostModelExecuteStream:
+				return json.Marshal(pluginapi.HostModelStreamResponse{StatusCode: http.StatusOK, StreamID: "host-stream-kimi-responses", Headers: http.Header{"Content-Type": {"text/event-stream"}}})
+			case pluginabi.MethodHostModelStreamRead:
+				next := reads[0]
+				reads = reads[1:]
+				return json.Marshal(next)
+			case pluginabi.MethodHostStreamEmit:
+				var emit struct {
+					Payload []byte `json:"payload"`
+				}
+				raw, err := json.Marshal(payload)
+				if err != nil {
+					return nil, err
+				}
+				if err := json.Unmarshal(raw, &emit); err != nil {
+					return nil, err
+				}
+				emitted = append(emitted, string(emit.Payload))
+				return json.Marshal(map[string]any{})
+			case pluginabi.MethodHostModelStreamClose:
+				closedHost = true
+				return json.Marshal(map[string]any{})
+			case pluginabi.MethodHostStreamClose:
+				var closePayload struct {
+					Error string `json:"error"`
+				}
+				raw, err := json.Marshal(payload)
+				if err != nil {
+					return nil, err
+				}
+				if err := json.Unmarshal(raw, &closePayload); err != nil {
+					return nil, err
+				}
+				closePlugin(closePayload.Error)
+				return json.Marshal(map[string]any{})
+			default:
+				return nil, fmt.Errorf("unexpected method %q", method)
+			}
+		}
+		directRequest := executorRPCRequest{
+			Model:           "claude-opus-5",
+			Format:          "openai-response",
+			SourceFormat:    "openai-response",
+			OriginalRequest: []byte(`{"model":"claude-opus-5","stream":true}`),
+			StreamID:        "plugin-stream-kimi-responses",
+		}
+		if _, err := startExecutorStream(directRequest, call, func(_ string, errText string) error {
+			closePlugin(errText)
+			return nil
+		}); err != nil {
+			t.Fatalf("startExecutorStream error = %v", err)
+		}
+		select {
+		case <-pluginDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("stream forwarder did not close plugin stream")
+		}
+		if !closedHost || !closedPlugin {
+			t.Fatalf("closedHost=%v, closedPlugin=%v", closedHost, closedPlugin)
+		}
+		if !strings.Contains(closeError, "upstream failed") {
+			t.Fatalf("plugin close error=%q, want upstream failure", closeError)
+		}
+		assertLifecycle(t, emitted)
+	})
 }
 
 func TestRunStreamForwardDoesNotFabricateDoneOnError(t *testing.T) {

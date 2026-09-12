@@ -28,14 +28,15 @@ func main() {}
 var pluginVersion = "0.0.0-dev"
 
 type sseRewriter struct {
-	originalModel string
-	encodedModel  json.RawMessage
-	buf           []byte
-	scanFrom      int
-	bomPrefix     []byte
-	bomDone       bool
-	trackDone     bool
-	sawDone       bool
+	originalModel          string
+	encodedModel           json.RawMessage
+	buf                    []byte
+	scanFrom               int
+	bomPrefix              []byte
+	bomDone                bool
+	trackDone              bool
+	sawDone                bool
+	recoverResponsesEvents bool
 }
 
 type streamChunkRewriter struct {
@@ -145,17 +146,34 @@ func (r *sseRewriter) drain(eof bool) ([][]byte, error) {
 	var out [][]byte
 	consumed := false
 	for {
-		delim, n, next := findSSEEventDelimiter(r.buf, r.scanFrom, eof)
+		logicalEnd, logical := 0, false
+		if r.recoverResponsesEvents {
+			logicalEnd, logical = findDelimiterlessResponsesEventEnd(r.buf, eof)
+		}
+		standardEnd, n, next := findSSEEventDelimiter(r.buf, r.scanFrom, eof)
+		if logical && (n == 0 || logicalEnd < standardEnd) {
+			event := r.buf[:logicalEnd]
+			r.buf = r.buf[logicalEnd:]
+			r.scanFrom = 0
+			consumed = true
+			var err error
+			out, err = r.rewriteEvent(out, event)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, []byte("\n\n"))
+			continue
+		}
 		if n == 0 {
 			r.scanFrom = next
 			break
 		}
-		event := r.buf[:delim]
-		delimiter := r.buf[delim : delim+n : delim+n]
+		event := r.buf[:standardEnd]
+		delimiter := r.buf[standardEnd : standardEnd+n : standardEnd+n]
 		if cap(r.buf) >= 1<<20 {
 			delimiter = bytes.Clone(delimiter)
 		}
-		r.buf = r.buf[delim+n:]
+		r.buf = r.buf[standardEnd+n:]
 		r.scanFrom = 0
 		consumed = true
 		var err error
@@ -399,6 +417,49 @@ func findSSEEventDelimiter(buf []byte, start int, eof bool) (eventLen, delimLen,
 	}
 }
 
+func findDelimiterlessResponsesEventEnd(buf []byte, eof bool) (int, bool) {
+	lineEnd, lineBreakLen, _ := sseLineEnding(buf, 0, false)
+	if lineBreakLen == 0 || !bytes.HasPrefix(buf[:lineEnd], []byte("event:")) {
+		return 0, false
+	}
+	eventType := strings.TrimSpace(string(buf[len("event:"):lineEnd]))
+	if !strings.HasPrefix(eventType, "response.") {
+		return 0, false
+	}
+	dataStart := lineEnd + lineBreakLen
+	dataLine := buf[dataStart:]
+	if !bytes.HasPrefix(dataLine, []byte("data:")) {
+		return 0, false
+	}
+	valueStart := dataStart + len("data:")
+	if valueStart < len(buf) && buf[valueStart] == ' ' {
+		valueStart++
+	}
+	dec := json.NewDecoder(bytes.NewReader(buf[valueStart:]))
+	var raw json.RawMessage
+	if err := dec.Decode(&raw); err != nil {
+		return 0, false
+	}
+	var typed struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(raw, &typed) != nil || typed.Type != eventType {
+		return 0, false
+	}
+	end := valueStart + int(dec.InputOffset())
+	suffix := buf[end:]
+	if len(suffix) == 0 {
+		return end, eof
+	}
+	if bytes.HasPrefix(suffix, []byte("event:")) {
+		return end, true
+	}
+	if bytes.HasPrefix([]byte("event:"), suffix) {
+		return 0, false
+	}
+	return 0, false
+}
+
 func sseEventDelimiter(buf []byte, start int) (eventLen, delimLen, next int) {
 	return findSSEEventDelimiter(buf, start, false)
 }
@@ -460,6 +521,7 @@ func hasSSEDoneEvent(p []byte) bool {
 
 func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 	r.sse.trackDone = r.format == "openai"
+	r.sse.recoverResponsesEvents = r.format == "openai-response"
 	if !r.sse.bomDone {
 		p = r.sse.consumeLeadingBOM(p)
 		if len(p) == 0 && !r.sse.bomDone {
