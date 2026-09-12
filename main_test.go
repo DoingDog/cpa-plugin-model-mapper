@@ -5308,7 +5308,7 @@ func TestStreamChunkRewriterRawJSONArrayBuffersOnlyCurrentElement(t *testing.T) 
 	}
 }
 
-func TestStreamChunkRewriterRawJSONArrayRetainsOwnedPendingCapacity(t *testing.T) {
+func TestStreamChunkRewriterRawJSONArrayRetainsCopiedPendingData(t *testing.T) {
 	r := newStreamChunkRewriter("client")
 	first := []byte(`[{"x":"` + strings.Repeat("a", 10))
 	second := []byte(strings.Repeat("b", 8))
@@ -5322,9 +5322,6 @@ func TestStreamChunkRewriterRawJSONArrayRetainsOwnedPendingCapacity(t *testing.T
 		t.Fatal(err)
 	}
 	chunks = append(chunks, more...)
-	if cap(r.pending) <= len(r.pending) {
-		t.Fatalf("pending capacity=%d, length=%d, want retained spare capacity after reallocation", cap(r.pending), len(r.pending))
-	}
 
 	first[2] = 'z'
 	second[0] = 'z'
@@ -5337,6 +5334,84 @@ func TestStreamChunkRewriterRawJSONArrayRetainsOwnedPendingCapacity(t *testing.T
 	}
 	if got, want := string(bytes.Join(chunks, nil)), `[{"x":"aaaaaaaaaabbbbbbbb"}]`; got != want {
 		t.Fatalf("output=%q, want %q", got, want)
+	}
+}
+
+func TestStreamChunkRewriterRejectsOversizedIncompleteUnit(t *testing.T) {
+	tests := []struct {
+		name, prefix string
+		configure    func(*streamChunkRewriter)
+	}{
+		{name: "sse", prefix: "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"", configure: func(r *streamChunkRewriter) {
+			r.format = "openai-response"
+			r.frameRawJSONAsSSE = true
+		}},
+		{name: "raw json", prefix: "{\"type\":\"response.output_text.delta\",\"delta\":\"", configure: func(r *streamChunkRewriter) {
+			r.format = "openai-response"
+			r.frameRawJSONAsSSE = true
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := newStreamChunkRewriter("client")
+			tt.configure(r)
+			var emitted [][]byte
+			prefix := []byte(tt.prefix)
+			out, err := r.Write(prefix)
+			if err != nil {
+				t.Fatalf("prefix Write: %v", err)
+			}
+			emitted = append(emitted, out...)
+			remaining := maxPendingStreamBytes - len(prefix)
+			for remaining > 0 {
+				n := min(1<<20, remaining)
+				out, err = r.Write(bytes.Repeat([]byte("x"), n))
+				if err != nil {
+					t.Fatalf("early overflow with %d bytes remaining: %v", remaining, err)
+				}
+				emitted = append(emitted, out...)
+				remaining -= n
+			}
+			out, err = r.Write([]byte("x"))
+			if err == nil || !strings.Contains(err.Error(), "stream pending data exceeds") {
+				t.Fatalf("overflow Write=(%q,%v)", out, err)
+			}
+			if len(out) != 0 || len(emitted) != 0 {
+				t.Fatalf("emitted partial oversized unit: %q", append(emitted, out...))
+			}
+			if flushed, flushErr := r.Flush(); flushErr != nil || len(flushed) != 0 {
+				t.Fatalf("Flush after overflow=(%q,%v), want cleared", flushed, flushErr)
+			}
+		})
+	}
+}
+
+func TestStreamChunkRewriterPendingLimitAllowsLargeCompleteTraffic(t *testing.T) {
+	largeText := strings.Repeat("x", 1<<20)
+	for _, framed := range []bool{false, true} {
+		r := newStreamChunkRewriter("client")
+		r.format = "openai-response"
+		r.frameRawJSONAsSSE = framed
+		payload := []byte(`{"type":"response.output_text.delta","delta":"` + largeText + `"}`)
+		out, err := r.Write(payload)
+		if err != nil || len(out) == 0 {
+			t.Fatalf("framed=%v large complete Write=(%d chunks,%v)", framed, len(out), err)
+		}
+	}
+
+	unit := []byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"" + strings.Repeat("x", 64<<10) + "\"}\n\n")
+	r := newStreamChunkRewriter("client")
+	r.format = "openai-response"
+	r.frameRawJSONAsSSE = true
+	var total int
+	for total <= maxPendingStreamBytes {
+		out, err := r.Write(unit)
+		if err != nil || len(out) == 0 {
+			t.Fatalf("total=%d Write=(%d chunks,%v)", total, len(out), err)
+		}
+		for _, chunk := range out {
+			total += len(chunk)
+		}
 	}
 }
 
@@ -6567,6 +6642,79 @@ func TestRunStreamForwardFlushesPendingBytesOnReadError(t *testing.T) {
 	}
 	if got := strings.Join(outerState.events, ","); got != "emit,host-close,plugin-close" {
 		t.Fatalf("outer close order = %q, want emit,host-close,plugin-close", got)
+	}
+}
+
+func TestRunStreamForwardClosesOnlyOversizedIncompleteStream(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	const prefix = "data: {\"type\":\"response.output_text.delta\",\"delta\":\""
+	fragment := append([]byte(prefix), bytes.Repeat([]byte("x"), 1<<20-len(prefix))...)
+	var emitCalls, hostCloseCalls, pluginCloseCalls, readCalls int
+	pluginCloseError := ""
+	pluginClosed := make(chan struct{})
+	call := func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostModelExecuteStream:
+			return json.Marshal(pluginapi.HostModelStreamResponse{
+				StatusCode: http.StatusOK,
+				Headers:    http.Header{"Content-Type": []string{"text/event-stream"}},
+				StreamID:   "host-stream-pending-limit-1",
+			})
+		case pluginabi.MethodHostModelStreamRead:
+			readCalls++
+			return json.Marshal(pluginapi.HostModelStreamReadResponse{Payload: fragment})
+		case pluginabi.MethodHostStreamEmit:
+			emitCalls++
+			return json.Marshal(map[string]any{})
+		case pluginabi.MethodHostModelStreamClose:
+			hostCloseCalls++
+			return json.Marshal(map[string]any{})
+		default:
+			return nil, fmt.Errorf("unexpected method %q", method)
+		}
+	}
+	req := executorRPCRequest{
+		Model:           "client",
+		Format:          "openai-response",
+		SourceFormat:    "openai-response",
+		OriginalRequest: []byte(`{"model":"client","stream":true}`),
+		StreamID:        "plugin-stream-pending-limit-1",
+	}
+	if _, err := startExecutorStream(req, call, func(_ string, errText string) error {
+		pluginCloseCalls++
+		pluginCloseError = errText
+		close(pluginClosed)
+		return nil
+	}); err != nil {
+		t.Fatalf("startExecutorStream error = %v", err)
+	}
+	select {
+	case <-pluginClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not close oversized stream")
+	}
+	if emitCalls != 0 {
+		t.Fatalf("emit calls=%d, want 0", emitCalls)
+	}
+	if hostCloseCalls != 1 || pluginCloseCalls != 1 {
+		t.Fatalf("close calls host=%d plugin=%d", hostCloseCalls, pluginCloseCalls)
+	}
+	if !strings.Contains(pluginCloseError, "stream pending data exceeds 16777216 bytes") {
+		t.Fatalf("plugin close error=%q", pluginCloseError)
+	}
+	if readCalls != 17 {
+		t.Fatalf("read calls=%d, want 17", readCalls)
+	}
+
+	next := newStreamChunkRewriter("client")
+	next.format = "openai-response"
+	next.frameRawJSONAsSSE = true
+	out, err := next.Write([]byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"upstream\",\"output\":[]}}\n\n"))
+	if err != nil || len(out) == 0 {
+		t.Fatalf("next stream Write=(%d chunks,%v)", len(out), err)
+	}
+	if flushed, err := next.Finish(); err != nil || len(flushed) != 0 {
+		t.Fatalf("next stream Finish=(%q,%v)", flushed, err)
 	}
 }
 

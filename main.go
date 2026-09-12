@@ -27,6 +27,8 @@ func main() {}
 
 var pluginVersion = "0.0.0-dev"
 
+const maxPendingStreamBytes = 16 << 20
+
 type sseRewriter struct {
 	originalModel          string
 	encodedModel           json.RawMessage
@@ -130,7 +132,16 @@ func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
 		return nil, nil
 	}
 	r.buf = append(r.buf, p...)
-	return r.drain(false)
+	out, err := r.drain(false)
+	if err != nil {
+		return nil, err
+	}
+	if len(r.buf) > maxPendingStreamBytes {
+		r.buf = nil
+		r.scanFrom = 0
+		return nil, fmt.Errorf("stream pending data exceeds %d bytes", maxPendingStreamBytes)
+	}
+	return out, nil
 }
 
 func (r *sseRewriter) Flush() ([][]byte, error) {
@@ -519,6 +530,15 @@ func hasSSEDoneEvent(p []byte) bool {
 	return false
 }
 
+func (r *streamChunkRewriter) retainPending(p []byte) error {
+	if len(p) > maxPendingStreamBytes {
+		r.pending = nil
+		return fmt.Errorf("stream pending data exceeds %d bytes", maxPendingStreamBytes)
+	}
+	r.pending = bytes.Clone(p)
+	return nil
+}
+
 func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 	r.sse.trackDone = r.format == "openai"
 	r.sse.recoverResponsesEvents = r.format == "openai-response"
@@ -528,21 +548,19 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 			return nil, nil
 		}
 	}
-	owned := false
 	if len(r.pending) > 0 {
 		p = append(r.pending, p...)
 		r.pending = nil
-		owned = true
 	}
 	if len(r.sse.buf) > 0 {
 		return r.sse.Write(p)
 	}
 	if r.rawJSONArray {
-		return r.writeRawJSONArray(p, false, owned)
+		return r.writeRawJSONArray(p, false)
 	}
 	start := skipTopLevelModelJSONSpace(p, 0)
 	if !r.frameRawJSONAsSSE && start < len(p) && p[start] == '[' {
-		return r.writeRawJSONArray(p, true, owned)
+		return r.writeRawJSONArray(p, true)
 	}
 	if r.frameRawJSONAsSSE && !couldStartJSONValue(p) && completeSSEEvents(p) && !mightContainResponseModelField(p) {
 		if r.sse.trackDone {
@@ -555,10 +573,8 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 	}
 	trimmed := bytes.TrimSpace(p)
 	if r.frameRawJSONAsSSE && len(trimmed) > 0 && trimmed[0] != '{' && trimmed[0] != '[' && couldStartJSONValue(p) && !isSSEChunk(p) {
-		if owned {
-			r.pending = p
-		} else {
-			r.pending = append(r.pending, p...)
+		if err := r.retainPending(p); err != nil {
+			return nil, err
 		}
 		return nil, nil
 	}
@@ -569,15 +585,15 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 		}
 		if ok {
 			if incomplete {
-				r.pending = append([]byte(nil), p[consumed:]...)
+				if err := r.retainPending(p[consumed:]); err != nil {
+					return nil, err
+				}
 			}
 			return chunks, nil
 		}
 		if incomplete {
-			if owned {
-				r.pending = p
-			} else {
-				r.pending = append(r.pending, p...)
+			if err := r.retainPending(p); err != nil {
+				return nil, err
 			}
 			return nil, nil
 		}
@@ -604,21 +620,21 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 		return r.sse.Write(p)
 	}
 	if isIncompleteSSEPrefix(p) {
-		r.pending = append(r.pending, p...)
+		if err := r.retainPending(p); err != nil {
+			return nil, err
+		}
 		return nil, nil
 	}
 	if len(p) > 0 && len(bytes.Trim(p, " \t\r\n")) == 0 {
-		if owned {
-			r.pending = p
-		} else {
-			r.pending = append(r.pending, p...)
+		if err := r.retainPending(p); err != nil {
+			return nil, err
 		}
 		return nil, nil
 	}
 	return r.rawJSONChunks(p)
 }
 
-func (r *streamChunkRewriter) writeRawJSONArray(p []byte, opening, owned bool) ([][]byte, error) {
+func (r *streamChunkRewriter) writeRawJSONArray(p []byte, opening bool) ([][]byte, error) {
 	var out [][]byte
 	cursor := 0
 	if opening {
@@ -655,10 +671,8 @@ func (r *streamChunkRewriter) writeRawJSONArray(p []byte, opening, owned bool) (
 			complete = json.Valid(p[start:end])
 		}
 		if !complete {
-			if owned {
-				r.pending = p[cursor:]
-			} else {
-				r.pending = bytes.Clone(p[cursor:])
+			if err := r.retainPending(p[cursor:]); err != nil {
+				return nil, err
 			}
 			return out, nil
 		}
