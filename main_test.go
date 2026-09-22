@@ -5871,6 +5871,74 @@ func TestPrepareExecutorStreamGeminiKeepsCoreChunksRaw(t *testing.T) {
 	}
 }
 
+func TestExecutorStreamNeedsSSEFraming(t *testing.T) {
+	for _, tt := range []struct {
+		format string
+		want   bool
+	}{
+		{format: "openai", want: false},
+		{format: "gemini", want: false},
+		{format: "claude", want: true},
+		{format: "openai-response", want: true},
+		{format: "interactions", want: true},
+	} {
+		t.Run(tt.format, func(t *testing.T) {
+			if got := executorStreamNeedsSSEFraming(tt.format); got != tt.want {
+				t.Fatalf("executorStreamNeedsSSEFraming(%q) = %v, want %v", tt.format, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPrepareExecutorStreamOpenAIChatKeepsRawJSONChunksUnframed(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	stream, responseHeaders, err := prepareExecutorStream(&executorRPCRequest{
+		Model:           "client",
+		Format:          "openai",
+		SourceFormat:    "openai",
+		OriginalRequest: []byte(`{"model":"client"}`),
+	}, func(method string, payload any) (json.RawMessage, error) {
+		if method != pluginabi.MethodHostModelExecuteStream {
+			return nil, fmt.Errorf("method=%q", method)
+		}
+		return json.Marshal(pluginapi.HostModelStreamResponse{
+			StatusCode: http.StatusOK,
+			StreamID:   "host-stream",
+			Headers:    http.Header{"Content-Type": {"text/event-stream"}},
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if responseHeaders.Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("Content-Type=%q, want text/event-stream", responseHeaders.Get("Content-Type"))
+	}
+	if stream.frameRawJSONAsSSE {
+		t.Fatal("frameRawJSONAsSSE=true, want false: CPA frames OpenAI chat/completions payloads itself")
+	}
+	r := newStreamChunkRewriter("client")
+	r.format = stream.format
+	r.frameRawJSONAsSSE = stream.frameRawJSONAsSSE
+	chunks, err := r.Write([]byte(`{"model":"upstream","choices":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished, err := r.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := bytes.Join(append(chunks, finished...), nil)
+	if !bytes.Contains(output, []byte(`"model":"client"`)) {
+		t.Fatalf("output=%q, want the client model restored", output)
+	}
+	if bytes.HasPrefix(output, []byte("data:")) || bytes.Contains(output, []byte("data: data:")) {
+		t.Fatalf("output=%q, want an unframed raw JSON payload", output)
+	}
+	if bytes.Contains(output, []byte("[DONE]")) {
+		t.Fatalf("output=%q, want no [DONE] appended by the plugin", output)
+	}
+}
+
 func TestHandleExecutorExecuteStreamReturnsPreparedHostHeaders(t *testing.T) {
 	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
 	tests := []struct {
@@ -5895,7 +5963,6 @@ func TestHandleExecutorExecuteStreamReturnsPreparedHostHeaders(t *testing.T) {
 				"x-request-id": {"request-1"},
 			},
 			wantContentType: "text/event-stream",
-			wantFramed:      true,
 		},
 		{
 			name: "event stream with parameters",
@@ -5904,7 +5971,6 @@ func TestHandleExecutorExecuteStreamReturnsPreparedHostHeaders(t *testing.T) {
 				"x-request-id": {"request-1"},
 			},
 			wantContentType: "text/event-stream; charset=utf-8",
-			wantFramed:      true,
 		},
 		{
 			name: "json profile mentioning event stream",
@@ -6135,7 +6201,7 @@ func TestPrepareExecutorStreamClosesPartialStreamIDOnDecodeError(t *testing.T) {
 	}
 }
 
-func TestRunStreamForwardTerminatesReframedOpenAIChat(t *testing.T) {
+func TestRunStreamForwardTerminatesOpenAIChat(t *testing.T) {
 	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
 	newRequest := func(format string) rpcExecutorRequest {
 		return rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
@@ -6151,7 +6217,9 @@ func TestRunStreamForwardTerminatesReframedOpenAIChat(t *testing.T) {
 		reads                 []pluginapi.HostModelStreamReadResponse
 		wantDone              int
 	}{
-		{name: "raw chat completion", format: "openai", payload: `{"model":"upstream","choices":[]}`, reads: []pluginapi.HostModelStreamReadResponse{{Payload: []byte(`{"model":"upstream","choices":[]}`)}, {Done: true}}, wantDone: 1},
+		// CPA's OpenAI handler appends "data: [DONE]" for the client, so a plugin-framed
+		// OpenAI chat stream would terminate the client with two DONE frames.
+		{name: "raw chat completion", format: "openai", payload: `{"model":"upstream","choices":[]}`, reads: []pluginapi.HostModelStreamReadResponse{{Payload: []byte(`{"model":"upstream","choices":[]}`)}, {Done: true}}, wantDone: 0},
 		{name: "already framed done", format: "openai", reads: []pluginapi.HostModelStreamReadResponse{{Payload: []byte(`{"model":"upstream","choices":[]}`)}, {Payload: []byte("data: [DONE]\n\n")}, {Done: true}}, wantDone: 1},
 		{name: "responses", format: "openai-response", reads: []pluginapi.HostModelStreamReadResponse{{Payload: []byte(`{"type":"response.completed","response":{"model":"upstream"}}`)}, {Done: true}}},
 		{name: "claude", format: "claude", reads: []pluginapi.HostModelStreamReadResponse{{Payload: []byte(`{"type":"message_start","message":{"model":"upstream"}}`)}, {Done: true}}},
@@ -6168,6 +6236,9 @@ func TestRunStreamForwardTerminatesReframedOpenAIChat(t *testing.T) {
 			}
 			if !strings.Contains(got, "client") || strings.Contains(got, "upstream") {
 				t.Fatalf("output=%q, want restored client model", got)
+			}
+			if tt.format == "openai" && strings.Contains(got, "data: {\"choices\"") {
+				t.Fatalf("output=%q, want an unframed OpenAI chat payload", got)
 			}
 		})
 	}
@@ -6483,8 +6554,10 @@ func TestRunStreamForwardProcessesTerminalPayload(t *testing.T) {
 			if got := string(emitted); !strings.Contains(got, `"model":"client"`) {
 				t.Fatalf("emitted=%q, want restored terminal payload", got)
 			}
+			// OpenAI chat/completions payloads stay raw JSON: CPA appends its own
+			// "data: [DONE]", so the plugin must not emit a second terminal frame.
 			wantEvents := "emit,host-close,plugin-close"
-			if tt.name == "done payload" {
+			if tt.name == "split sse payload before error" {
 				wantEvents = "emit,emit,host-close,plugin-close"
 			}
 			if got := strings.Join(events, ","); got != wantEvents {

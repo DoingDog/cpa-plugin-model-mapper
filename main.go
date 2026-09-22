@@ -1814,8 +1814,25 @@ func prepareExecutorStream(req *executorRPCRequest, call hostCaller) (*executorS
 		}
 		headers.Set("Content-Type", contentType)
 	}
-	stream.frameRawJSONAsSSE = req.Format != "gemini" && isEventStreamContentType(headers.Get("Content-Type"))
+	// CPA's OpenAI chat/completions handler writes the SSE framing itself, one
+	// "data: %s\n\n" per payload plus the terminating "data: [DONE]", so a raw JSON chunk
+	// framed here reaches the client as "data: data: {...}". Claude and Responses clients
+	// instead receive payloads verbatim, so those formats still need this framing.
+	stream.frameRawJSONAsSSE = executorStreamNeedsSSEFraming(req.Format) && isEventStreamContentType(headers.Get("Content-Type"))
 	return stream, headers, nil
+}
+
+// executorStreamNeedsSSEFraming reports whether the host hands this client protocol's stream
+// payloads to the client without adding SSE framing. OpenAI chat/completions payloads are raw
+// JSON chunks framed by CPA's own OpenAI handler, and Gemini raw core chunks are framed by CPA
+// too; Claude and Responses payloads are forwarded verbatim and must be framed here.
+func executorStreamNeedsSSEFraming(format string) bool {
+	switch format {
+	case "gemini", "openai":
+		return false
+	default:
+		return true
+	}
 }
 
 func startExecutorStream(req executorRPCRequest, call hostCaller, closeStream func(string, string) error) ([]byte, error) {

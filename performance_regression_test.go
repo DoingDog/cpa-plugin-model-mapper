@@ -759,7 +759,10 @@ func BenchmarkStreamChunkRewriterCompleteSSEBatch(b *testing.B) {
 func TestRunStreamForwardBatchesOnlySSEOutput(t *testing.T) {
 	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
 	req := rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
-		Model: "client", Format: "openai", SourceFormat: "openai",
+		// OpenAI chat/completions payloads stay raw JSON because CPA frames them itself, so
+		// already-framed SSE input is batched for the protocols whose clients receive the
+		// payloads verbatim.
+		Model: "client", Format: "openai-response", SourceFormat: "openai-response",
 		OriginalRequest: []byte(`{"model":"client"}`), Stream: true,
 	}, StreamID: "plugin-stream"}
 
@@ -786,6 +789,21 @@ func TestRunStreamForwardBatchesOnlySSEOutput(t *testing.T) {
 	}
 	if len(emitted) != 2 {
 		t.Fatalf("raw emitted=%q, want original per-read boundaries", emitted)
+	}
+
+	openaiReq := req
+	openaiReq.Format = "openai"
+	openaiReq.SourceFormat = "openai"
+	openaiReads := []pluginapi.HostModelStreamReadResponse{
+		{Payload: []byte("data: one\n\ndata: two\n\n")},
+		{Done: true},
+	}
+	emitted, _, _, _, err = runExecutorStreamTestWithHostContentType(openaiReq, openaiReads, "text/event-stream; charset=utf-8")
+	if err != nil {
+		t.Fatalf("openai SSE stream error = %v", err)
+	}
+	if got := strings.Join(emitted, ""); got != "data: one\n\ndata: two\n\n" {
+		t.Fatalf("openai SSE emitted=%q, want byte-identical passthrough", emitted)
 	}
 }
 
