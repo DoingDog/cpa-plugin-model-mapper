@@ -1,5 +1,6 @@
 PLUGIN_NAME := model-mapper
 DIST_DIR := dist
+CPA_INTEGRATION_SHA := c76dfd4e0edabab9000628b1560ab8ab379eadb8
 GO ?= go
 GOOS ?=
 GOARCH ?=
@@ -18,7 +19,7 @@ MACOSX_DEPLOYMENT_TARGET ?= 12.0
 READELF ?= readelf
 OTOOL ?= otool
 
-.PHONY: test vet build-platform build-windows-amd64 build-linux-amd64 build package-platform package install-local install-linux-amd64 smoke-local clean
+.PHONY: test vet integration build-platform build-windows-amd64 build-linux-amd64 build package-platform package install-local install-linux-amd64 smoke-local clean
 
 test:
 	$(GO) test ./...
@@ -92,6 +93,33 @@ smoke-local:
 	host_goarch="$$( $(GO) env GOHOSTARCH )"; \
 	$(MAKE) --no-print-directory build-platform GOOS="$$host_goos" GOARCH="$$host_goarch" GO="$(GO)" DIST_DIR="$(DIST_DIR)" PLUGIN_NAME="$(PLUGIN_NAME)"
 	GOOS= GOARCH= CGO_ENABLED= $(GO) run .github/scripts/smoke-local.go
+
+integration:
+	@set -eu; \
+	export GOWORK=off; \
+	root="$$( $(GO) list -m -f '{{.Dir}}' )"; \
+	if [ -z "$(DIST_DIR)" ]; then echo "DIST_DIR is required" >&2; exit 1; fi; \
+	dist="$(DIST_DIR)"; \
+	case "$$dist" in /*|[A-Za-z]:*) ;; *) dist="$$root/$$dist" ;; esac; \
+	checkout="$$dist/integration/cpa-src"; \
+	mkdir -p "$$dist/integration"; \
+	if [ ! -d "$$checkout/.git" ]; then \
+		if [ -e "$$checkout" ]; then echo "CPA checkout already exists: $$checkout" >&2; exit 1; fi; \
+		git clone --quiet --depth=1 --branch v7.2.152 https://github.com/router-for-me/CLIProxyAPI.git "$$checkout"; \
+	fi; \
+	if [ "$$(git -C "$$checkout" rev-parse HEAD)" != "$(CPA_INTEGRATION_SHA)" ]; then echo "CPA checkout is not $(CPA_INTEGRATION_SHA)" >&2; exit 1; fi; \
+	checkout_status="$$(git -C "$$checkout" status --porcelain --untracked-files=all --ignored)"; \
+	if [ -n "$$checkout_status" ]; then echo "CPA checkout has local changes" >&2; exit 1; fi; \
+	bin="$$dist/integration/cpa"; \
+	if [ "$$( $(GO) env GOHOSTOS )" = windows ]; then bin="$$bin.exe"; fi; \
+	GOOS= GOARCH= CGO_ENABLED= $(GO) -C "$$checkout" build -trimpath -o "$$bin" ./cmd/server; \
+	host_goos="$$( $(GO) env GOHOSTOS )"; \
+	host_goarch="$$( $(GO) env GOHOSTARCH )"; \
+	$(MAKE) --no-print-directory build-platform GOOS="$$host_goos" GOARCH="$$host_goarch" GO="$(GO)" DIST_DIR="$(DIST_DIR)" PLUGIN_NAME="$(PLUGIN_NAME)"; \
+	case "$$host_goos" in windows) ext=.dll ;; darwin) ext=.dylib ;; *) ext=.so ;; esac; \
+	plugin="$$dist/$${host_goos}_$${host_goarch}/$(PLUGIN_NAME)$$ext"; \
+	GOOS= GOARCH= CGO_ENABLED= $(GO) test .github/scripts/smoke-local.go .github/scripts/smoke-local_test.go -list '^TestCPAPluginIntegration$$' | grep -qx 'TestCPAPluginIntegration' || { echo 'integration test is missing' >&2; exit 1; }; \
+	CPA_SMOKE_INTEGRATION=1 CPA_SMOKE_CPA_BIN="$$bin" CPA_SMOKE_PLUGIN="$$plugin" GOOS= GOARCH= CGO_ENABLED= $(GO) test -count=1 -v .github/scripts/smoke-local.go .github/scripts/smoke-local_test.go -run '^TestCPAPluginIntegration$$'
 
 clean:
 	rm -rf $(DIST_DIR)

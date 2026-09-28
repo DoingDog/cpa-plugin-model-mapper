@@ -44,6 +44,9 @@ jobs:
       - name: Vet
         run: make vet
 
+      - name: Test CPA integration
+        run: make integration
+
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
     if: github.event_name != 'pull_request'

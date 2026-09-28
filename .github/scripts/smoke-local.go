@@ -306,6 +306,8 @@ func startCPA(env smokeEnv) (*cpaProcess, error) {
 	}
 	cmd := exec.Command(cpaBin, "--config", "config.yaml", "--no-browser")
 	cmd.Dir = env.dir
+	tempDir := filepath.Join(env.dir, "tmp")
+	cmd.Env = append(os.Environ(), "TMPDIR="+tempDir, "TEMP="+tempDir, "TMP="+tempDir)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	if err := cmd.Start(); err != nil {

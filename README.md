@@ -261,6 +261,13 @@ Linux amd64 CPA:
 
 ## Smoke test
 
+`make integration` builds the current plugin and CPA at commit `c76dfd4e0edabab9000628b1560ab8ab379eadb8` (v7.2.152), then checks registration and model mapping through CPA with a local fake upstream. It requires no upstream API key. The checkout and binaries are generated under `dist/`. On Windows, set `TMPDIR` to a Windows path before running it from PowerShell if Go rejects Git Bash's `/c/...` temporary path:
+
+```powershell
+$env:TMPDIR = $env:TEMP
+make integration
+```
+
 Generated CPA runtime state is under `.test-cpa/`. Each live smoke case deletes its generated config before it finishes. `make smoke-local` also builds `dist/<goos>_<goarch>/model-mapper` with the host extension and copies the artifact for the current GOOS and GOARCH values reported by go env. Relative path-like `CPA_SMOKE_CPA_BIN` values are resolved from the repository root.
 
 Required environment variables:

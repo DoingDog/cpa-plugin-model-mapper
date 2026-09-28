@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -549,5 +552,151 @@ func TestRunStreamCaseAcceptsMultiDataJSONEvent(t *testing.T) {
 	port := server.Listener.Addr().(*net.TCPAddr).Port
 	if err := runStreamCase(port, caseConfig{requestModel: "client", requestAPIKey: localAPIKey, wantOriginalModel: "client"}); err != nil {
 		t.Fatalf("runStreamCase error = %v", err)
+	}
+}
+
+func TestCPAPluginIntegration(t *testing.T) {
+	cpaBin := os.Getenv("CPA_SMOKE_CPA_BIN")
+	if cpaBin == "" || os.Getenv("CPA_SMOKE_INTEGRATION") != "1" {
+		t.Skip("make integration is required for CPA integration")
+	}
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/chat/completions" || r.Header.Get("Authorization") != "Bearer fake-upstream-key" {
+			http.Error(w, "unexpected upstream request", http.StatusBadRequest)
+			return
+		}
+		var request struct {
+			Model    string `json:"model"`
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if request.Model != "deepseek-v4-flash" || len(request.Messages) != 1 || request.Messages[0].Role != "user" || request.Messages[0].Content != "say ok" {
+			http.Error(w, "unexpected upstream body", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"deepseek-v4-flash","choices":[{"index":0,"message":{"role":"assistant","content":"upstream deepseek-v4-flash remains"},"finish_reason":"stop"}]}`))
+	}))
+	defer upstream.Close()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	env := smokeEnv{
+		repoRoot: repoRoot, cpaBin: cpaBin, dir: dir, port: port,
+		baseURL: upstream.URL + "/v1", apiKey: "fake-upstream-key",
+		config:  filepath.Join(dir, "config.yaml"),
+		logsDir: filepath.Join(dir, "logs"), logFile: filepath.Join(dir, "logs", "cpa.log"),
+	}
+	source := os.Getenv("CPA_SMOKE_PLUGIN")
+	if source == "" {
+		t.Fatal("CPA_SMOKE_PLUGIN is required for CPA integration")
+	}
+	_, env.plugin = smokePluginPaths(repoRoot, dir)
+	if err := prepareDirs(env); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(source, env.plugin); err != nil {
+		t.Fatal(err)
+	}
+	config := buildConfig(env, caseConfig{pluginRules: "deepseek-v4-pro=>deepseek-v4-flash"}) +
+		"remote-management:\n  secret-key: local-integration-management-key\n  disable-control-panel: true\n"
+	if err := writeSmokeConfig(env.config, []byte(config)); err != nil {
+		t.Fatal(err)
+	}
+	proc, err := startCPA(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := stopCPA(proc); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := waitReady(proc, port, localAPIKey); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		shadowDir := filepath.Join(env.dir, "tmp", "cliproxy-pluginhost", fmt.Sprintf("pid-%d", proc.cmd.Process.Pid))
+		if entries, err := os.ReadDir(shadowDir); err != nil || len(entries) == 0 {
+			t.Fatalf("CPA shadow directory %s: entries=%d err=%v", shadowDir, len(entries), err)
+		}
+	}
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/v0/management/plugins", port)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Management-Key", "local-integration-management-key")
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("management plugins status = %d, want 200", resp.StatusCode)
+	}
+	var listing struct {
+		Plugins []struct {
+			ID               string `json:"id"`
+			Registered       bool   `json:"registered"`
+			EffectiveEnabled bool   `json:"effective_enabled"`
+		} `json:"plugins"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&listing); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, plugin := range listing.Plugins {
+		if plugin.ID == "model-mapper" {
+			found = true
+			if !plugin.Registered || !plugin.EffectiveEnabled {
+				t.Fatalf("model-mapper registered=%t effective_enabled=%t", plugin.Registered, plugin.EffectiveEnabled)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatal("model-mapper missing from CPA management plugins")
+	}
+	status, body, err := sendRequest(port, "openai", "deepseek-v4-pro", localAPIKey, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var completion struct {
+		Model   string `json:"model"`
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(body, &completion); err != nil {
+		t.Fatal(err)
+	}
+	if status != http.StatusOK || completion.Model != "deepseek-v4-pro" || len(completion.Choices) != 1 || completion.Choices[0].Message.Content != "upstream deepseek-v4-flash remains" {
+		t.Fatalf("client completion status=%d body=%s", status, body)
+	}
+	if calls := upstreamCalls.Load(); calls != 1 {
+		t.Fatalf("upstream calls = %d, want 1", calls)
 	}
 }
