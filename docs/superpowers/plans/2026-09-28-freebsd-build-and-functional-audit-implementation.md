@@ -40,7 +40,7 @@
 - Consumes: `packageExistingArtifacts(version, distDir, outDir string) error`, `artifactSpecs() []artifactSpec`, `artifactSpec.binaryPath(distDir string) string`, `validateDistinctPaths(paths ...string) error`.
 - Produces: the same public script flags and package layout; aggregate preflight rejects input/output aliases before `os.MkdirAll`, `removeChecksum`, `packageLibrary`, or stale-zip cleanup.
 
-- [ ] **Step 1: Add every failing alias regression before implementation.** In a new `TestPackageExistingArtifactsRejectsAliasedArchivesBeforeWriting`, use `t.TempDir()` for each subtest to create `dist/linux_amd64/model-mapper.so` with literal `[]byte("original-plugin")` and `.version` with `[]byte("0.5.7\n")`. Create `out/checksums.txt` with `[]byte("old-manifest\n")`, then point `out/model-mapper_0.5.7_linux_amd64.zip` to the library using `os.Link` in one subtest and `os.Symlink` in another (`t.Skipf` only when that link type is unavailable). Add a two-input subtest (`linux_amd64`, `windows_amd64`) where the Linux output zip hardlinks to the Windows input, plus subtests where `checksums.txt` and an absent-platform stale zip alias an input. For every subtest assert `err` contains `must be distinct`, every input library retains its literal bytes, and prior outputs (including the manifest or alias path) remain untouched. The sentinel values come from fixtures, not the package writer.
+- [ ] **Step 1: Add every failing alias regression before implementation.** In a new `TestPackageExistingArtifactsRejectsAliasedArchivesBeforeWriting`, use `t.TempDir()` for each subtest to create `dist/linux_amd64/model-mapper.so` with literal `[]byte("original-plugin")` and `.version` with `[]byte("0.5.7\n")`. Create `out/checksums.txt` with `[]byte("old-manifest\n")`, then point `out/model-mapper_0.5.7_linux_amd64.zip` to the library using `os.Link` in one subtest and `os.Symlink` in another (`t.Skipf` only when that link type is unavailable). Add two-input subtests (`linux_amd64`, `windows_amd64`) where the Linux output zip hardlinks or symlinks to the Windows input, plus subtests where `checksums.txt` and an absent-platform stale zip alias an input. For every subtest assert `err` contains `must be distinct`, every input library retains its literal bytes, and prior outputs (including the manifest or alias path) remain untouched. The sentinel values come from fixtures, not the package writer.
 
 ```go
 func TestPackageExistingArtifactsRejectsAliasedArchivesBeforeWriting(t *testing.T) {
@@ -51,6 +51,7 @@ func TestPackageExistingArtifactsRejectsAliasedArchivesBeforeWriting(t *testing.
         {name: "own hardlink", output: "linux"},
         {name: "own symlink", output: "linux", symlink: true},
         {name: "other platform input", output: "linux", targetWindows: true},
+        {name: "other platform symlink", output: "linux", targetWindows: true, symlink: true},
         {name: "manifest symlink", output: "manifest", symlink: true},
         {name: "stale archive symlink", output: "stale", symlink: true, staleWindows: true},
     } {
