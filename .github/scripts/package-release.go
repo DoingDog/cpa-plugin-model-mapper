@@ -55,7 +55,7 @@ func run(args []string) error {
 		if *libraryPath == "" || *archivePath == "" || *checksumPath == "" {
 			return fmt.Errorf("library, archive, and checksum are required together")
 		}
-		if err := validateDistinctPaths(*libraryPath, *archivePath, *checksumPath); err != nil {
+		if err := validateDistinctPaths(*libraryPath, *archivePath, *checksumPath, "LICENSE"); err != nil {
 			return err
 		}
 		if err := removeChecksum(*checksumPath); err != nil {
@@ -264,7 +264,10 @@ func packageExistingArtifacts(version, distDir, outDir string) error {
 		zipName := fmt.Sprintf("%s_%s_%s_%s.zip", pluginName, version, artifact.osName, artifact.arch)
 		paths = append(paths, filepath.Join(outDir, zipName))
 	}
-	paths = append(paths, filepath.Join(outDir, "checksums.txt"))
+	paths = append(paths, filepath.Join(outDir, "checksums.txt"), "LICENSE")
+	for _, artifact := range artifacts {
+		paths = append(paths, artifact.binaryPath(distDir)+".version")
+	}
 	if err := validateDistinctPaths(paths...); err != nil {
 		return err
 	}

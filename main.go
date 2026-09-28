@@ -1460,6 +1460,9 @@ func handleModelRoute(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	if req.Metadata["request_path"] == "/v1/messages/count_tokens" {
+		return json.Marshal(pluginapi.ModelRouteResponse{Handled: false})
+	}
 	if req.SourceFormat == "interactions" && interactionsUsesAgent(req.Body) {
 		return json.Marshal(pluginapi.ModelRouteResponse{Handled: false})
 	}

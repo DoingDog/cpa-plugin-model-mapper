@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -172,6 +173,18 @@ func TestPackageLibraryWritesRootLibraryEntryAndChecksum(t *testing.T) {
 	if entries["LICENSE"] == nil {
 		t.Fatalf("zip entries = %v, missing LICENSE", entries)
 	}
+	licenseEntry, err := entries["LICENSE"].Open()
+	if err != nil {
+		t.Fatalf("open LICENSE entry: %v", err)
+	}
+	defer licenseEntry.Close()
+	licenseData, err := io.ReadAll(licenseEntry)
+	if err != nil {
+		t.Fatalf("read LICENSE entry: %v", err)
+	}
+	if string(licenseData) != "license" {
+		t.Fatalf("LICENSE entry = %q, want license", licenseData)
+	}
 	if entry.FileInfo().Mode().Perm() != 0o755 {
 		t.Fatalf("zip entry mode = %v, want 0755", entry.FileInfo().Mode().Perm())
 	}
@@ -337,6 +350,107 @@ func TestRunRejectsAliasedSinglePlatformPathsBeforeWriting(t *testing.T) {
 		}
 		assertSentinelsUnchanged(t, sentinels, library, archive, checksum)
 	})
+}
+
+func TestRunRejectsLicenseOutputAlias(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	library := filepath.Join(dir, "model-mapper.so")
+	archive := filepath.Join(dir, "archive.zip")
+	license := filepath.Join(dir, "LICENSE")
+	if err := os.WriteFile(library, []byte("plugin-binary"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(license, []byte("original-license"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := run([]string{"-library", library, "-archive", archive, "-checksum", license})
+	if err == nil || !strings.Contains(err.Error(), "must be distinct") {
+		t.Errorf("run error = %v, want distinct path error", err)
+	}
+	if got, err := os.ReadFile(license); err != nil || string(got) != "original-license" {
+		t.Errorf("LICENSE after rejected run = %q, %v; want original-license", got, err)
+	}
+	if got, err := os.ReadFile(library); err != nil || string(got) != "plugin-binary" {
+		t.Errorf("library after rejected run = %q, %v; want plugin-binary", got, err)
+	}
+	if _, err := os.Lstat(archive); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("archive exists after rejected run: %v", err)
+	}
+}
+
+func TestRunRejectsArchiveLicenseAliases(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		link func(string, string) error
+	}{
+		{name: "hardlink", link: os.Link},
+		{name: "symlink", link: os.Symlink},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Chdir(dir)
+			library := filepath.Join(dir, "model-mapper.so")
+			license := filepath.Join(dir, "LICENSE")
+			archive := filepath.Join(dir, "archive.zip")
+			checksum := filepath.Join(dir, "archive.zip.sha256")
+			for path, body := range map[string]string{
+				library:  "plugin-binary",
+				license:  "original-license",
+				checksum: "old-checksum",
+			} {
+				if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := tt.link(license, archive); err != nil {
+				t.Skipf("%s unavailable: %v", tt.name, err)
+			}
+
+			err := run([]string{"-library", library, "-archive", archive, "-checksum", checksum})
+			if err == nil || !strings.Contains(err.Error(), "must be distinct") {
+				t.Errorf("run error = %v, want distinct path error", err)
+			}
+			for path, want := range map[string]string{
+				library:  "plugin-binary",
+				license:  "original-license",
+				archive:  "original-license",
+				checksum: "old-checksum",
+			} {
+				if got, err := os.ReadFile(path); err != nil || string(got) != want {
+					t.Errorf("%s after rejected run = %q, %v; want %q", path, got, err, want)
+				}
+			}
+		})
+	}
+}
+
+func TestRunRejectsAbsentLicenseOutput(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	library := filepath.Join(dir, "model-mapper.so")
+	archive := filepath.Join(dir, "LICENSE")
+	checksum := filepath.Join(dir, "archive.sha256")
+	if err := os.WriteFile(library, []byte("plugin-binary"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(checksum, []byte("old-checksum"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := run([]string{"-library", library, "-archive", archive, "-checksum", checksum})
+	if err == nil || !strings.Contains(err.Error(), "must be distinct") {
+		t.Errorf("run error = %v, want distinct path error", err)
+	}
+	if _, err := os.Lstat(archive); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("LICENSE created after rejected run: %v", err)
+	}
+	for path, want := range map[string]string{library: "plugin-binary", checksum: "old-checksum"} {
+		if got, err := os.ReadFile(path); err != nil || string(got) != want {
+			t.Errorf("%s after rejected run = %q, %v; want %q", path, got, err, want)
+		}
+	}
 }
 
 func writeDistinctSentinels(t *testing.T, paths ...string) map[string][]byte {
@@ -680,6 +794,123 @@ func TestPackageExistingArtifactsRejectsAliasedArchivesBeforeWriting(t *testing.
 				if got, err := os.ReadFile(manifest); err != nil || string(got) != "old-manifest\n" {
 					t.Errorf("manifest after rejected package = %q, %v; want old-manifest", got, err)
 				}
+			}
+		})
+	}
+}
+
+func TestPackageExistingArtifactsRejectsVersionSidecarAlias(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	dist := filepath.Join(dir, "dist")
+	out := filepath.Join(dir, "out")
+	library := filepath.Join(dist, "linux_amd64", "model-mapper.so")
+	version := library + ".version"
+	archive := filepath.Join(out, "model-mapper_0.5.8_linux_amd64.zip")
+	manifest := filepath.Join(out, "checksums.txt")
+	if err := os.MkdirAll(filepath.Dir(library), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(library, []byte("plugin-binary"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(version, []byte("0.5.8\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifest, []byte("old-manifest\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(version, archive); err != nil {
+		t.Skipf("hard links unsupported: %v", err)
+	}
+
+	err := packageExistingArtifacts("0.5.8", dist, out)
+	if err == nil || !strings.Contains(err.Error(), "must be distinct") {
+		t.Errorf("packageExistingArtifacts error = %v, want distinct path error", err)
+	}
+	for _, path := range []string{version, archive} {
+		if got, err := os.ReadFile(path); err != nil || string(got) != "0.5.8\n" {
+			t.Errorf("sidecar alias %s after rejected package = %q, %v; want 0.5.8", path, got, err)
+		}
+	}
+	if got, err := os.ReadFile(library); err != nil || string(got) != "plugin-binary" {
+		t.Errorf("library after rejected package = %q, %v; want plugin-binary", got, err)
+	}
+	if got, err := os.ReadFile(manifest); err != nil || string(got) != "old-manifest\n" {
+		t.Errorf("manifest after rejected package = %q, %v; want old-manifest", got, err)
+	}
+	if _, err := os.Lstat(filepath.Join(out, "model-mapper_0.5.8_linux_arm64.zip")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("other platform archive exists after rejected package: %v", err)
+	}
+}
+
+func TestPackageExistingArtifactsRejectsOtherInputsAliasedToArchive(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		aliasToLicense bool
+	}{
+		{name: "other platform sidecar"},
+		{name: "LICENSE", aliasToLicense: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Chdir(dir)
+			dist := filepath.Join(dir, "dist")
+			out := filepath.Join(dir, "out")
+			linux := filepath.Join(dist, "linux_amd64", "model-mapper.so")
+			windows := filepath.Join(dist, "windows_amd64", "model-mapper.dll")
+			license := filepath.Join(dir, "LICENSE")
+			manifest := filepath.Join(out, "checksums.txt")
+			archive := filepath.Join(out, "model-mapper_0.5.8_linux_amd64.zip")
+			for _, path := range []string{linux, windows, manifest} {
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for path, body := range map[string]string{
+				linux:                "linux-binary",
+				linux + ".version":   "0.5.8\n",
+				windows:              "windows-binary",
+				windows + ".version": "0.5.8\n",
+				license:              "original-license",
+				manifest:             "old-manifest\n",
+			} {
+				if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			target, wantAlias := windows+".version", "0.5.8\n"
+			if tt.aliasToLicense {
+				target, wantAlias = license, "original-license"
+			}
+			if err := os.Link(target, archive); err != nil {
+				t.Skipf("hard links unsupported: %v", err)
+			}
+
+			err := packageExistingArtifacts("0.5.8", dist, out)
+			if err == nil || !strings.Contains(err.Error(), "must be distinct") {
+				t.Errorf("packageExistingArtifacts error = %v, want distinct path error", err)
+			}
+			for path, want := range map[string]string{
+				linux:                "linux-binary",
+				linux + ".version":   "0.5.8\n",
+				windows:              "windows-binary",
+				windows + ".version": "0.5.8\n",
+				license:              "original-license",
+				manifest:             "old-manifest\n",
+			} {
+				if got, err := os.ReadFile(path); err != nil || string(got) != want {
+					t.Errorf("%s after rejected package = %q, %v; want %q", path, got, err, want)
+				}
+			}
+			if got, err := os.ReadFile(archive); err != nil || string(got) != wantAlias {
+				t.Errorf("archive alias after rejected package = %q, %v; want %q", got, err, wantAlias)
+			}
+			if _, err := os.Lstat(filepath.Join(out, "model-mapper_0.5.8_windows_amd64.zip")); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("other platform archive exists after rejected package: %v", err)
 			}
 		})
 	}

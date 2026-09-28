@@ -1764,6 +1764,48 @@ func TestHandleModelRouteHandledSelfForChangedModel(t *testing.T) {
 	}
 }
 
+func TestHandleModelRouteSkipsClaudeCountTokens(t *testing.T) {
+	t.Cleanup(func() { setLoadedConfigForTest(defaultConfig()) })
+	setLoadedConfigForTest(Config{GlobalRules: "registered=>upstream"})
+
+	tests := []struct {
+		name        string
+		format      string
+		metadata    map[string]any
+		wantHandled bool
+	}{
+		{name: "Claude count", format: "claude", metadata: map[string]any{"request_path": "/v1/messages/count_tokens"}},
+		{name: "Claude messages", format: "claude", metadata: map[string]any{"request_path": "/v1/messages"}, wantHandled: true},
+		{name: "missing path", format: "claude", wantHandled: true},
+		{name: "non-string path", format: "claude", metadata: map[string]any{"request_path": 1}, wantHandled: true},
+		{name: "Gemini wildcard action", format: "gemini", metadata: map[string]any{"request_path": "/v1beta/models/*action"}, wantHandled: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, err := json.Marshal(pluginapi.ModelRouteRequest{
+				SourceFormat: tt.format, RequestedModel: "registered", Metadata: tt.metadata,
+			})
+			if err != nil {
+				t.Fatalf("marshal request: %v", err)
+			}
+			responseRaw, err := handleModelRoute(raw)
+			if err != nil {
+				t.Fatalf("handleModelRoute error = %v", err)
+			}
+			var response pluginapi.ModelRouteResponse
+			if err := json.Unmarshal(responseRaw, &response); err != nil {
+				t.Fatalf("decode route response: %v", err)
+			}
+			if response.Handled != tt.wantHandled {
+				t.Fatalf("route response=%#v, want Handled=%t", response, tt.wantHandled)
+			}
+			if tt.wantHandled && response.TargetKind != pluginapi.ModelRouteTargetSelf {
+				t.Fatalf("route response=%#v, want self target", response)
+			}
+		})
+	}
+}
+
 func TestHandleModelRouteIgnoresUnusedBody(t *testing.T) {
 	setLoadedConfigForTest(Config{GlobalRules: "a=>b"})
 	raw, err := json.Marshal(pluginapi.ModelRouteRequest{
