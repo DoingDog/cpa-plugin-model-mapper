@@ -256,6 +256,18 @@ func packageExistingArtifacts(version, distDir, outDir string) error {
 	if len(artifacts) == 0 {
 		return fmt.Errorf("no supported artifacts found under %s", filepath.ToSlash(distDir))
 	}
+	paths := make([]string, 0, len(artifacts)+len(artifactSpecs())+1)
+	for _, artifact := range artifacts {
+		paths = append(paths, artifact.binaryPath(distDir))
+	}
+	for _, artifact := range artifactSpecs() {
+		zipName := fmt.Sprintf("%s_%s_%s_%s.zip", pluginName, version, artifact.osName, artifact.arch)
+		paths = append(paths, filepath.Join(outDir, zipName))
+	}
+	paths = append(paths, filepath.Join(outDir, "checksums.txt"))
+	if err := validateDistinctPaths(paths...); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return fmt.Errorf("create output dir %s: %w", outDir, err)
 	}

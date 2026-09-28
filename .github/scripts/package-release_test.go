@@ -591,6 +591,100 @@ func TestPackageExistingArtifactsRejectsUnverifiedVersionsBeforeWriting(t *testi
 	}
 }
 
+func TestPackageExistingArtifactsRejectsAliasedArchivesBeforeWriting(t *testing.T) {
+	for _, tt := range []struct {
+		name, output                          string
+		targetWindows, symlink, staleWindows bool
+	}{
+		{name: "own hardlink", output: "linux"},
+		{name: "own symlink", output: "linux", symlink: true},
+		{name: "other platform input", output: "linux", targetWindows: true},
+		{name: "other platform symlink", output: "linux", targetWindows: true, symlink: true},
+		{name: "manifest symlink", output: "manifest", symlink: true},
+		{name: "stale archive symlink", output: "stale", symlink: true, staleWindows: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			dist, out := filepath.Join(dir, "dist"), filepath.Join(dir, "out")
+			linux := filepath.Join(dist, "linux_amd64", "model-mapper.so")
+			windows := filepath.Join(dist, "windows_amd64", "model-mapper.dll")
+			inputs := []struct{ path, body string }{{linux, "original-plugin"}}
+			if !tt.staleWindows {
+				inputs = append(inputs, struct{ path, body string }{windows, "original-windows"})
+			}
+			for _, input := range inputs {
+				if err := os.MkdirAll(filepath.Dir(input.path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(input.path, []byte(input.body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(input.path+".version", []byte("0.5.7\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.MkdirAll(out, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			manifest := filepath.Join(out, "checksums.txt")
+			alias := filepath.Join(out, "model-mapper_0.5.7_linux_amd64.zip")
+			switch tt.output {
+			case "manifest":
+				alias = manifest
+			case "stale":
+				alias = filepath.Join(out, "model-mapper_0.5.7_windows_amd64.zip")
+			}
+			if alias != manifest {
+				if err := os.WriteFile(manifest, []byte("old-manifest\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			target := linux
+			if tt.targetWindows {
+				target = windows
+			}
+			link := os.Link
+			if tt.symlink {
+				link = os.Symlink
+			}
+			if err := link(target, alias); err != nil {
+				t.Skipf("link unavailable: %v", err)
+			}
+
+			err := packageExistingArtifacts("0.5.7", dist, out)
+			if err == nil || !strings.Contains(err.Error(), "must be distinct") {
+				t.Errorf("packageExistingArtifacts error = %v, want path alias rejection", err)
+			}
+			for _, input := range inputs {
+				if got, err := os.ReadFile(input.path); err != nil || string(got) != input.body {
+					t.Errorf("library %s after rejected package = %q, %v; want %q", input.path, got, err, input.body)
+				}
+			}
+			targetInfo, err := os.Stat(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			aliasInfo, err := os.Stat(alias)
+			if err != nil || !os.SameFile(targetInfo, aliasInfo) {
+				t.Errorf("alias no longer points to input: %v", err)
+			}
+			if tt.symlink {
+				linkInfo, err := os.Lstat(alias)
+				if err != nil || linkInfo.Mode()&os.ModeSymlink == 0 {
+					t.Errorf("alias symlink replaced: %v", err)
+				} else if linked, err := os.Readlink(alias); err != nil || linked != target {
+					t.Errorf("alias symlink target = %q, %v; want %q", linked, err, target)
+				}
+			}
+			if alias != manifest {
+				if got, err := os.ReadFile(manifest); err != nil || string(got) != "old-manifest\n" {
+					t.Errorf("manifest after rejected package = %q, %v; want old-manifest", got, err)
+				}
+			}
+		})
+	}
+}
+
 func TestPackageExistingArtifactsRejectsChecksumsDirectory(t *testing.T) {
 	dir := t.TempDir()
 	dist := filepath.Join(dir, "dist")
