@@ -1,0 +1,36 @@
+# FreeBSD build and functional audit design (2026-09-28)
+
+## Scope and evidence
+
+Starting point: `8bda61d` on local and remote `main`; latest published tag is `v0.5.6`. This task changes the plugin repository only. The fixed CPA used by integration tests remains `v7.2.152` at `c76dfd4e0edabab9000628b1560ab8ab379eadb8`; no CPA source is modified. The initial Go, script, vet, and real CPA registration/mapping tests pass.
+
+The repository, relevant CPA plugin host and SDK paths, and FreeBSD/action primary sources were examined in disjoint parallel scopes. Two independently actionable defects survived verification:
+
+1. The existing FreeBSD/amd64 CI job runs `go-cross/cgo-actions@v1`, whose executed bundle downloads the removed FreeBSD `14.3-RELEASE/base.txz` without a configurable URL or version. The previous main workflow's FreeBSD job failed at `wget` exit 8 before `go build`; the test job, including real CPA integration, passed. An independent request to the same URL returned 404. This prevents the release job from satisfying its seven-build dependency.
+2. Aggregate packaging accepts a pre-existing output zip that is a symlink or hardlink to any input dynamic library. Both aliases were reproduced using temporary fixtures: `package-release.go -version 0.5.2 -dist ... -out ...` returned success, replaced the input library with a zip containing a zero-byte library, and wrote a matching checksum. Single-platform packaging already uses `validateDistinctPaths`; aggregate packaging omits it.
+
+## FreeBSD build repair
+
+Replace only the broken FreeBSD/amd64 action step in `.github/workflows/build.yml` with a direct cross-build on its existing Ubuntu runner. Download the official FreeBSD 14.4/amd64 `base.txz` from `https://download.freebsd.org/releases/amd64/amd64/14.4-RELEASE/base.txz`, verify its SHA256 `769f60a6eea2938ad6b7943cfbcc17dfaf7d1f7ba59a32b869a00349302df853` against the official MANIFEST before extracting, and use the extracted sysroot with Clang's `x86_64-unknown-freebsd14.4` target and lld. Preserve `CGO_ENABLED=1`, `GOOS=freebsd`, `GOARCH=amd64`, `-trimpath`, `-buildmode=c-shared`, the prior version linker injection, and `dist/freebsd_amd64/model-mapper.so`. Keep the existing package/upload steps and the release job's dependency on the FreeBSD build unchanged.
+
+FreeBSD 14.4 is still supported on 2026-09-28, through 2026-12-31. Using its sysroot avoids raising the existing FreeBSD 14.x minimum to 14.5 without a runtime compatibility test. Successful cross-compilation and ELF inspection do not prove runtime loading on FreeBSD; do not claim that without a FreeBSD runtime test. Do not add FreeBSD/arm64 or /386: Go does not support `c-shared` on those FreeBSD targets.
+
+## Aggregate packaging repair
+
+After the aggregate mode has found and version-checked its input artifacts, but before creating or deleting any output, call the existing `validateDistinctPaths` once with every discovered input library, every output archive path that aggregate mode may write or clean, and `outDir/checksums.txt`. The helper already resolves symlinks, checks existing file identity with `os.SameFile` for hardlinks, and handles case-insensitive Windows paths. A single global preflight is required: checking each platform against only its own zip would allow an earlier platform's zip to overwrite a later platform's input. Reject aliases before touching either the library or the existing checksum manifest. Do not add an extra packaging abstraction or change archive contents.
+
+Regression tests use temporary libraries and sidecars, with both symlink and hardlink aliases to the same and a different platform's output zip, plus an alias to `checksums.txt` where applicable. They must assert a nonzero result, unchanged library bytes, and unchanged prior outputs. Existing ordinary aggregate/single-platform tests remain green.
+
+## Findings not represented as plugin-only fixes
+
+The core audit confirmed two cross-RPC correctness hazards: the wildcard caller-pattern cache is keyed only by `caller_scope + pattern` and can be reused by another request with an unbound credential or evicted before the original executor call; hot reconfiguration can replace mappings between a successful `model_router` response and `executor.execute(_stream)`. However, the host returns only `Handled/TargetKind/Reason`, does not pass a trustworthy route decision/version or request ID to the executor, and creates unrelated callback IDs for the two RPCs. SDK `auth_selection_model` is a caller-supplied auth-selection override, not a verified route receipt. A plugin-only cache key or config history therefore cannot determine which route decision belonged to which executor invocation. Removing unbound cache use would break the documented behavior for request interceptors that change credential headers; choosing a historical config could silently select the wrong upstream. Do not silently replace these hazards with another incorrect route or change CPA code. Record them as protocol limitations requiring a future trusted, request-affine host contract or coordinated drain/reload; do not claim them repaired in this release.
+
+The SDK treats the first nonempty stream payload as the retry boundary. Some partial SSE/JSON-array bytes can commit a stream before a complete event, but changing this would conflict with the existing requirement to flush valid pending SSE bytes on host read errors and the tested incremental Gemini array output. No unambiguous plugin-only repair that preserves those contracts was established, so this release does not alter streaming semantics. Metadata `requested_model`/`auth_selection_model` is not used by the plugin executor, so a proposed response-model mismatch from those keys was rejected.
+
+Fragmented large raw JSON has near-quadratic buffering and parsing in the current implementation. Existing 64 KiB/32-fragment benchmark is about 1 ms/op; no representative upstream workload or observed user-visible regression for larger fragments was established. This is a performance investigation lead, not a verified optimization to bundle into the release. Preserve existing stream correctness rather than adding an unproven incremental parser here.
+
+## Verification and release boundary
+
+Follow TDD for the packaging guard: add a failing regression test and observe the input being overwritten before changing implementation, then observe the same test rejecting aliases while preserving bytes. The previous GitHub Actions FreeBSD failure is the failing end-to-end case for the workflow change; verify the replacement with a Linux cross-build and the GitHub Actions FreeBSD job, inspecting ELF architecture and archive checksum. Run all Go tests, the explicit script tests, `go vet`, race tests where relevant, `make integration` against the real fixed CPA, and `git diff --check`.
+
+After local verification, fast-forward local `main` and push it to trigger the main workflow. Only after that workflow completes successfully, create and push the next patch tag `v0.5.7`, then verify tag-triggered builds and published release assets. Do not publish while any required build is red. Do not treat ignored `dist/`, `.test-cpa/`, or the original checkout's pre-existing untracked `.claude/` as source changes.
