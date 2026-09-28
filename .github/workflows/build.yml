@@ -235,17 +235,21 @@ jobs:
 
       - name: Build FreeBSD shared library
         timeout-minutes: 45
-        uses: go-cross/cgo-actions@v1
-        env:
-          GOFLAGS: -trimpath -buildmode=c-shared
-        with:
-          dir: .
-          packages: .
-          targets: freebsd-amd64
-          out-dir: dist/freebsd_amd64
-          output: ${{ env.PLUGIN_NAME }}.so
-          flags: -ldflags=-s -w
-          x-flags: main.pluginVersion=${{ steps.release_metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/freebsd-14.4-base.txz"
+          sysroot="${RUNNER_TEMP}/freebsd-14.4-amd64"
+          curl --fail --location --show-error --silent \
+            'https://download.freebsd.org/releases/amd64/amd64/14.4-RELEASE/base.txz' -o "${archive}"
+          printf '%s  %s\n' '769f60a6eea2938ad6b7943cfbcc17dfaf7d1f7ba59a32b869a00349302df853' "${archive}" | sha256sum --check --status
+          mkdir -p "${sysroot}" dist/freebsd_amd64
+          tar -xf "${archive}" -C "${sysroot}"
+          CGO_ENABLED=1 GOOS=freebsd GOARCH=amd64 \
+            CC="clang --target=x86_64-unknown-freebsd14.4 --sysroot=${sysroot}" \
+            CGO_LDFLAGS=-fuse-ld=lld \
+            go build -trimpath -buildmode=c-shared \
+              -ldflags="-s -w -X main.pluginVersion=${VERSION}" \
+              -o "dist/freebsd_amd64/${PLUGIN_NAME}.so" .
 
       - name: Package plugin
         run: |
