@@ -674,6 +674,28 @@ func completeSSEEvents(p []byte) bool {
 	return found
 }
 
+func sseContainsEscapedModelField(p []byte) bool {
+	if !bytes.Contains(p, []byte(`\u`)) {
+		return false
+	}
+	var scanner responseModelMarkerScanner
+	for len(p) > 0 {
+		line, _, next := splitSSELine(p)
+		p = next
+		if len(line) == 0 {
+			scanner = responseModelMarkerScanner{}
+		} else if bytes.HasPrefix(line, []byte("data:")) {
+			for _, b := range sseFieldValue(line) {
+				if scanner.feed(b) {
+					return true
+				}
+			}
+			scanner.feed('\n')
+		}
+	}
+	return false
+}
+
 func hasSSEDoneEvent(p []byte) bool {
 	for len(p) > 0 {
 		eventLen, delimiterLen, _ := findSSEEventDelimiter(p, 0, true)
@@ -744,7 +766,7 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 	if !r.frameRawJSONAsSSE && start < len(p) && p[start] == '[' {
 		return r.writeRawJSONArray(p, true)
 	}
-	if r.frameRawJSONAsSSE && !couldStartJSONValue(p) && completeSSEEvents(p) && !mightContainResponseModelField(p) {
+	if r.frameRawJSONAsSSE && !couldStartJSONValue(p) && completeSSEEvents(p) && !mightContainResponseModelField(p) && !sseContainsEscapedModelField(p) {
 		if r.sse.trackDone {
 			r.sse.sawDone = r.sse.sawDone || hasSSEDoneEvent(p)
 		}

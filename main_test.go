@@ -2853,6 +2853,59 @@ func TestSSERewriterRestoresEscapedKeyAcrossDataFields(t *testing.T) {
 	}
 }
 
+func TestStreamChunkRewriterRestoresEscapedModelAcrossSSEDataFields(t *testing.T) {
+	backslash := string(rune(92))
+	input := []byte("event: message\nid: 7\ndata: {\"" + backslash + "u006dodel\"\ndata: :\"upstream\",\"text\":\"keep\"}\n\n")
+	want := "event: message\nid: 7\ndata: {\"model\":\"client\",\"text\":\"keep\"}\n\n"
+	cut := bytes.Index(input, []byte("\ndata: :")) + 1
+	for _, tc := range []struct {
+		name  string
+		parts [][]byte
+	}{
+		{"complete", [][]byte{input}},
+		{"partitioned", [][]byte{input[:cut], input[cut:]}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newStreamChunkRewriter("client")
+			r.format, r.frameRawJSONAsSSE = "openai-response", true
+			var out [][]byte
+			for _, part := range tc.parts {
+				chunks, err := r.Write(part)
+				if err != nil {
+					t.Fatal(err)
+				}
+				out = append(out, chunks...)
+			}
+			tail, err := r.Finish()
+			if err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, tail...)
+			if got := flattenChunks(out); got != want {
+				t.Fatalf("stream = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestStreamChunkRewriterPreservesOtherEscapedSSEDataFields(t *testing.T) {
+	backslash := string(rune(92))
+	input := []byte("event: message\ndata: {\"" + backslash + "u006eote\"\ndata: :\"keep\"}\n\n")
+	r := newStreamChunkRewriter("client")
+	r.format, r.frameRawJSONAsSSE = "openai-response", true
+	chunks, err := r.Write(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail, err := r.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := flattenChunks(append(chunks, tail...)); got != string(input) {
+		t.Fatalf("stream = %q, want %q", got, input)
+	}
+}
+
 func TestSSERewriterPreservesMultilineEventBoundaries(t *testing.T) {
 	r := newSSERewriter("A")
 	out, err := r.Write([]byte("event: message\ndata: {\"model\":\"B\"}\nid: 1\n\n"))
