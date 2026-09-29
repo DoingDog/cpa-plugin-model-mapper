@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"unsafe"
@@ -603,68 +604,80 @@ func emitRewrittenBatchBenchmarkFixture(totalSize, chunkCount int) [][]byte {
 }
 
 func BenchmarkStreamChunkRewriterFragmentedRawJSON(b *testing.B) {
-	opaqueID := string(bytes.Repeat([]byte("x"), 64<<10))
-	payload := append([]byte(`{"model":"upstream","id":"`), opaqueID...)
-	payload = append(payload, `"}`...)
-	const fragments = 32
-	chunkSize := (len(payload) + fragments - 1) / fragments
-	chunks := make([][]byte, 0, fragments)
-	for start := 0; start < len(payload); start += chunkSize {
-		end := start + chunkSize
-		if end > len(payload) {
-			end = len(payload)
-		}
-		chunks = append(chunks, payload[start:end])
-	}
+	large := strings.Repeat(`x{}\"`, 1<<18)
+	for _, tt := range []struct {
+		name, format string
+		input        []byte
+		chunkSize    int
+		framed       bool
+	}{
+		{"object-64KiB-32-fragments", "", []byte(`{"model":"upstream","id":"` + strings.Repeat("x", 64<<10) + `"}`), (64<<10)/32 + 1, false},
+		{"object-1MiB-8KiB", "openai-response", []byte(`{"model":"upstream","payload":"` + large + `"}`), 8 << 10, true},
+		{"gemini-array-1MiB-8KiB", "gemini", []byte(`[{"modelVersion":"upstream","payload":"` + large + `"}]`), 8 << 10, false},
+	} {
+		b.Run(tt.name, func(b *testing.B) {
+			chunks := make([][]byte, 0, (len(tt.input)+tt.chunkSize-1)/tt.chunkSize)
+			for start := 0; start < len(tt.input); start += tt.chunkSize {
+				chunks = append(chunks, tt.input[start:min(start+tt.chunkSize, len(tt.input))])
+			}
 
-	r := newStreamChunkRewriter("client")
-	var output []byte
-	for _, chunk := range chunks {
-		out, err := r.Write(chunk)
-		if err != nil {
-			b.Fatal(err)
-		}
-		output = append(output, bytes.Join(out, nil)...)
-	}
-	out, err := r.Flush()
-	if err != nil {
-		b.Fatal(err)
-	}
-	output = append(output, bytes.Join(out, nil)...)
-	var restored struct {
-		Model string `json:"model"`
-		ID    string `json:"id"`
-	}
-	if err := json.Unmarshal(output, &restored); err != nil {
-		b.Fatalf("preflight output is not JSON: %v", err)
-	}
-	if restored.Model != "client" || restored.ID != opaqueID {
-		b.Fatalf("preflight restored=%#v, want client model and intact ID", restored)
-	}
-
-	b.SetBytes(int64(len(payload)))
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		r := newStreamChunkRewriter("client")
-		outputBytes := 0
-		for _, chunk := range chunks {
-			out, err := r.Write(chunk)
+			r := newStreamChunkRewriter("client")
+			r.format, r.frameRawJSONAsSSE = tt.format, tt.framed
+			var output []byte
+			for _, chunk := range chunks {
+				out, err := r.Write(chunk)
+				if err != nil {
+					b.Fatal(err)
+				}
+				output = append(output, bytes.Join(out, nil)...)
+			}
+			out, err := r.Flush()
 			if err != nil {
 				b.Fatal(err)
 			}
-			for _, p := range out {
-				outputBytes += len(p)
+			output = append(output, bytes.Join(out, nil)...)
+			value := output
+			if tt.framed {
+				if !bytes.HasPrefix(value, []byte("data: ")) || !bytes.HasSuffix(value, []byte("\n\n")) {
+					b.Fatalf("preflight output is not SSE: %d bytes", len(value))
+				}
+				value = bytes.TrimSuffix(bytes.TrimPrefix(value, []byte("data: ")), []byte("\n\n"))
 			}
-		}
-		out, err := r.Flush()
-		if err != nil {
-			b.Fatal(err)
-		}
-		for _, p := range out {
-			outputBytes += len(p)
-		}
-		benchmarkStreamOutputBytes = outputBytes
+			want := bytes.Replace(tt.input, []byte(`"upstream"`), []byte(`"client"`), 1)
+			var gotValue, wantValue any
+			if err := json.Unmarshal(value, &gotValue); err != nil {
+				b.Fatalf("preflight output is not JSON: %v", err)
+			}
+			if err := json.Unmarshal(want, &wantValue); err != nil || !reflect.DeepEqual(gotValue, wantValue) {
+				b.Fatalf("preflight output differs from restored input: %v", err)
+			}
+
+			b.SetBytes(int64(len(tt.input)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				r := newStreamChunkRewriter("client")
+				r.format, r.frameRawJSONAsSSE = tt.format, tt.framed
+				outputBytes := 0
+				for _, chunk := range chunks {
+					out, err := r.Write(chunk)
+					if err != nil {
+						b.Fatal(err)
+					}
+					for _, p := range out {
+						outputBytes += len(p)
+					}
+				}
+				out, err := r.Flush()
+				if err != nil {
+					b.Fatal(err)
+				}
+				for _, p := range out {
+					outputBytes += len(p)
+				}
+				benchmarkStreamOutputBytes = outputBytes
+			}
+		})
 	}
 }
 

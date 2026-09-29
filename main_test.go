@@ -5490,6 +5490,74 @@ func TestStreamChunkRewriterRawJSONArrayBuffersOnlyCurrentElement(t *testing.T) 
 	}
 }
 
+func TestStreamChunkRewriterLargeFragmentedRawJSONAllocations(t *testing.T) {
+	payload := strings.Repeat(`x{}\"`, 1<<18)
+	tests := []struct {
+		name, format, input, restoredField string
+		framed                             bool
+	}{
+		{"object", "openai-response", `{"model":"upstream","payload":"` + payload + `"}`, `"model":"client"`, true},
+		{"gemini array", "gemini", `[{"modelVersion":"upstream","payload":"` + payload + `"}]`, `"modelVersion":"client"`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := []byte(tt.input)
+			parts := make([][]byte, 0, (len(input)+8191)/8192)
+			for i := 0; i < len(input); i += 8192 {
+				parts = append(parts, input[i:min(i+8192, len(input))])
+			}
+			run := func(parts [][]byte) []byte {
+				r := newStreamChunkRewriter("client")
+				r.format, r.frameRawJSONAsSSE = tt.format, tt.framed
+				var output []byte
+				for _, part := range parts {
+					chunks, err := r.Write(part)
+					if err != nil {
+						t.Fatal(err)
+					}
+					for _, chunk := range chunks {
+						output = append(output, chunk...)
+					}
+				}
+				chunks, err := r.Finish()
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, chunk := range chunks {
+					output = append(output, chunk...)
+				}
+				return output
+			}
+			want := run([][]byte{input})
+			if got := run(parts); !bytes.Equal(got, want) || !bytes.Contains(got, []byte(tt.restoredField)) {
+				t.Fatalf("fragmented output differs from restored complete JSON, output=%d bytes", len(got))
+			}
+			var measured []byte
+			allocs := testing.AllocsPerRun(1, func() { measured = run(parts) })
+			if allocs >= 100 || len(measured) == 0 {
+				t.Fatalf("allocations=%v, output=%d bytes", allocs, len(measured))
+			}
+		})
+	}
+}
+
+func TestStreamChunkRewriterCompletedRawJSONMayCrossPendingLimit(t *testing.T) {
+	r := newStreamChunkRewriter("client")
+	r.format, r.frameRawJSONAsSSE = "openai-response", true
+	prefix := []byte(`{"model":"upstream","payload":"`)
+	incomplete := append(prefix, bytes.Repeat([]byte("x"), maxPendingStreamBytes-len(prefix))...)
+	if chunks, err := r.Write(incomplete); err != nil || len(chunks) != 0 {
+		t.Fatalf("incomplete Write=(%d chunks,%v)", len(chunks), err)
+	}
+	chunks, err := r.Write([]byte(`"}`))
+	if err != nil || len(chunks) != 1 || !bytes.Contains(chunks[0], []byte(`"model":"client"`)) {
+		t.Fatalf("completed Write=(%d chunks,%v), want restored complete value", len(chunks), err)
+	}
+	if len(chunks[0]) <= maxPendingStreamBytes {
+		t.Fatalf("completed output=%d bytes, want more than pending limit", len(chunks[0]))
+	}
+}
+
 func TestStreamChunkRewriterRawJSONArrayRetainsCopiedPendingData(t *testing.T) {
 	r := newStreamChunkRewriter("client")
 	first := []byte(`[{"x":"` + strings.Repeat("a", 10))

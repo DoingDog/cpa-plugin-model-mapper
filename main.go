@@ -68,6 +68,43 @@ type streamChunkRewriter struct {
 	sse               *sseRewriter
 	pending           []byte
 	rawJSONArray      bool
+	rawScan           rawJSONScan
+}
+
+type rawJSONScan struct {
+	active   bool
+	scanFrom int
+	depth    int
+	inString bool
+	escaped  bool
+}
+
+func (s *rawJSONScan) advance(p []byte) bool {
+	for i := s.scanFrom; i < len(p); i++ {
+		b := p[i]
+		switch {
+		case s.inString && s.escaped:
+			s.escaped = false
+		case s.inString && b == '\\':
+			s.escaped = true
+		case s.inString && b == '"':
+			s.inString = false
+			if s.depth == 0 {
+				return true
+			}
+		case !s.inString && b == '"':
+			s.inString = true
+		case !s.inString && (b == '{' || b == '['):
+			s.depth++
+		case !s.inString && (b == '}' || b == ']'):
+			s.depth--
+			if s.depth == 0 {
+				return true
+			}
+		}
+	}
+	s.scanFrom = len(p)
+	return false
 }
 
 func newSSERewriter(originalModel string) *sseRewriter {
@@ -656,11 +693,19 @@ func hasSSEDoneEvent(p []byte) bool {
 }
 
 func (r *streamChunkRewriter) retainPending(p []byte) error {
+	r.rawScan = rawJSONScan{}
 	if len(p) > maxPendingStreamBytes {
 		r.pending = nil
 		return fmt.Errorf("stream pending data exceeds %d bytes", maxPendingStreamBytes)
 	}
 	r.pending = bytes.Clone(p)
+	start := skipTopLevelModelJSONSpace(r.pending, 0)
+	if start < len(r.pending) && (r.pending[start] == '{' || r.pending[start] == '[' || r.pending[start] == '"') {
+		scan := rawJSONScan{active: true, scanFrom: start}
+		if !scan.advance(r.pending) {
+			r.rawScan = scan
+		}
+	}
 	return nil
 }
 
@@ -673,7 +718,19 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 			return nil, nil
 		}
 	}
-	if len(r.pending) > 0 {
+	if r.rawScan.active {
+		r.pending = append(r.pending, p...)
+		if !r.rawScan.advance(r.pending) {
+			if len(r.pending) > maxPendingStreamBytes {
+				r.pending = nil
+				r.rawScan = rawJSONScan{}
+				return nil, fmt.Errorf("stream pending data exceeds %d bytes", maxPendingStreamBytes)
+			}
+			return nil, nil
+		}
+		p, r.pending = r.pending, nil
+		r.rawScan = rawJSONScan{}
+	} else if len(r.pending) > 0 {
 		p = append(r.pending, p...)
 		r.pending = nil
 	}
@@ -983,6 +1040,7 @@ func splitJSONValues(p []byte) ([][]byte, int, bool, bool) {
 }
 
 func (r *streamChunkRewriter) Flush() ([][]byte, error) {
+	r.rawScan = rawJSONScan{}
 	if r.rawJSONArray {
 		r.rawJSONArray = false
 		pending := bytes.Clone(r.pending)
