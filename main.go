@@ -1480,10 +1480,6 @@ func handleModelRoute(raw []byte) ([]byte, error) {
 }
 
 func routeModel(cfg Config, format, model, scope, key string) (routeDecision, error) {
-	return routeModelWithCallerCache(cfg, format, model, scope, key, false)
-}
-
-func routeModelWithCallerCache(cfg Config, format, model, scope, key string, allowUnboundCache bool) (routeDecision, error) {
 	if !cfg.compiled {
 		var err error
 		cfg, err = compileConfig(cfg)
@@ -1495,13 +1491,13 @@ func routeModelWithCallerCache(cfg Config, format, model, scope, key string, all
 	if len(selection.first) == 0 {
 		return routeDecision{}, nil
 	}
-	mapped, matched, err := applyRulesWithCallerCache(model, scope, key, selection.first, allowUnboundCache)
+	mapped, matched, err := applyRules(model, scope, key, selection.first)
 	if err != nil {
 		return routeDecision{}, err
 	}
 	if len(selection.second) > 0 {
 		var secondMatched bool
-		mapped, secondMatched, err = applyRulesWithCallerCache(mapped, scope, key, selection.second, allowUnboundCache)
+		mapped, secondMatched, err = applyRules(mapped, scope, key, selection.second)
 		if err != nil {
 			return routeDecision{}, err
 		}
@@ -1732,7 +1728,7 @@ func (s *executorStream) emit(payload []byte) error {
 func prepareExecutorStream(req *executorRPCRequest, call hostCaller) (*executorStream, http.Header, error) {
 	scope := callerScopeFromMetadata(req.Metadata)
 	cfg := loadedConfig()
-	decision, err := routeModelWithCallerCache(cfg, req.SourceFormat, req.Model, scope, callerAPIKeyForSelectedRules(cfg, req.SourceFormat, req.Headers, req.Query, scope), true)
+	decision, err := routeModel(cfg, req.SourceFormat, req.Model, scope, callerAPIKeyForSelectedRules(cfg, req.SourceFormat, req.Headers, req.Query, scope))
 	if err != nil {
 		return nil, nil, fmt.Errorf("route stream: %w", err)
 	}
@@ -1958,7 +1954,7 @@ func handleExecutorExecute(raw []byte, call hostCaller) ([]byte, error) {
 	canonicalizeHeaders(req.Headers)
 	scope := callerScopeFromMetadata(req.Metadata)
 	cfg := loadedConfig()
-	decision, err := routeModelWithCallerCache(cfg, req.SourceFormat, req.Model, scope, callerAPIKeyForSelectedRules(cfg, req.SourceFormat, req.Headers, req.Query, scope), true)
+	decision, err := routeModel(cfg, req.SourceFormat, req.Model, scope, callerAPIKeyForSelectedRules(cfg, req.SourceFormat, req.Headers, req.Query, scope))
 	if err != nil {
 		return nil, err
 	}
@@ -3023,12 +3019,7 @@ func applyASCIIModelCase(model string, operation caseOperation) string {
 }
 
 func callerPatternMatch(r *rule, scope, key string) (bool, bool) {
-	return callerPatternMatchWithCallerCache(r, scope, key, false)
-}
-
-func callerPatternMatchWithCallerCache(r *rule, scope, key string, allowUnboundCache bool) (bool, bool) {
-	authenticated := key != "" && callerScope(key) == scope
-	if !allowUnboundCache && !authenticated {
+	if key == "" || callerScope(key) != scope {
 		return false, false
 	}
 	cacheKey := callerPatternCacheKey{scope: scope, pattern: r.callerPatternText}
@@ -3040,9 +3031,6 @@ func callerPatternMatchWithCallerCache(r *rule, scope, key string, allowUnboundC
 	callerPatternCacheMu.RUnlock()
 	if ok {
 		return matched, true
-	}
-	if !authenticated {
-		return false, false
 	}
 	_, matched = matchTokens(key, r.callerPattern)
 	callerPatternCacheMu.Lock()
@@ -3062,10 +3050,6 @@ func callerPatternMatchWithCallerCache(r *rule, scope, key string, allowUnboundC
 }
 
 func callerMatchesRule(r *rule, scope, key string) bool {
-	return callerMatchesRuleWithCallerCache(r, scope, key, false)
-}
-
-func callerMatchesRuleWithCallerCache(r *rule, scope, key string, allowUnboundCache bool) bool {
 	if r.callerScope == "" && len(r.callerPattern) == 0 {
 		return true
 	}
@@ -3075,7 +3059,7 @@ func callerMatchesRuleWithCallerCache(r *rule, scope, key string, allowUnboundCa
 	matched := r.callerScope == scope
 	if len(r.callerPattern) > 0 {
 		var ok bool
-		matched, ok = callerPatternMatchWithCallerCache(r, scope, key, allowUnboundCache)
+		matched, ok = callerPatternMatch(r, scope, key)
 		if !ok {
 			return false
 		}
@@ -3084,15 +3068,11 @@ func callerMatchesRuleWithCallerCache(r *rule, scope, key string, allowUnboundCa
 }
 
 func applyRules(model, scope, key string, rules []rule) (string, bool, error) {
-	return applyRulesWithCallerCache(model, scope, key, rules, false)
-}
-
-func applyRulesWithCallerCache(model, scope, key string, rules []rule, allowUnboundCache bool) (string, bool, error) {
 	current := model
 	matchedAny := false
 	for i := range rules {
 		r := &rules[i]
-		if !callerMatchesRuleWithCallerCache(r, scope, key, allowUnboundCache) {
+		if !callerMatchesRule(r, scope, key) {
 			continue
 		}
 		if r.caseOperation != caseOperationNone {

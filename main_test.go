@@ -1564,22 +1564,12 @@ func TestExecutorReusesCallerStackAfterWarmRoute(t *testing.T) {
 			if err != nil {
 				t.Fatalf("marshal executor request: %v", err)
 			}
-			var captured hostModelExecutionRequest
-			_, err = handleExecutorExecute(rawReq, func(_ string, payload any) (json.RawMessage, error) {
-				raw, err := json.Marshal(payload)
-				if err != nil {
-					return nil, err
-				}
-				if err := json.Unmarshal(raw, &captured); err != nil {
-					return nil, err
-				}
-				return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: 200, Body: []byte(`{"model":"target"}`)})
+			_, err = handleExecutorExecute(rawReq, func(_ string, _ any) (json.RawMessage, error) {
+				t.Fatal("host callback called for unbound credential")
+				return nil, nil
 			})
-			if err != nil {
-				t.Fatalf("executor after warm route: %v", err)
-			}
-			if captured.Model != "target" {
-				t.Fatalf("forwarded model=%q, want target", captured.Model)
+			if err == nil || !strings.Contains(err.Error(), "unhandled model route") {
+				t.Fatalf("executor after warm route error = %v, want unhandled model route", err)
 			}
 		})
 	}
@@ -3674,19 +3664,103 @@ func TestModelRouteDoesNotReuseCallerPatternWithoutBoundCredential(t *testing.T)
 	}
 }
 
+func TestExecutorDoesNotReuseOtherRequestCallerPattern(t *testing.T) {
+	for _, tt := range []struct {
+		name, rules string
+	}{
+		{name: "positive wildcard", rules: "foo=>bar;key*#bar=>baz"},
+		{name: "inverse wildcard", rules: "foo=>bar;#other*#bar=>baz"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			setLoadedConfigForTest(Config{GlobalRules: tt.rules})
+			scope := callerScope("key123")
+			if _, err := routeModel(loadedConfig(), "openai", "bar", scope, "key123"); err != nil {
+				t.Fatal(err)
+			}
+			route, err := routeModel(loadedConfig(), "openai", "foo", scope, "")
+			if err != nil || route.UpstreamModel != "bar" {
+				t.Fatalf("route=%+v err=%v, want bar", route, err)
+			}
+			raw, err := json.Marshal(rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+				Model: "foo", Format: "openai", SourceFormat: "openai",
+				Metadata:        map[string]any{"caller_scope": scope},
+				OriginalRequest: []byte(`{"model":"foo"}`),
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = handleExecutorExecute(raw, func(method string, payload any) (json.RawMessage, error) {
+				if method != pluginabi.MethodHostModelExecute {
+					t.Errorf("method=%q, want %q", method, pluginabi.MethodHostModelExecute)
+				}
+				if got := payload.(hostModelExecutePayload).Model; got != "bar" {
+					t.Errorf("upstream model=%q, want bar", got)
+				}
+				return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: http.StatusOK, Body: []byte(`{"model":"bar"}`)})
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestPrepareExecutorStreamDoesNotReuseOtherRequestCallerPattern(t *testing.T) {
+	for _, tt := range []struct {
+		name, rules string
+	}{
+		{name: "positive wildcard", rules: "foo=>bar;key*#bar=>baz"},
+		{name: "inverse wildcard", rules: "foo=>bar;#other*#bar=>baz"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			setLoadedConfigForTest(Config{GlobalRules: tt.rules})
+			scope := callerScope("key123")
+			if _, err := routeModel(loadedConfig(), "openai", "bar", scope, "key123"); err != nil {
+				t.Fatal(err)
+			}
+			route, err := routeModel(loadedConfig(), "openai", "foo", scope, "")
+			if err != nil || route.UpstreamModel != "bar" {
+				t.Fatalf("route=%+v err=%v, want bar", route, err)
+			}
+			_, _, err = prepareExecutorStream(&executorRPCRequest{
+				Model: "foo", Format: "openai", SourceFormat: "openai",
+				Metadata:        map[string]any{"caller_scope": scope},
+				OriginalRequest: []byte(`{"model":"foo"}`),
+			}, func(method string, payload any) (json.RawMessage, error) {
+				if method != pluginabi.MethodHostModelExecuteStream {
+					t.Errorf("method=%q, want %q", method, pluginabi.MethodHostModelExecuteStream)
+				}
+				if got := payload.(hostModelExecutePayload).Model; got != "bar" {
+					t.Errorf("upstream model=%q, want bar", got)
+				}
+				return json.Marshal(pluginapi.HostModelStreamResponse{StatusCode: http.StatusOK, StreamID: "host-stream"})
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestExecutorReusesCallerPatternAfterHeadersChange(t *testing.T) {
+	const positive = "sk-kimi-*#client-model=>wildcard-target"
 	tests := []struct {
 		name, rules, key, upstream string
-		headers                    http.Header
+		routeHeaders, headers      http.Header
+		query                      url.Values
 	}{
-		{name: "positive wildcard", rules: "sk-kimi-*#client-model=>wildcard-target", key: "sk-kimi-team", headers: http.Header{"Authorization": {"Bearer sk-kimi-team"}}, upstream: "wildcard-target"},
-		{name: "inverse wildcard", rules: "#sk-*#client-model=>inverse-target", key: "ak-team", headers: http.Header{"X-Api-Key": {"ak-team"}}, upstream: "inverse-target"},
+		{name: "positive wildcard replaced", rules: positive, key: "sk-kimi-team", routeHeaders: http.Header{"Authorization": {"Bearer sk-kimi-team"}}, headers: http.Header{"Authorization": {"Bearer interceptor-replacement"}}},
+		{name: "inverse wildcard replaced", rules: "#sk-*#client-model=>inverse-target", key: "ak-team", routeHeaders: http.Header{"X-Api-Key": {"ak-team"}}, headers: http.Header{"Authorization": {"Bearer interceptor-replacement"}}},
+		{name: "unscoped fallback after replacement", rules: positive + ";client-model=>fallback-target", key: "sk-kimi-team", routeHeaders: http.Header{"Authorization": {"Bearer sk-kimi-team"}}, headers: http.Header{"Authorization": {"Bearer interceptor-replacement"}}, upstream: "fallback-target"},
+		{name: "bound header", rules: positive, key: "sk-kimi-team", routeHeaders: http.Header{"Authorization": {"Bearer sk-kimi-team"}}, headers: http.Header{"Authorization": {"Bearer sk-kimi-team"}}, upstream: "wildcard-target"},
+		{name: "bound query key", rules: positive, key: "sk-kimi-team", routeHeaders: http.Header{"Authorization": {"Bearer sk-kimi-team"}}, query: url.Values{"key": {"sk-kimi-team"}}, upstream: "wildcard-target"},
+		{name: "bound query auth_token inverse", rules: "#sk-*#client-model=>inverse-target", key: "ak-team", routeHeaders: http.Header{"X-Api-Key": {"ak-team"}}, query: url.Values{"auth_token": {"ak-team"}}, upstream: "inverse-target"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			setLoadedConfigForTest(Config{GlobalRules: tt.rules})
 			metadata := map[string]any{"caller_scope": callerScope(tt.key)}
-			routeRaw, err := json.Marshal(pluginapi.ModelRouteRequest{SourceFormat: "openai", RequestedModel: "client-model", Metadata: metadata, Headers: tt.headers})
+			routeRaw, err := json.Marshal(pluginapi.ModelRouteRequest{SourceFormat: "openai", RequestedModel: "client-model", Metadata: metadata, Headers: tt.routeHeaders})
 			if err != nil {
 				t.Fatalf("marshal route request: %v", err)
 			}
@@ -3704,29 +3778,31 @@ func TestExecutorReusesCallerPatternAfterHeadersChange(t *testing.T) {
 				Format:          "openai",
 				SourceFormat:    "openai",
 				Metadata:        metadata,
-				Headers:         http.Header{"Authorization": {"Bearer interceptor-replacement"}},
+				Headers:         tt.headers,
+				Query:           tt.query,
 				OriginalRequest: []byte(`{"model":"client-model"}`),
 			}}
 			rawReq, err := json.Marshal(req)
 			if err != nil {
 				t.Fatalf("marshal executor request: %v", err)
 			}
-			var captured hostModelExecutionRequest
+			called := false
 			_, err = handleExecutorExecute(rawReq, func(method string, payload any) (json.RawMessage, error) {
-				raw, err := json.Marshal(payload)
-				if err != nil {
-					return nil, err
+				called = true
+				if method != pluginabi.MethodHostModelExecute {
+					t.Errorf("method=%q, want %q", method, pluginabi.MethodHostModelExecute)
 				}
-				if err := json.Unmarshal(raw, &captured); err != nil {
-					return nil, err
+				if got := payload.(hostModelExecutePayload).Model; got != tt.upstream {
+					t.Errorf("forwarded model=%q, want %q", got, tt.upstream)
 				}
-				return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: 200, Body: []byte(`{"model":"` + tt.upstream + `"}`)})
+				return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: http.StatusOK, Body: []byte(`{"model":"` + tt.upstream + `"}`)})
 			})
-			if err != nil {
-				t.Fatalf("handleExecutorExecute error = %v", err)
-			}
-			if captured.Model != tt.upstream {
-				t.Fatalf("forwarded model=%q, want %q", captured.Model, tt.upstream)
+			if tt.upstream == "" {
+				if err == nil || !strings.Contains(err.Error(), "unhandled model route") || called {
+					t.Fatalf("executor error=%v host called=%v, want unhandled without host call", err, called)
+				}
+			} else if err != nil || !called {
+				t.Fatalf("executor error=%v host called=%v, want forwarded model %q", err, called, tt.upstream)
 			}
 		})
 	}
@@ -3808,25 +3884,35 @@ func TestEquivalentReconfigurePreservesCallerPatternDecisionForExecutor(t *testi
 	if err != nil {
 		t.Fatalf("marshal executor request: %v", err)
 	}
-	var captured hostModelExecutionRequest
+	_, err = handleExecutorExecute(rawReq, func(_ string, _ any) (json.RawMessage, error) {
+		t.Fatal("host callback called for unbound credential")
+		return nil, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "unhandled model route") {
+		t.Fatalf("executor after reconfigure error = %v, want unhandled model route", err)
+	}
+
+	rawReq, err = json.Marshal(rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+		Model: "client-model", Format: "openai", SourceFormat: "openai",
+		Metadata: metadata, Headers: http.Header{"Authorization": {"Bearer " + key}},
+		OriginalRequest: []byte(`{"model":"client-model"}`),
+	}})
+	if err != nil {
+		t.Fatalf("marshal bound executor request: %v", err)
+	}
+	called := false
 	_, err = handleExecutorExecute(rawReq, func(method string, payload any) (json.RawMessage, error) {
+		called = true
 		if method != pluginabi.MethodHostModelExecute {
-			t.Fatalf("method=%q, want %q", method, pluginabi.MethodHostModelExecute)
+			t.Errorf("method=%q, want %q", method, pluginabi.MethodHostModelExecute)
 		}
-		raw, err := json.Marshal(payload)
-		if err != nil {
-			return nil, err
-		}
-		if err := json.Unmarshal(raw, &captured); err != nil {
-			return nil, err
+		if got := payload.(hostModelExecutePayload).Model; got != "wildcard-target" {
+			t.Errorf("forwarded model=%q, want wildcard-target", got)
 		}
 		return json.Marshal(pluginapi.HostModelExecutionResponse{StatusCode: http.StatusOK, Body: []byte(`{"model":"wildcard-target"}`)})
 	})
-	if err != nil {
-		t.Fatalf("handleExecutorExecute error = %v", err)
-	}
-	if captured.Model != "wildcard-target" {
-		t.Fatalf("forwarded model=%q, want wildcard-target", captured.Model)
+	if err != nil || !called {
+		t.Fatalf("bound executor error=%v host called=%v, want wildcard-target", err, called)
 	}
 }
 
