@@ -675,7 +675,7 @@ func completeSSEEvents(p []byte) bool {
 }
 
 func sseContainsEscapedModelField(p []byte) bool {
-	if !bytes.Contains(p, []byte(`\u`)) {
+	if !bytes.Contains(p, []byte(`\u00`)) {
 		return false
 	}
 	var scanner responseModelMarkerScanner

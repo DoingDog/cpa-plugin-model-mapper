@@ -2888,6 +2888,19 @@ func TestStreamChunkRewriterRestoresEscapedModelAcrossSSEDataFields(t *testing.T
 	}
 }
 
+func TestStreamChunkRewriterRestoresEscapedModelVersionAcrossSSEDataFields(t *testing.T) {
+	input := []byte("data: {\"model" + string(rune(92)) + "u0056ersion\"\ndata: :\"upstream\"}\n\n")
+	r := newStreamChunkRewriter("client")
+	r.frameRawJSONAsSSE = true
+	chunks, err := r.Write(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := flattenChunks(chunks); got != "data: {\"modelVersion\":\"client\"}\n\n" {
+		t.Fatalf("stream = %q, want restored modelVersion", got)
+	}
+}
+
 func TestStreamChunkRewriterPreservesOtherEscapedSSEDataFields(t *testing.T) {
 	backslash := string(rune(92))
 	input := []byte("event: message\ndata: {\"" + backslash + "u006eote\"\ndata: :\"keep\"}\n\n")

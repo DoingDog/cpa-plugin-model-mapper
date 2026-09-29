@@ -778,6 +778,21 @@ func BenchmarkStreamChunkRewriterEscapedSSEBatch(b *testing.B) {
 	}
 }
 
+func BenchmarkStreamChunkRewriterUnicodeEscapedSSEBatch(b *testing.B) {
+	payload := bytes.Repeat([]byte("data: {\"text\":\"a\\u4e2db\"}\n\n"), 8192)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		r := newStreamChunkRewriter("client")
+		r.frameRawJSONAsSSE = true
+		chunks, err := r.Write(payload)
+		if err != nil || len(chunks) != 1 || !bytes.Equal(chunks[0], payload) {
+			b.Fatalf("Write=(%d,%v), want unchanged batch", len(chunks), err)
+		}
+	}
+}
+
 func BenchmarkStreamChunkRewriterCompleteSSEBatch(b *testing.B) {
 	payload := bytes.Repeat([]byte("data:x\n\n"), 8192)
 	r := newStreamChunkRewriter("client")
