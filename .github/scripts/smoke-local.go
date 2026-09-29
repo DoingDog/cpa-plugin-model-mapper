@@ -165,7 +165,14 @@ func smokePluginPaths(repoRoot, smokeDir string) (string, string) {
 		ext = ".dylib"
 	}
 	name := "model-mapper" + ext
-	return filepath.Join(repoRoot, "dist", runtime.GOOS+"_"+runtime.GOARCH, name),
+	distDir := os.Getenv("CPA_SMOKE_DIST_DIR")
+	if distDir == "" {
+		distDir = "dist"
+	}
+	if !filepath.IsAbs(distDir) {
+		distDir = filepath.Join(repoRoot, distDir)
+	}
+	return filepath.Join(distDir, runtime.GOOS+"_"+runtime.GOARCH, name),
 		filepath.Join(smokeDir, "plugins", runtime.GOOS, runtime.GOARCH, name)
 }
 

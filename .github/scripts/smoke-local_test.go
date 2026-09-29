@@ -18,6 +18,7 @@ import (
 )
 
 func TestSmokePluginPathsUseHostPlatform(t *testing.T) {
+	t.Setenv("CPA_SMOKE_DIST_DIR", "")
 	repo := filepath.Join("repo")
 	dir := filepath.Join(repo, ".test-cpa")
 	source, destination := smokePluginPaths(repo, dir)
@@ -34,6 +35,71 @@ func TestSmokePluginPathsUseHostPlatform(t *testing.T) {
 	}
 	if destination != filepath.Join(dir, "plugins", runtime.GOOS, runtime.GOARCH, name) {
 		t.Fatalf("destination=%q", destination)
+	}
+}
+
+func TestSmokePluginPathsCustomDist(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		distDir string
+	}{
+		{name: "relative", distDir: "custom builds"},
+		{name: "absolute", distDir: filepath.Join(t.TempDir(), "absolute builds")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CPA_SMOKE_DIST_DIR", tc.distDir)
+			repo := t.TempDir()
+			dir := filepath.Join(repo, ".test-cpa")
+			ext := ".so"
+			if runtime.GOOS == "windows" {
+				ext = ".dll"
+			}
+			if runtime.GOOS == "darwin" {
+				ext = ".dylib"
+			}
+			name := "model-mapper" + ext
+			platform := runtime.GOOS + "_" + runtime.GOARCH
+			customDir := tc.distDir
+			if !filepath.IsAbs(customDir) {
+				customDir = filepath.Join(repo, customDir)
+			}
+			oldSource := filepath.Join(repo, "dist", platform, name)
+			wantSource := filepath.Join(customDir, platform, name)
+			for _, file := range []struct {
+				path string
+				data string
+			}{
+				{oldSource, "old bytes"},
+				{wantSource, "new bytes"},
+			} {
+				if err := os.MkdirAll(filepath.Dir(file.path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(file.path, []byte(file.data), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			source, destination := smokePluginPaths(repo, dir)
+			if source != wantSource {
+				t.Fatalf("source=%q, want %q", source, wantSource)
+			}
+			if wantDestination := filepath.Join(dir, "plugins", runtime.GOOS, runtime.GOARCH, name); destination != wantDestination {
+				t.Fatalf("destination=%q, want %q", destination, wantDestination)
+			}
+			if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := copyFile(source, destination); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(destination)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != "new bytes" {
+				t.Fatalf("copied %q, want new bytes", got)
+			}
+		})
 	}
 }
 

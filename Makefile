@@ -81,18 +81,18 @@ package:
 install-local: build-windows-amd64
 	@if [ -z "$(CPA_PLUGINS_DIR)" ]; then echo "CPA_PLUGINS_DIR is required"; exit 1; fi
 	mkdir -p "$(CPA_PLUGINS_DIR)"
-	cp $(WINDOWS_AMD64_OUT) "$(CPA_PLUGINS_DIR)/$(PLUGIN_NAME).dll"
+	cp "$(WINDOWS_AMD64_OUT)" "$(CPA_PLUGINS_DIR)/$(PLUGIN_NAME).dll"
 
 install-linux-amd64: build-linux-amd64
 	@if [ -z "$(CPA_PLUGINS_DIR)" ]; then echo "CPA_PLUGINS_DIR is required"; exit 1; fi
 	mkdir -p "$(CPA_PLUGINS_DIR)"
-	cp $(LINUX_AMD64_OUT) "$(CPA_PLUGINS_DIR)/$(PLUGIN_NAME).so"
+	cp "$(LINUX_AMD64_OUT)" "$(CPA_PLUGINS_DIR)/$(PLUGIN_NAME).so"
 
 smoke-local:
 	@host_goos="$$( $(GO) env GOHOSTOS )"; \
 	host_goarch="$$( $(GO) env GOHOSTARCH )"; \
 	$(MAKE) --no-print-directory build-platform GOOS="$$host_goos" GOARCH="$$host_goarch" GO="$(GO)" DIST_DIR="$(DIST_DIR)" PLUGIN_NAME="$(PLUGIN_NAME)"
-	GOOS= GOARCH= CGO_ENABLED= $(GO) run .github/scripts/smoke-local.go
+	CPA_SMOKE_DIST_DIR="$(DIST_DIR)" GOOS= GOARCH= CGO_ENABLED= $(GO) run .github/scripts/smoke-local.go
 
 integration:
 	@set -eu; \
@@ -122,4 +122,4 @@ integration:
 	CPA_SMOKE_INTEGRATION=1 CPA_SMOKE_CPA_BIN="$$bin" CPA_SMOKE_PLUGIN="$$plugin" GOOS= GOARCH= CGO_ENABLED= $(GO) test -count=1 -v .github/scripts/smoke-local.go .github/scripts/smoke-local_test.go -run '^TestCPAPluginIntegration$$'
 
 clean:
-	rm -rf $(DIST_DIR)
+	rm -rf "$(DIST_DIR)"
