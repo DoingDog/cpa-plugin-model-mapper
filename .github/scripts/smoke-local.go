@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -368,7 +369,10 @@ func stopCPA(proc *cpaProcess) (stopErr error) {
 	}
 	if interruptErr == nil {
 		select {
-		case <-proc.waitDone:
+		case waitErr := <-proc.waitDone:
+			if waitErr != nil && !expectedInterruptExit(waitErr) {
+				return earlyExitError(proc.logFile.Name(), waitErr)
+			}
 			return nil
 		case <-time.After(2 * time.Second):
 		}
@@ -397,10 +401,19 @@ func stopCPA(proc *cpaProcess) (stopErr error) {
 		return fmt.Errorf("kill CPA: %w", killErr)
 	}
 	waitErr := <-proc.waitDone
-	if errors.Is(killErr, os.ErrProcessDone) && interruptErr != nil && waitErr != nil {
+	if errors.Is(killErr, os.ErrProcessDone) && waitErr != nil && !expectedInterruptExit(waitErr) {
 		return earlyExitError(proc.logFile.Name(), waitErr)
 	}
 	return nil
+}
+
+func expectedInterruptExit(waitErr error) bool {
+	var exitErr *exec.ExitError
+	if !errors.As(waitErr, &exitErr) {
+		return false
+	}
+	status, ok := exitErr.Sys().(syscall.WaitStatus)
+	return ok && status.Signaled() && status.Signal() == syscall.SIGINT
 }
 
 func checkPortAvailable(address string) error {
