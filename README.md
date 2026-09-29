@@ -194,9 +194,9 @@ When model restoration changes nonstream response bytes, the plugin removes `Con
 
 Opaque response content and tool text are not recursively rewritten. Before closing the plugin stream after a read error, the plugin flushes complete pending SSE bytes; incomplete raw JSON is rejected instead of being emitted as an invalid SSE event.
 
-Unframed raw JSON stream chunks preserve the bytes that separate complete JSON values. Gemini streamed JSON arrays restore the top-level `modelVersion` of each object element. Gemini raw core chunks are not double-framed.
+Unframed raw JSON stream chunks preserve the bytes that separate complete JSON values. Gemini streamed JSON arrays restore the top-level `modelVersion` of each object element. Gemini raw core chunks and OpenAI chat/completions raw JSON chunks are not double-framed.
 
-When raw JSON is framed as SSE, `openai-response` and `claude` include an `event:` line from the top-level `type`. A clean `openai` Chat completion appends `data: [DONE]`, while Gemini does not append `[DONE]`.
+When raw JSON is framed as SSE, `openai-response` and `claude` include an `event:` line from the top-level `type`. CPA's OpenAI handler already writes `data: %s\n\n` for every chat/completions payload and emits the terminating `data: [DONE]` itself (`sdk/api/handlers/openai/openai_handlers.go`), so the plugin restores the model in the raw JSON chunk and hands it over unframed, without appending a `[DONE]` of its own.
 
 Delimiterless OpenAI Responses logical events produced by CPA's provider translators are separated by their complete JSON `data:` values before model restoration; host stream-read boundaries alone are never treated as SSE delimiters.
 
