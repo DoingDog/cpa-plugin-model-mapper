@@ -1551,7 +1551,11 @@ func handleModelRoute(raw []byte) ([]byte, error) {
 	cfg := loadedConfig()
 	decision, err := routeModel(cfg, req.SourceFormat, req.RequestedModel, scope, callerAPIKeyForSelectedRules(cfg, req.SourceFormat, req.Headers, req.Query, scope))
 	if err != nil {
-		return nil, err
+		return json.Marshal(pluginapi.ModelRouteResponse{
+			Handled:    true,
+			TargetKind: pluginapi.ModelRouteTargetSelf,
+			Reason:     "runtime model mapping error",
+		})
 	}
 	if !decision.Handled {
 		return json.Marshal(pluginapi.ModelRouteResponse{Handled: false})
