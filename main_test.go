@@ -2274,8 +2274,8 @@ func TestRestoreResponseModelFastPathPreservesEscapedSemantics(t *testing.T) {
 		changed bool
 		want    string
 	}{
-		{name: "escaped model key", body: []byte(`{"` + backslash + `u006dodel":"upstream"}`), changed: true, want: `"model":"client"`},
-		{name: "escaped nested response and model keys", body: []byte(`{"res` + backslash + `u0070onse":{"` + backslash + `u006dodel":"upstream"}}`), changed: true, want: `"model":"client"`},
+		{name: "escaped model key", body: []byte(`{"` + backslash + `u006dodel":"upstream"}`), changed: true, want: `"` + backslash + `u006dodel":"client"`},
+		{name: "escaped nested response and model keys", body: []byte(`{"res` + backslash + `u0070onse":{"` + backslash + `u006dodel":"upstream"}}`), changed: true, want: `"` + backslash + `u006dodel":"client"`},
 		{name: "escaped equal value remains unchanged", body: []byte(`{"model":"cli` + backslash + `u0065nt"}`), changed: false},
 		{name: "ordinary escaped text remains unchanged", body: []byte(`{"text":"line` + backslash + `nnext"}`), changed: false},
 	}
@@ -2333,7 +2333,7 @@ func BenchmarkSSEMarkerGuardRestore(b *testing.B) {
 	event := []byte("data: {\"model\":\"upstream\",\"id\":\"r1\"}\n\n")
 	line, _, _ := splitSSELine(event)
 	value := sseFieldValue(line)
-	want := []byte(`{"id":"r1","model":"client"}`)
+	want := []byte(`{"model":"client","id":"r1"}`)
 	r := newSSERewriter("client")
 	if !mightContainResponseModelField(value) {
 		b.Fatal("model marker missing")
@@ -2359,7 +2359,7 @@ func BenchmarkSSEMarkerGuardCandidate(b *testing.B) {
 	event := []byte("data: {\"model\":\"upstream\",\"id\":\"r1\"}\n\n")
 	line, _, _ := splitSSELine(event)
 	value := sseFieldValue(line)
-	want := []byte(`{"id":"r1","model":"client"}`)
+	want := []byte(`{"model":"client","id":"r1"}`)
 	r := newSSERewriter("client")
 	if !mightContainResponseModelField(value) {
 		b.Fatal("model marker missing")
@@ -2847,7 +2847,7 @@ func TestSSERewriterRestoresEscapedKeyAcrossDataFields(t *testing.T) {
 	input := `data: {"` + backslash + `u006dodel"` + lf + `data: :"upstream"}` + lf + lf
 
 	chunks, err := newSSERewriter("client").Write([]byte(input))
-	want := `data: {"model":"client"}` + lf + lf
+	want := `data: {"` + backslash + `u006dodel":"client"}` + lf + lf
 	if err != nil || flattenChunks(chunks) != want {
 		t.Fatalf("Write=(%q,%v), want %q", chunks, err, want)
 	}
@@ -2856,7 +2856,7 @@ func TestSSERewriterRestoresEscapedKeyAcrossDataFields(t *testing.T) {
 func TestStreamChunkRewriterRestoresEscapedModelAcrossSSEDataFields(t *testing.T) {
 	backslash := string(rune(92))
 	input := []byte("event: message\nid: 7\ndata: {\"" + backslash + "u006dodel\"\ndata: :\"upstream\",\"text\":\"keep\"}\n\n")
-	want := "event: message\nid: 7\ndata: {\"model\":\"client\",\"text\":\"keep\"}\n\n"
+	want := "event: message\nid: 7\ndata: {\"" + backslash + "u006dodel\":\"client\",\"text\":\"keep\"}\n\n"
 	cut := bytes.Index(input, []byte("\ndata: :")) + 1
 	for _, tc := range []struct {
 		name  string
@@ -2896,7 +2896,7 @@ func TestStreamChunkRewriterRestoresEscapedModelVersionAcrossSSEDataFields(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := flattenChunks(chunks); got != "data: {\"modelVersion\":\"client\"}\n\n" {
+	if got := flattenChunks(chunks); got != "data: {\"model"+string(rune(92))+"u0056ersion\":\"client\"}\n\n" {
 		t.Fatalf("stream = %q, want restored modelVersion", got)
 	}
 }
@@ -3605,7 +3605,7 @@ func TestHandleExecutorExecuteAllFormats(t *testing.T) {
 		rewrittenRequest = `{"content":[{"text":"client-model in content"}],"model":"upstream-model","nested":{"model":"client-model","content":"client-model in nested content"},"tools":[{"arguments":"client-model in tool arguments"}]}`
 		geminiRequest    = `{"contents":[{"parts":[{"text":"client-model in content"}]}],"generationConfig":{"toolConfig":{"arguments":"client-model in tool arguments"}},"nested":{"model":"client-model"}}`
 		upstreamResponse = `{"model":"upstream-model","modelVersion":"upstream-model","message":{"model":"upstream-model","content":"upstream-model in message content"},"response":{"model":"upstream-model","modelVersion":"upstream-model","content":"upstream-model in response content","tool":{"arguments":"upstream-model in response tool"}},"nested":{"model":"upstream-model","content":"upstream-model in nested content","tool":{"arguments":"upstream-model in nested tool"}},"content":[{"text":"upstream-model in content"}],"tools":[{"arguments":"upstream-model in tool arguments"}]}`
-		restoredResponse = `{"content":[{"text":"upstream-model in content"}],"message":{"content":"upstream-model in message content","model":"client-model"},"model":"client-model","modelVersion":"client-model","nested":{"model":"upstream-model","content":"upstream-model in nested content","tool":{"arguments":"upstream-model in nested tool"}},"response":{"content":"upstream-model in response content","model":"client-model","modelVersion":"client-model","tool":{"arguments":"upstream-model in response tool"}},"tools":[{"arguments":"upstream-model in tool arguments"}]}`
+		restoredResponse = `{"model":"client-model","modelVersion":"client-model","message":{"model":"client-model","content":"upstream-model in message content"},"response":{"model":"client-model","modelVersion":"client-model","content":"upstream-model in response content","tool":{"arguments":"upstream-model in response tool"}},"nested":{"model":"upstream-model","content":"upstream-model in nested content","tool":{"arguments":"upstream-model in nested tool"}},"content":[{"text":"upstream-model in content"}],"tools":[{"arguments":"upstream-model in tool arguments"}]}`
 	)
 	formats := []string{"openai", "openai-response", "claude", "gemini", "interactions"}
 	requests := map[string]struct {
@@ -4454,7 +4454,7 @@ func TestHandleExecutorExecuteStreamAllFormats(t *testing.T) {
 		rewrittenRequest = `{"content":[{"text":"client-model in content"}],"model":"upstream-model","nested":{"model":"client-model","content":"client-model in nested content"},"tools":[{"arguments":"client-model in tool arguments"}]}`
 		geminiRequest    = `{"contents":[{"parts":[{"text":"client-model in content"}]}],"generationConfig":{"toolConfig":{"arguments":"client-model in tool arguments"}},"nested":{"model":"client-model"}}`
 		upstreamResponse = `{"model":"upstream-model","modelVersion":"upstream-model","message":{"model":"upstream-model","content":"upstream-model in message content"},"response":{"model":"upstream-model","modelVersion":"upstream-model","content":"upstream-model in response content","tool":{"arguments":"upstream-model in response tool"}},"nested":{"model":"upstream-model","content":"upstream-model in nested content","tool":{"arguments":"upstream-model in nested tool"}},"content":[{"text":"upstream-model in content"}],"tools":[{"arguments":"upstream-model in tool arguments"}]}`
-		restoredResponse = `{"content":[{"text":"upstream-model in content"}],"message":{"content":"upstream-model in message content","model":"client-model"},"model":"client-model","modelVersion":"client-model","nested":{"model":"upstream-model","content":"upstream-model in nested content","tool":{"arguments":"upstream-model in nested tool"}},"response":{"content":"upstream-model in response content","model":"client-model","modelVersion":"client-model","tool":{"arguments":"upstream-model in response tool"}},"tools":[{"arguments":"upstream-model in tool arguments"}]}`
+		restoredResponse = `{"model":"client-model","modelVersion":"client-model","message":{"model":"client-model","content":"upstream-model in message content"},"response":{"model":"client-model","modelVersion":"client-model","content":"upstream-model in response content","tool":{"arguments":"upstream-model in response tool"}},"nested":{"model":"upstream-model","content":"upstream-model in nested content","tool":{"arguments":"upstream-model in nested tool"}},"content":[{"text":"upstream-model in content"}],"tools":[{"arguments":"upstream-model in tool arguments"}]}`
 	)
 	formats := []string{"openai", "openai-response", "claude", "gemini", "interactions"}
 	requests := map[string]struct {
@@ -4723,7 +4723,7 @@ func TestStreamChunkRewriterRejectsNewlinesInSynthesizedEventType(t *testing.T) 
 		if err != nil {
 			t.Fatalf("Flush: %v", err)
 		}
-		want := "data: {\"message\":{\"model\":\"client\"},\"type\":\"message_start" + escaped + "id: injected\"}\n\n"
+		want := "data: {\"type\":\"message_start" + escaped + "id: injected\",\"message\":{\"model\":\"client\"}}\n\n"
 		if got := string(bytes.Join(append(chunks, flushed...), nil)); got != want {
 			t.Fatalf("output=%q, want %q", got, want)
 		}
@@ -4732,7 +4732,7 @@ func TestStreamChunkRewriterRejectsNewlinesInSynthesizedEventType(t *testing.T) 
 
 func TestStreamChunkRewriterFramesRawJSONBeforeSSEDoneInSameWrite(t *testing.T) {
 	input := `{"model":"upstream","choices":[]}` + "\n\ndata: [DONE]\n\n"
-	want := "data: {\"choices\":[],\"model\":\"client\"}\n\ndata: [DONE]\n\n"
+	want := "data: {\"model\":\"client\",\"choices\":[]}\n\ndata: [DONE]\n\n"
 	for _, parts := range [][][]byte{
 		{[]byte(input)},
 		{[]byte(`{"model":"upstream","choices":[]}` + "\n\n"), []byte("data: [DONE]\n\n")},
@@ -4761,7 +4761,7 @@ func TestStreamChunkRewriterFramesRawJSONBeforeSSEDoneInSameWrite(t *testing.T) 
 func TestStreamChunkRewriterFramesRawJSONBeforeSSEDoneAcrossPartitions(t *testing.T) {
 	jsonPrefix := []byte(`{"model":"upstream","choices":[]}` + "\n\n")
 	sseSuffix := []byte("data: [DONE]\n\n")
-	want := "data: {\"choices\":[],\"model\":\"client\"}\n\ndata: [DONE]\n\n"
+	want := "data: {\"model\":\"client\",\"choices\":[]}\n\ndata: [DONE]\n\n"
 	for split := 0; split <= len(sseSuffix); split++ {
 		r := newStreamChunkRewriter("client")
 		r.format = "openai"
@@ -5372,19 +5372,22 @@ func TestStreamChunkRewriterPrefersValidRawJSONOverSSEDelimiterHeuristic(t *test
 	lineBreak := string([]byte{10})
 	blankLine := lineBreak + lineBreak
 	tests := []struct {
-		name       string
-		input      []byte
-		wantValues int
+		name         string
+		input        []byte
+		wantValues   int
+		wantPayloads []string
 	}{
 		{
-			name:       "formatted single value",
-			input:      []byte(`{` + blankLine + `"model":"B","type":"response.completed"` + lineBreak + `}`),
-			wantValues: 1,
+			name:         "formatted single value",
+			input:        []byte(`{` + blankLine + `"model":"B","type":"response.completed"` + lineBreak + `}`),
+			wantValues:   1,
+			wantPayloads: []string{`{` + blankLine + `"model":"A","type":"response.completed"` + lineBreak + `}`},
 		},
 		{
-			name:       "blank-line-delimited sequence",
-			input:      []byte(`{"model":"B"}` + blankLine + `{"response":{"model":"B"}}`),
-			wantValues: 2,
+			name:         "blank-line-delimited sequence",
+			input:        []byte(`{"model":"B"}` + blankLine + `{"response":{"model":"B"}}`),
+			wantValues:   2,
+			wantPayloads: []string{`{"model":"A"}`, `{"response":{"model":"A"}}`},
 		},
 	}
 	for _, tt := range tests {
@@ -5404,7 +5407,7 @@ func TestStreamChunkRewriterPrefersValidRawJSONOverSSEDelimiterHeuristic(t *test
 				if len(chunks) != tt.wantValues {
 					t.Fatalf("chunks = %q, want %d JSON values", chunks, tt.wantValues)
 				}
-				for _, chunk := range chunks {
+				for i, chunk := range chunks {
 					payload := chunk
 					if framed {
 						prefix := []byte("data: ")
@@ -5412,10 +5415,26 @@ func TestStreamChunkRewriterPrefersValidRawJSONOverSSEDelimiterHeuristic(t *test
 						if !bytes.HasPrefix(chunk, prefix) || !bytes.HasSuffix(chunk, suffix) {
 							t.Fatalf("framed chunk = %q, want one SSE data event", chunk)
 						}
-						payload = chunk[len(prefix) : len(chunk)-len(suffix)]
+						var data [][]byte
+						for remaining := chunk[:len(chunk)-len(suffix)]; len(remaining) > 0; {
+							line, _, next := splitSSELine(remaining)
+							remaining = next
+							if !bytes.HasPrefix(line, []byte("data:")) {
+								t.Fatalf("framed line = %q, want SSE data field", line)
+							}
+							data = append(data, sseFieldValue(line))
+						}
+						payload = bytes.Join(data, []byte{10})
 					}
 					if !json.Valid(payload) || bytes.Contains(payload, []byte(`"B"`)) || !bytes.Contains(payload, []byte(`"A"`)) {
 						t.Fatalf("payload = %q, want valid JSON with restored model A", payload)
+					}
+					want := tt.wantPayloads[i]
+					if !framed && i > 0 {
+						want = blankLine + want
+					}
+					if !bytes.Equal(payload, []byte(want)) {
+						t.Fatalf("payload = %q, want %q", payload, want)
 					}
 				}
 			})

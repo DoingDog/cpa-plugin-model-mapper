@@ -2283,29 +2283,71 @@ func rewriteTopLevelModel(body []byte, model string) ([]byte, bool, error) {
 	return out, true, nil
 }
 
+type jsonByteEdit struct {
+	start, end  int
+	replacement json.RawMessage
+}
+
+func applyJSONByteEdits(body []byte, edits []jsonByteEdit) []byte {
+	if len(edits) == 0 {
+		return bytes.Clone(body)
+	}
+	size := len(body)
+	for _, edit := range edits {
+		size += len(edit.replacement) - (edit.end - edit.start)
+	}
+	out := make([]byte, size)
+	written, copyFrom := 0, 0
+	for _, edit := range edits {
+		written += copy(out[written:], body[copyFrom:edit.start])
+		written += copy(out[written:], edit.replacement)
+		copyFrom = edit.end
+	}
+	copy(out[written:], body[copyFrom:])
+	return out
+}
+
 func rewriteTopLevelModelCanonical(body []byte, model string) ([]byte, bool, error) {
-	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(body, &doc); err != nil {
-		return bytes.Clone(body), false, nil
+	d := json.NewDecoder(bytes.NewReader(body))
+	if _, err := d.Token(); err != nil {
+		return nil, false, err
 	}
-	rawValue, ok := doc["model"]
-	if !ok || len(rawValue) < 2 || rawValue[0] != '"' || rawValue[len(rawValue)-1] != '"' {
-		return bytes.Clone(body), false, nil
+	var edits []jsonByteEdit
+	var lastModel json.RawMessage
+	for d.More() {
+		memberStart := skipTopLevelModelJSONSpace(body, int(d.InputOffset()))
+		key, err := d.Token()
+		if err != nil {
+			return nil, false, err
+		}
+		var raw json.RawMessage
+		if err := d.Decode(&raw); err != nil {
+			return nil, false, err
+		}
+		if key != "model" {
+			continue
+		}
+		end := int(d.InputOffset())
+		start := end - len(raw)
+		if len(edits) > 0 {
+			// 后续 model member 连同前置逗号删除，其他 member 保留原字节。
+			start = memberStart
+		}
+		edits = append(edits, jsonByteEdit{start: start, end: end})
+		lastModel = raw
 	}
-	var current string
-	if err := json.Unmarshal(rawValue, &current); err != nil {
+	if _, err := d.Token(); err != nil {
+		return nil, false, err
+	}
+	if len(lastModel) == 0 || lastModel[0] != '"' {
 		return bytes.Clone(body), false, nil
 	}
 	replacement, err := json.Marshal(model)
 	if err != nil {
 		return nil, false, err
 	}
-	doc["model"] = replacement
-	out, err := json.Marshal(doc)
-	if err != nil {
-		return nil, false, err
-	}
-	return out, true, nil
+	edits[0].replacement = replacement
+	return applyJSONByteEdits(body, edits), true, nil
 }
 
 func findTopLevelModelValue(body []byte) (int, int, bool, bool) {
@@ -2592,139 +2634,87 @@ func rewriteResponseModelFieldsWithReplacementChecked(body []byte, model string,
 	if start == len(body) {
 		return bytes.Clone(body), false, false, nil
 	}
+	d := json.NewDecoder(bytes.NewReader(body))
+	var edits []jsonByteEdit
+	var raw json.RawMessage
+	var err error
 	switch body[start] {
 	case '{':
-		return rewriteResponseModelObjectWithReplacementChecked(body, model, replacement)
+		err = collectResponseModelEdits(d, 0, model, replacement, "", &edits)
 	case '[':
-		return rewriteResponseModelArrayWithReplacementChecked(body, model, replacement)
-	default:
-		if !json.Valid(body) {
-			return bytes.Clone(body), false, false, nil
+		_, err = d.Token()
+		for err == nil && d.More() {
+			if err = d.Decode(&raw); err != nil {
+				break
+			}
+			if raw[0] == '{' {
+				offset := int(d.InputOffset()) - len(raw)
+				err = collectResponseModelEdits(json.NewDecoder(bytes.NewReader(raw)), offset, model, replacement, "", &edits)
+			}
 		}
-		return bytes.Clone(body), false, true, nil
+		if err == nil {
+			_, err = d.Token()
+		}
+	default:
+		err = d.Decode(&raw)
 	}
-}
-
-func rewriteResponseModelObjectWithReplacementChecked(body []byte, model string, replacement json.RawMessage) ([]byte, bool, bool, error) {
-	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(body, &doc); err != nil {
-		return bytes.Clone(body), false, false, nil
+	if err == nil {
+		err = d.Decode(&raw)
+		if err == io.EOF {
+			return applyJSONByteEdits(body, edits), len(edits) > 0, true, nil
+		}
 	}
-	changed := rewriteRawStringField(doc, "model", model, replacement)
-	changed = rewriteRawStringField(doc, "modelVersion", model, replacement) || changed
-	messageChanged, err := rewriteNestedRawStringFields(doc, "message", model, replacement, "model")
-	if err != nil {
-		return nil, false, true, err
-	}
-	changed = messageChanged || changed
-	responseChanged, err := rewriteNestedRawStringFields(doc, "response", model, replacement, "model", "modelVersion")
-	if err != nil {
-		return nil, false, true, err
-	}
-	changed = responseChanged || changed
-	interactionChanged, err := rewriteNestedRawStringFields(doc, "interaction", model, replacement, "model")
-	if err != nil {
-		return nil, false, true, err
-	}
-	changed = interactionChanged || changed
-	if !changed {
-		return bytes.Clone(body), false, true, nil
-	}
-	out, err := json.Marshal(doc)
-	if err != nil {
-		return nil, false, true, err
-	}
-	return out, true, true, nil
-}
-
-func rewriteResponseModelArrayWithReplacementChecked(body []byte, model string, replacement json.RawMessage) ([]byte, bool, bool, error) {
 	if !json.Valid(body) {
 		return bytes.Clone(body), false, false, nil
 	}
-	cursor := skipTopLevelModelJSONSpace(body, 0) + 1
-	copyFrom := 0
-	changed := false
-	var out []byte
-	for {
-		start := skipTopLevelModelJSONSpace(body, cursor)
-		if body[start] == ']' {
-			break
+	return nil, false, true, err
+}
+
+func collectResponseModelEdits(d *json.Decoder, offset int, model string, replacement json.RawMessage, parent string, edits *[]jsonByteEdit) error {
+	if _, err := d.Token(); err != nil {
+		return err
+	}
+	var raw json.RawMessage
+	for d.More() {
+		key, err := d.Token()
+		if err != nil {
+			return err
 		}
-		end := skipTopLevelModelJSONValue(body, start)
-		if body[start] == '{' {
-			restored, elementChanged, _, err := rewriteResponseModelObjectWithReplacementChecked(body[start:end], model, replacement)
+		if err := d.Decode(&raw); err != nil {
+			return err
+		}
+		end := offset + int(d.InputOffset())
+		start := end - len(raw)
+		if key == "model" || key == "modelVersion" && (parent == "" || parent == "response") {
+			if raw[0] != '"' {
+				continue
+			}
+			equal, err := responseModelStringEqual(raw, model)
 			if err != nil {
-				return nil, false, true, err
+				return err
 			}
-			if elementChanged {
-				if !changed {
-					out = make([]byte, 0, len(body)-end+start+len(restored))
-				}
-				out = append(out, body[copyFrom:start]...)
-				out = append(out, restored...)
-				copyFrom = end
-				changed = true
+			if !equal {
+				*edits = append(*edits, jsonByteEdit{start: start, end: end, replacement: replacement})
+			}
+		} else if parent == "" && raw[0] == '{' && (key == "response" || key == "message" || key == "interaction") {
+			if err := collectResponseModelEdits(json.NewDecoder(bytes.NewReader(raw)), start, model, replacement, key.(string), edits); err != nil {
+				return err
 			}
 		}
-		next := skipTopLevelModelJSONSpace(body, end)
-		if body[next] == ']' {
-			break
-		}
-		cursor = next + 1
 	}
-	if !changed {
-		return bytes.Clone(body), false, true, nil
-	}
-	out = append(out, body[copyFrom:]...)
-	return out, true, true, nil
+	_, err := d.Token()
+	return err
 }
 
-func rewriteNestedRawStringFields(doc map[string]json.RawMessage, key, model string, replacement json.RawMessage, fields ...string) (bool, error) {
-	raw, ok := doc[key]
-	if !ok {
-		return false, nil
-	}
-	var nested map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &nested); err != nil {
-		return false, nil
-	}
-	changed := false
-	for _, field := range fields {
-		changed = rewriteRawStringField(nested, field, model, replacement) || changed
-	}
-	if !changed {
-		return false, nil
-	}
-	out, err := json.Marshal(nested)
-	if err != nil {
-		return false, err
-	}
-	doc[key] = out
-	return true, nil
-}
-
-func rewriteRawStringField(doc map[string]json.RawMessage, key, model string, replacement json.RawMessage) bool {
-	raw, ok := doc[key]
-	if !ok {
-		return false
-	}
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 || trimmed[0] != '"' {
-		return false
-	}
-	if bytes.IndexByte(trimmed, '\\') < 0 && utf8.Valid(trimmed[1:len(trimmed)-1]) {
-		if len(trimmed) == len(model)+2 && bytes.Equal(trimmed[1:len(trimmed)-1], []byte(model)) {
-			return false
-		}
-		doc[key] = replacement
-		return true
+func responseModelStringEqual(raw []byte, model string) (bool, error) {
+	if bytes.IndexByte(raw, '\\') < 0 && utf8.Valid(raw[1:len(raw)-1]) {
+		return len(raw) == len(model)+2 && bytes.Equal(raw[1:len(raw)-1], []byte(model)), nil
 	}
 	var current string
-	if err := json.Unmarshal(trimmed, &current); err != nil || current == model {
-		return false
+	if err := json.Unmarshal(raw, &current); err != nil {
+		return false, err
 	}
-	doc[key] = replacement
-	return true
+	return current == model, nil
 }
 
 type token struct {
