@@ -1711,6 +1711,7 @@ type executorStream struct {
 	closePluginErr    error
 	terminalSelected  bool
 	terminalErr       error
+	outputFinished    bool
 }
 
 var errExecutorStreamShutdown = errors.New("executor stream interrupted during shutdown")
@@ -1775,18 +1776,20 @@ func shutdownExecutorStreams() {
 	executorStreamLifecycle.stopping = true
 	executorStreamLifecycle.shutdowns++
 	streams := make([]*executorStream, 0, len(executorStreamLifecycle.active))
+	interrupts := make([]*executorStream, 0, len(executorStreamLifecycle.active))
 	for stream := range executorStreamLifecycle.active {
 		if !stream.terminalSelected {
 			stream.terminalSelected = true
 			stream.terminalErr = errExecutorStreamShutdown
 		}
+		if stream.terminalErr != nil && !stream.outputFinished {
+			interrupts = append(interrupts, stream)
+		}
 		streams = append(streams, stream)
 	}
 	executorStreamLifecycle.mu.Unlock()
-	for _, stream := range streams {
-		if stream.terminalErr != nil {
-			_ = stream.closePlugin(stream.terminalErr.Error())
-		}
+	for _, stream := range interrupts {
+		_ = stream.closePlugin(stream.terminalErr.Error())
 	}
 	for _, stream := range streams {
 		_ = stream.closeHost()
@@ -2007,6 +2010,10 @@ func (s *executorStream) flushAndEmit(rewriter *streamChunkRewriter, cleanComple
 
 func (s *executorStream) selectTerminal(primary error, completed bool) error {
 	executorStreamLifecycle.mu.Lock()
+	if completed {
+		// 输出和 flush 结束后，由 worker 合并 host cleanup 错误再关闭下游。
+		s.outputFinished = true
+	}
 	// 正常输出完成后才能选定自然结束；选定后的 terminalErr 保持不变。
 	if !s.terminalSelected && (primary != nil || completed) {
 		s.terminalSelected = true
@@ -2059,9 +2066,13 @@ func runStreamForward(stream *executorStream) error {
 		if err := json.Unmarshal(readRaw, &chunk); err != nil {
 			return stream.finish(rewriter, fmt.Errorf("decode host stream chunk: %w", err), nil, false, false)
 		}
-		payloadErr := stream.processPayload(rewriter, chunk.Payload)
+		var primary error
 		if chunk.Error != "" {
-			return stream.finish(rewriter, errors.New(chunk.Error), payloadErr, true, false)
+			primary = stream.selectTerminal(errors.New(chunk.Error), false)
+		}
+		payloadErr := stream.processPayload(rewriter, chunk.Payload)
+		if primary != nil {
+			return stream.finish(rewriter, primary, payloadErr, true, false)
 		}
 		if payloadErr != nil || chunk.Done {
 			return stream.finish(rewriter, payloadErr, nil, true, chunk.Done && payloadErr == nil)
