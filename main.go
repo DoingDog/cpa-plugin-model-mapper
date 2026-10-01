@@ -2640,17 +2640,11 @@ func rewriteResponseModelFieldsWithReplacementChecked(body []byte, model string,
 	var err error
 	switch body[start] {
 	case '{':
-		err = collectResponseModelEdits(d, 0, model, replacement, "", &edits)
+		err = collectResponseModelEdits(d, body, model, replacement, "", &edits)
 	case '[':
 		_, err = d.Token()
 		for err == nil && d.More() {
-			if err = d.Decode(&raw); err != nil {
-				break
-			}
-			if raw[0] == '{' {
-				offset := int(d.InputOffset()) - len(raw)
-				err = collectResponseModelEdits(json.NewDecoder(bytes.NewReader(raw)), offset, model, replacement, "", &edits)
-			}
+			err = collectResponseModelEdits(d, body, model, replacement, "", &edits)
 		}
 		if err == nil {
 			_, err = d.Token()
@@ -2670,20 +2664,34 @@ func rewriteResponseModelFieldsWithReplacementChecked(body []byte, model string,
 	return nil, false, true, err
 }
 
-func collectResponseModelEdits(d *json.Decoder, offset int, model string, replacement json.RawMessage, parent string, edits *[]jsonByteEdit) error {
+func collectResponseModelEdits(d *json.Decoder, body []byte, model string, replacement json.RawMessage, parent string, edits *[]jsonByteEdit) error {
+	start := skipTopLevelModelJSONSpace(body, int(d.InputOffset()))
+	if start < len(body) && (body[start] == ':' || body[start] == ',') {
+		start = skipTopLevelModelJSONSpace(body, start+1)
+	}
+	var raw json.RawMessage
+	// 此处只选择读取方式，JSON 结构和分隔符仍由 Decoder 验证。
+	if start == len(body) || body[start] != '{' {
+		return d.Decode(&raw)
+	}
 	if _, err := d.Token(); err != nil {
 		return err
 	}
-	var raw json.RawMessage
 	for d.More() {
 		key, err := d.Token()
 		if err != nil {
 			return err
 		}
+		if parent == "" && (key == "response" || key == "message" || key == "interaction") {
+			if err := collectResponseModelEdits(d, body, model, replacement, key.(string), edits); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := d.Decode(&raw); err != nil {
 			return err
 		}
-		end := offset + int(d.InputOffset())
+		end := int(d.InputOffset())
 		start := end - len(raw)
 		if key == "model" || key == "modelVersion" && (parent == "" || parent == "response") {
 			if raw[0] != '"' {
@@ -2695,10 +2703,6 @@ func collectResponseModelEdits(d *json.Decoder, offset int, model string, replac
 			}
 			if !equal {
 				*edits = append(*edits, jsonByteEdit{start: start, end: end, replacement: replacement})
-			}
-		} else if parent == "" && raw[0] == '{' && (key == "response" || key == "message" || key == "interaction") {
-			if err := collectResponseModelEdits(json.NewDecoder(bytes.NewReader(raw)), start, model, replacement, key.(string), edits); err != nil {
-				return err
 			}
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	pluginabi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -196,6 +197,74 @@ func TestFunctionalJSONExecutorHeaders(t *testing.T) {
 			}
 			if response.Headers.Get("Accept-Ranges") != "bytes" || response.Headers.Get("X-Keep") != "keep" {
 				t.Fatalf("response Accept-Ranges or X-Keep changed: %v", response.Headers)
+			}
+		})
+	}
+}
+
+func TestFunctionalResponseContainersAvoidWholeValueCopies(t *testing.T) {
+	payload := strings.Repeat("x", 8<<20)
+	inputObject := ` { "model" : "upstream", "opaque":{"model":"keep","tool":{"modelVersion":"keep"},"x":1,"x":2}, "payload":"` + payload + `", "model":"client" } `
+	wantObject := ` { "model" : "client", "opaque":{"model":"keep","tool":{"modelVersion":"keep"},"x":1,"x":2}, "payload":"` + payload + `", "model":"client" } `
+	measure := func(t *testing.T, input, want []byte) testing.BenchmarkResult {
+		t.Helper()
+		snapshot := bytes.Clone(input)
+		out, changed, valid, err := rewriteResponseModelFieldsWithReplacementChecked(input, "client", json.RawMessage(`"client"`))
+		if err != nil || !changed || !valid || !bytes.Equal(out, want) {
+			t.Fatalf("restore=(%d bytes,%v,%v,%v), want %d exact bytes", len(out), changed, valid, err, len(want))
+		}
+		if !bytes.Equal(input, snapshot) || &out[0] == &input[0] {
+			t.Fatal("restore changed input or returned an alias")
+		}
+		return testing.Benchmark(func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				var err error
+				benchmarkRewriteTopLevelModelOutput, benchmarkRewriteTopLevelModelChanged, err = restoreResponseModel(input, "client")
+				if err != nil || !benchmarkRewriteTopLevelModelChanged {
+					b.Fatalf("restore changed=%v err=%v", benchmarkRewriteTopLevelModelChanged, err)
+				}
+			}
+		})
+	}
+	reference := measure(t, []byte(inputObject), []byte(wantObject))
+	t.Logf("object: %d ns/op, %d B/op, %d allocs/op", reference.NsPerOp(), reference.AllocedBytesPerOp(), reference.AllocsPerOp())
+	for _, tc := range []struct {
+		name, prefix, suffix, wantSuffix string
+	}{
+		{"array", " \n[ null , ", ` , [{"model":"upstream"}] , false , 9007199254740993 , {"modelVersion":"upstream","response":{"model":"upstream"},"opaque":{"model":"keep"}} ] `, ` , [{"model":"upstream"}] , false , 9007199254740993 , {"modelVersion":"client","response":{"model":"client"},"opaque":{"model":"keep"}} ] `},
+		{"response", " \n{ \"res\\u0070onse\" : ", ` , "response":{"model":"upstream","modelVersion":"upstream"}, "response":null, "opaque":{"model":"upstream"} } `, ` , "response":{"model":"client","modelVersion":"client"}, "response":null, "opaque":{"model":"upstream"} } `},
+		{"message", " \n{ \"message\" : ", ` , "message":{"model":"upstream","modelVersion":"opaque"}, "message":null, "opaque":{"model":"upstream"} } `, ` , "message":{"model":"client","modelVersion":"opaque"}, "message":null, "opaque":{"model":"upstream"} } `},
+		{"interaction", " \n{ \"interaction\" : ", ` , "interaction":{"model":"upstream","modelVersion":"opaque"}, "interaction":null, "opaque":{"model":"upstream"} } `, ` , "interaction":{"model":"client","modelVersion":"opaque"}, "interaction":null, "opaque":{"model":"upstream"} } `},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result := measure(t, []byte(tc.prefix+inputObject+tc.suffix), []byte(tc.prefix+wantObject+tc.wantSuffix))
+			t.Logf("container: %d ns/op, %d B/op, %d allocs/op", result.NsPerOp(), result.AllocedBytesPerOp(), result.AllocsPerOp())
+			// 允许一份额外 payload 的预算，防止容器整体 Decode 后再复制和解析内部字段。
+			if got, limit := result.AllocedBytesPerOp(), reference.AllocedBytesPerOp()+int64(len(payload)); got > limit {
+				t.Fatalf("container allocations=%d B/op, object=%d B/op, limit=%d B/op", got, reference.AllocedBytesPerOp(), limit)
+			}
+		})
+	}
+}
+
+func TestFunctionalResponseLargeContainersUnchanged(t *testing.T) {
+	object := ` { "model":"client", "payload":"` + strings.Repeat("x", 8<<20) + `", "model":"client", "opaque":{"model":"upstream"} } `
+	for _, tc := range []struct{ name, prefix, suffix string }{
+		{"array", "[ null , ", ` , [{"model":"upstream"}] , {"model":false,"modelVersion":null} ]`},
+		{"response", `{"response":`, `,"response":{"model":"client","modelVersion":"client"},"response":[{"model":"upstream"}]}`},
+		{"message", `{"message":`, `,"message":{"model":"client","modelVersion":"upstream"},"message":9007199254740993}`},
+		{"interaction", `{"interaction":`, `,"interaction":{"model":"client","modelVersion":"upstream"},"interaction":null}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input := []byte(tc.prefix + object + tc.suffix)
+			snapshot := bytes.Clone(input)
+			out, changed, valid, err := rewriteResponseModelFieldsWithReplacementChecked(input, "client", json.RawMessage(`"client"`))
+			if err != nil || changed || !valid || !bytes.Equal(out, snapshot) {
+				t.Fatalf("restore=(%d bytes,%v,%v,%v), want unchanged %d bytes", len(out), changed, valid, err, len(input))
+			}
+			if !bytes.Equal(input, snapshot) || &out[0] == &input[0] {
+				t.Fatal("unchanged restore changed input or returned an alias")
 			}
 		})
 	}
