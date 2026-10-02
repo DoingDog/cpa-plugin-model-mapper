@@ -1711,7 +1711,14 @@ type executorStream struct {
 	call              hostCaller
 	closeHostOnce     sync.Once
 	closeHostErr      error
+	closePluginOnce   sync.Once
+	closePluginErr    error
+	terminalSelected  bool
+	terminalErr       error
+	outputFinished    bool
 }
+
+var errExecutorStreamShutdown = errors.New("executor stream interrupted during shutdown")
 
 var executorStreamLifecycle = struct {
 	mu        sync.Mutex
@@ -1773,10 +1780,21 @@ func shutdownExecutorStreams() {
 	executorStreamLifecycle.stopping = true
 	executorStreamLifecycle.shutdowns++
 	streams := make([]*executorStream, 0, len(executorStreamLifecycle.active))
+	interrupts := make([]*executorStream, 0, len(executorStreamLifecycle.active))
 	for stream := range executorStreamLifecycle.active {
+		if !stream.terminalSelected {
+			stream.terminalSelected = true
+			stream.terminalErr = errExecutorStreamShutdown
+		}
+		if stream.terminalErr != nil && !stream.outputFinished {
+			interrupts = append(interrupts, stream)
+		}
 		streams = append(streams, stream)
 	}
 	executorStreamLifecycle.mu.Unlock()
+	for _, stream := range interrupts {
+		_ = stream.closePlugin(stream.terminalErr.Error())
+	}
 	for _, stream := range streams {
 		_ = stream.closeHost()
 	}
@@ -1794,11 +1812,13 @@ func (s *executorStream) closeHost() error {
 }
 
 func (s *executorStream) closePlugin(errText string) error {
-	_, err := s.call(pluginabi.MethodHostStreamClose, struct {
-		StreamID string `json:"stream_id"`
-		Error    string `json:"error,omitempty"`
-	}{StreamID: s.pluginStreamID, Error: errText})
-	return err
+	s.closePluginOnce.Do(func() {
+		_, s.closePluginErr = s.call(pluginabi.MethodHostStreamClose, struct {
+			StreamID string `json:"stream_id"`
+			Error    string `json:"error,omitempty"`
+		}{StreamID: s.pluginStreamID, Error: errText})
+	})
+	return s.closePluginErr
 }
 
 func (s *executorStream) emit(payload []byte) error {
@@ -1930,7 +1950,17 @@ func startExecutorStream(req executorRPCRequest, call hostCaller, closeStream fu
 	go func() {
 		defer unregisterExecutorStream(stream)
 		if err := runStreamForward(stream); err != nil {
-			_ = closeStream(stream.pluginStreamID, err.Error())
+			outerAttempted := false
+			stream.closePluginOnce.Do(func() {
+				outerAttempted = true
+				stream.closePluginErr = closeStream(stream.pluginStreamID, err.Error())
+			})
+			if !outerAttempted && stream.closePluginErr != nil {
+				if !errors.Is(err, stream.closePluginErr) {
+					err = joinStreamErrors(err, fmt.Errorf("close plugin stream: %w", stream.closePluginErr))
+				}
+				_ = closeStream(stream.pluginStreamID, err.Error())
+			}
 		}
 	}()
 	return response, nil
@@ -1982,18 +2012,32 @@ func (s *executorStream) flushAndEmit(rewriter *streamChunkRewriter, cleanComple
 	return nil
 }
 
+func (s *executorStream) selectTerminal(primary error, completed bool) error {
+	executorStreamLifecycle.mu.Lock()
+	if completed {
+		// 输出和 flush 结束后，由 worker 合并 host cleanup 错误再关闭下游。
+		s.outputFinished = true
+	}
+	// 正常输出完成后才能选定自然结束；选定后的 terminalErr 保持不变。
+	if !s.terminalSelected && (primary != nil || completed) {
+		s.terminalSelected = true
+		s.terminalErr = primary
+	}
+	terminalErr := s.terminalErr
+	executorStreamLifecycle.mu.Unlock()
+	if terminalErr != nil && !errors.Is(primary, terminalErr) {
+		return joinStreamErrors(primary, terminalErr)
+	}
+	return primary
+}
+
 func (s *executorStream) finish(rewriter *streamChunkRewriter, primary error, payloadErr error, closePlugin bool, cleanCompletion bool) error {
-	cleanup := make([]error, 0, 2)
-	if payloadErr != nil {
-		cleanup = append(cleanup, payloadErr)
-	}
-	if err := s.flushAndEmit(rewriter, cleanCompletion); err != nil {
-		cleanup = append(cleanup, err)
-	}
+	primary = s.selectTerminal(joinStreamErrors(primary, payloadErr), false)
+	flushErr := s.flushAndEmit(rewriter, cleanCompletion && primary == nil)
+	firstErr := s.selectTerminal(joinStreamErrors(primary, flushErr), true)
 	if err := s.closeHost(); err != nil {
-		cleanup = append(cleanup, fmt.Errorf("close host stream: %w", err))
+		firstErr = joinStreamErrors(firstErr, fmt.Errorf("close host stream: %w", err))
 	}
-	firstErr := joinStreamErrors(primary, cleanup...)
 	if !closePlugin {
 		return firstErr
 	}
@@ -2012,6 +2056,12 @@ func runStreamForward(stream *executorStream) error {
 	rewriter.format = stream.format
 	rewriter.frameRawJSONAsSSE = stream.frameRawJSONAsSSE
 	for {
+		executorStreamLifecycle.mu.Lock()
+		terminalErr := stream.terminalErr
+		executorStreamLifecycle.mu.Unlock()
+		if terminalErr != nil {
+			return stream.finish(rewriter, terminalErr, nil, true, false)
+		}
 		readRaw, err := stream.call(pluginabi.MethodHostModelStreamRead, pluginapi.HostModelStreamReadRequest{StreamID: stream.hostStreamID})
 		if err != nil {
 			return stream.finish(rewriter, fmt.Errorf("read host stream: %w", err), nil, false, false)
@@ -2020,9 +2070,13 @@ func runStreamForward(stream *executorStream) error {
 		if err := json.Unmarshal(readRaw, &chunk); err != nil {
 			return stream.finish(rewriter, fmt.Errorf("decode host stream chunk: %w", err), nil, false, false)
 		}
-		payloadErr := stream.processPayload(rewriter, chunk.Payload)
+		var primary error
 		if chunk.Error != "" {
-			return stream.finish(rewriter, errors.New(chunk.Error), payloadErr, true, false)
+			primary = stream.selectTerminal(errors.New(chunk.Error), false)
+		}
+		payloadErr := stream.processPayload(rewriter, chunk.Payload)
+		if primary != nil {
+			return stream.finish(rewriter, primary, payloadErr, true, false)
 		}
 		if payloadErr != nil || chunk.Done {
 			return stream.finish(rewriter, payloadErr, nil, true, chunk.Done && payloadErr == nil)
