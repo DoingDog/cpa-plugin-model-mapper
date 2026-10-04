@@ -137,8 +137,11 @@ func BenchmarkResponseModelMarkerScan(b *testing.B) {
 				if !changed && !bytes.Equal(restored, body) {
 					b.Fatalf("restoreResponseModel=%q, want %q", restored, body)
 				}
-				if changed && !bytes.Contains(restored, []byte(`"model":"client"`)) {
-					b.Fatalf("restoreResponseModel=%q, want restored model", restored)
+				if changed {
+					want := bytes.Replace(body, []byte(`"upstream"`), []byte(`"client"`), 1)
+					if !bytes.Equal(restored, want) {
+						b.Fatalf("restoreResponseModel=%q, want %q", restored, want)
+					}
 				}
 
 				b.ReportAllocs()
