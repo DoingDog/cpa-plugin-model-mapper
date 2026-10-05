@@ -136,6 +136,15 @@ channel 控制的回归同时覆盖满队列、读期间中断、两次读取之
 6. B 与 E 显式运行 `BenchmarkSSEMarkerGuardRestore`、`BenchmarkSSEMarkerGuardCandidate` 的 byte-exact preflight 和完整 benchmark；root tests 不运行 benchmark。两项固定输入的 `model` 在 `id` 前，B 将旧 map 排序的 expected 改为 `{"model":"client","id":"r1"}`，保留输入和全部断言。在同一机器、Go、构建模式和参数下比较 baseline/fixed 的现有 request、response、marker scan、fragmented raw JSON、markerless/escaped SSE、emit batching benchmarks。不得凭未测量的百分比设置性能门槛或宣称优化；发现稳定回归先定位新增扫描或复制，再修正和复测。修正不能牺牲内容或协议。
 7. Windows/Linux 实际构建、打包、compatibility 和 metadata 检查完成；release 经实际用户授权后复核 remote/tag，七平台 CI 和 Release 成功，下载 assets 验证 zip 根目录、LICENSE、版本和 `checksums.txt`。
 
+## 公共报告验收补充
+
+以下验收沿用 C/E/F 的所有权，F01..F14、既有边界和全部验证条件保持不变。
+
+1. [PR7](https://github.com/DoingDog/cpa-plugin-model-mapper/pull/7) 归属 C/F04 的同一 framing 根因，由 C 统一完成 TDD 和旧 framing/emission fixture 修正。E 对真实 CPA `/v1/chat/completions`、`/v1/completions` 的 mapped/unmapped 流检查 HTTP 200、完整内容、各自 client model、可派发且可解码的 JSON SSE、`data: data:` 为零、DONE 恰好一次。缺少 `Content-Type`、`text/event-stream`、`text/event-stream; charset=utf-8`、`application/json` 的正常 core/header 对照和最后一个 raw payload 的 native 对照在实际可达层执行，记录插件收到的 headers 与 core bytes。源探测的单个 raw payload 内容为 `hello`；E 既有 HTTP fixture 的完整内容为 `onetwo`，分别精确断言，不互换预期。
+2. [issue8](https://github.com/DoingDog/cpa-plugin-model-mapper/issues/8) 使用原规则 `grok-4.6=>grok-4.7`、`Format/SourceFormat=openai-response` 和完整 `response.completed` terminal fixture。上游请求 `Model`、顶层 JSON `model` 均为 `grok-4.7`；mapped 下游 `response.model=grok-4.6`，unmapped 对照为 `grok-4.7`；完整 `response.output` 和 opaque output 文本中的 `grok-4.7` 保持。C 的既有 terminal 控制覆盖 `Payload+Done`、split terminal、`Payload+Error+Done`，保留原错误与 emit -> host-close -> plugin-close 顺序；E 的正常 native producer 使用 payload 后独立 Done 的真实 bridge 对照。真实 `/v1/responses` mapped/unmapped 正常请求均为 200，含有效可派发 data/terminal，完整 output 不丢；错误用例在其实际 error/terminal 通道保留原错误。
+3. 独立 PR7 探测运行真实 CPA HTTP handler，upstream/RPC 为 mock；独立 issue8 terminal 探测使用真实插件 Go 函数和 fake callbacks。E 分别报告 mock、native loader/ABI/host bridge、完整 HTTP 的结果与限制，组合 terminal flags 的 ABI 接受对照不替代正常 producer 的实际 read 序列，也不作为报告者 Linux/Docker 现场复现。新增永久 integration 全部进入 E 的唯一 `TestCPAPluginIntegration` 和唯一 `.github/scripts/testdata/cpa-functional-regression_test.go`，复用现有 smoke helper、CPA parser 和 `encoding/json`；不增加第二入口，不修改 CPA，不新增 parser 或猜测性 workaround。
+4. 固定核查 HEAD `6c7f060f4da5bb33e7b2ecd74c44499c9676a93c` 仍复现 PR7；`9fe917c031f0a7ed8b43897220a1eea237acc88b` 是候选，真实 `v0.5.7` 仍有问题。F 在成功发布并核验后，按真实用户授权评论 C 的实际修复 commit 和首个包含它的 Release 版本。issue8 的历史 terminal 修复 `8b7bd9a0d135251878792b3740bc06a7da7ede00`／`v0.5.2` 早于提问，原始 502 和对应真实 fixCommit/version 尚未确定，不能归因于该旧修复。F 根据最终 E 实际结果评论；原 502 未复现时说明核查范围及仍缺的部署版本、原始 SSE/host read、CPA revision，保持 open。后续已发布版本确实解决报告且获得用户授权后，评论已证实相关 commit/版本并关闭。
+
 ## 文档完成条件
 
 两份文档覆盖全部问题和控制条件，明确证据层级、函数/fixture 依赖、RED/GREEN 命令和终验。自审检查无占位、无新增功能、无未经测量的优化承诺；`git diff --check` 通过。文档提交只包含本规格和对应实施计划，不包括产品源码、中间结果或其他工作区的内容。
