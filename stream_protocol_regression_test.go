@@ -904,6 +904,200 @@ func TestFunctionalRawJSONFlushRetainsMetadataSuffix(t *testing.T) {
 	}
 }
 
+func TestFunctionalCompleteRawScalarAboveLimit(t *testing.T) {
+	input, err := json.Marshal(strings.Repeat("x", maxPendingStreamBytes+1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append(append([]byte("data: "), input...), '\n', '\n')
+	for _, format := range []string{"openai-response", "claude", "interactions"} {
+		for _, tc := range []struct {
+			name  string
+			parts [][]byte
+		}{
+			{"whole", [][]byte{input}},
+			{"pending at limit", [][]byte{input[:maxPendingStreamBytes], input[maxPendingStreamBytes:]}},
+			{"continued pending at limit", [][]byte{input[:1], input[1:maxPendingStreamBytes], input[maxPendingStreamBytes:]}},
+		} {
+			t.Run(format+"/"+tc.name, func(t *testing.T) {
+				got := functionalProtocolParts(t, format, tc.parts...)
+				if !bytes.Equal(got, want) {
+					t.Fatalf("output=%d bytes, want %d", len(got), len(want))
+				}
+			})
+		}
+	}
+}
+
+func TestFunctionalIncompleteRawScalarAboveLimit(t *testing.T) {
+	input := append([]byte{'"'}, bytes.Repeat([]byte{'x'}, maxPendingStreamBytes)...)
+	for _, continued := range []bool{false, true} {
+		t.Run(fmt.Sprintf("continued=%v", continued), func(t *testing.T) {
+			r := newStreamChunkRewriter("client")
+			r.format, r.frameRawJSONAsSSE = "openai-response", true
+			part := input
+			if continued {
+				chunks, err := r.Write(input[:maxPendingStreamBytes])
+				if err != nil || len(chunks) != 0 {
+					t.Fatalf("pending Write=(%d,%v)", len(chunks), err)
+				}
+				part = input[maxPendingStreamBytes:]
+			}
+			chunks, err := r.Write(part)
+			if err == nil || !strings.Contains(err.Error(), "stream pending data exceeds") || len(chunks) != 0 {
+				t.Fatalf("overflow=(%d,%v)", len(chunks), err)
+			}
+			if r.pending != nil || r.sse.buf != nil || r.rawScan.active {
+				t.Fatal("oversized incomplete scalar retained")
+			}
+			flushed, err := r.Finish()
+			if err != nil || len(flushed) != 0 {
+				t.Fatalf("Finish=(%d,%v), want no incomplete output", len(flushed), err)
+			}
+		})
+	}
+}
+
+func TestFunctionalCompleteRawScalarBatchAboveLimit(t *testing.T) {
+	value, err := json.Marshal(strings.Repeat("x", maxPendingStreamBytes+1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := append(bytes.Clone(value), []byte(" true")...)
+	want := append(append([]byte("data: "), value...), []byte("\n\ndata: true\n\n")...)
+	for _, split := range []int{0, maxPendingStreamBytes, len(value)} {
+		t.Run(fmt.Sprintf("split=%d", split), func(t *testing.T) {
+			got := functionalProtocolParts(t, "openai-response", input[:split], input[split:])
+			if !bytes.Equal(got, want) {
+				t.Fatalf("output=%d bytes, want %d", len(got), len(want))
+			}
+		})
+	}
+}
+
+func TestFunctionalRawScalarCompletePrefixBeforeLimit(t *testing.T) {
+	value, err := json.Marshal(strings.Repeat("x", maxPendingStreamBytes+1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append(append([]byte("data: "), value...), '\n', '\n')
+	for _, oversized := range []bool{false, true} {
+		for _, split := range []int{0, maxPendingStreamBytes, len(value)} {
+			t.Run(fmt.Sprintf("oversized=%v/split=%d", oversized, split), func(t *testing.T) {
+				tail := []byte(` {"text":"`)
+				if oversized {
+					tail = append(tail, bytes.Repeat([]byte{'x'}, maxPendingStreamBytes+1-len(tail))...)
+				}
+				input := append(bytes.Clone(value), tail...)
+				r := newStreamChunkRewriter("client")
+				r.format, r.frameRawJSONAsSSE = "openai-response", true
+				chunks, err := r.Write(input[:split])
+				if err != nil || len(chunks) != 0 {
+					t.Fatalf("first Write=(%d,%v)", len(chunks), err)
+				}
+				chunks, err = r.Write(input[split:])
+				if oversized {
+					if err == nil || !strings.Contains(err.Error(), "stream pending data exceeds") || !bytes.Equal(bytes.Join(chunks, nil), want) {
+						t.Fatalf("overflow=(%d,%v), want complete prefix", len(bytes.Join(chunks, nil)), err)
+					}
+					if r.pending != nil || r.sse.buf != nil || r.rawScan.active {
+						t.Fatal("oversized tail retained")
+					}
+					flushed, err := r.Finish()
+					if err != nil || len(flushed) != 0 {
+						t.Fatalf("Finish=(%d,%v), want no replay", len(flushed), err)
+					}
+					return
+				}
+				if err != nil || len(chunks) != 0 {
+					t.Fatalf("Write=(%d,%v), want pending EOF classification", len(chunks), err)
+				}
+				chunks, err = r.Finish()
+				if err == nil || !strings.Contains(err.Error(), "incomplete raw JSON stream") || !bytes.Equal(bytes.Join(chunks, nil), want) {
+					t.Fatalf("Finish=(%d,%v), want complete prefix and incomplete error", len(bytes.Join(chunks, nil)), err)
+				}
+			})
+		}
+	}
+}
+
+func TestFunctionalCompleteRawScalarUnknownSSEPartitions(t *testing.T) {
+	value, err := json.Marshal(strings.Repeat("x", maxPendingStreamBytes+1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := append(bytes.Clone(value), []byte("\nx-vendor-field\ndata: {\"model\":\"upstream\"}\n\n")...)
+	want := append(bytes.Clone(value), []byte("\nx-vendor-field\ndata: {\"model\":\"client\"}\n\n")...)
+	boundary := len(value) + len("\nx-vendor-field\nd")
+	for _, tc := range []struct {
+		name  string
+		parts [][]byte
+	}{
+		{"whole", [][]byte{input}},
+		{"pending at limit", [][]byte{input[:maxPendingStreamBytes], input[maxPendingStreamBytes:]}},
+		{"unknown field before split data", [][]byte{input[:len(value)], input[len(value):boundary], input[boundary:]}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := functionalProtocolParts(t, "openai-response", tc.parts...)
+			if !bytes.Equal(got, want) {
+				t.Fatalf("output=%d bytes, want %d; scalar unknown field must remain unchanged", len(got), len(want))
+			}
+		})
+	}
+}
+
+func TestFunctionalCompleteRawScalarAfterRawPrefix(t *testing.T) {
+	value, err := json.Marshal(strings.Repeat("x", maxPendingStreamBytes+1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix := []byte(`{"model":"upstream"} `)
+	want := append(append([]byte("data: {\"model\":\"client\"}\n\ndata: "), value...), '\n', '\n')
+	for _, ending := range []string{"complete", "incomplete", "overflow"} {
+		for _, split := range []int{0, maxPendingStreamBytes} {
+			t.Run(fmt.Sprintf("%s/split=%d", ending, split), func(t *testing.T) {
+				input := append(bytes.Clone(prefix), value...)
+				if ending != "complete" {
+					tail := []byte(` {"text":"`)
+					if ending == "overflow" {
+						tail = append(tail, bytes.Repeat([]byte{'x'}, maxPendingStreamBytes+1-len(tail))...)
+					}
+					input = append(input, tail...)
+				}
+				r := newStreamChunkRewriter("client")
+				r.format, r.frameRawJSONAsSSE = "openai-response", true
+				first, err := r.Write(input[:split])
+				if err != nil {
+					t.Fatal(err)
+				}
+				chunks, err := r.Write(input[split:])
+				out := append(first, chunks...)
+				if ending == "overflow" {
+					if err == nil || !strings.Contains(err.Error(), "stream pending data exceeds") || !bytes.Equal(bytes.Join(out, nil), want) {
+						t.Fatalf("overflow=(%d,%v), want both complete units", len(bytes.Join(out, nil)), err)
+					}
+					if r.pending != nil || r.sse.buf != nil || r.rawScan.active {
+						t.Fatal("oversized scalar suffix retained")
+					}
+					flushed, err := r.Finish()
+					if err != nil || len(flushed) != 0 {
+						t.Fatalf("Finish=(%d,%v), want no replay", len(flushed), err)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				flushed, err := r.Finish()
+				out = append(out, flushed...)
+				if ending == "complete" && err != nil || ending == "incomplete" && (err == nil || !strings.Contains(err.Error(), "incomplete raw JSON stream")) || !bytes.Equal(bytes.Join(out, nil), want) {
+					t.Fatalf("Finish=(%d,%v), want both complete units", len(bytes.Join(out, nil)), err)
+				}
+			})
+		}
+	}
+}
+
 func TestFunctionalRawScalarEOFPartitions(t *testing.T) {
 	cases := []struct{ input, want string }{
 		{"true", "data: true\n\n"},

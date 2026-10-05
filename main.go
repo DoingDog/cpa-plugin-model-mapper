@@ -751,7 +751,15 @@ func hasSSEDoneEvent(p []byte) bool {
 
 func (r *streamChunkRewriter) retainPending(p []byte) error {
 	r.rawScan = rawJSONScan{}
-	if len(p) > maxPendingStreamBytes {
+	incompleteBytes := len(p)
+	if incompleteBytes > maxPendingStreamBytes && r.frameRawJSONAsSSE && couldStartJSONValue(p) {
+		_, consumed, ok, _ := splitJSONValues(p, false, true)
+		if ok {
+			// 完整单位等待 SSE 分类或 EOF，只限制未完成 suffix。
+			incompleteBytes = len(p) - consumed
+		}
+	}
+	if incompleteBytes > maxPendingStreamBytes {
 		r.pending = nil
 		return fmt.Errorf("stream pending data exceeds %d bytes", maxPendingStreamBytes)
 	}
@@ -832,7 +840,8 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 		}
 		if r.frameRawJSONAsSSE {
 			if err := r.retainPending(p); err != nil {
-				return nil, err
+				chunks, _, _, _, rewriteErr := r.tryRawJSONChunks(p, true)
+				return chunks, joinStreamErrors(rewriteErr, err)
 			}
 			return nil, nil
 		}
@@ -845,7 +854,11 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 		if ok {
 			if incomplete {
 				if err := r.retainPending(p[consumed:]); err != nil {
-					return chunks, err
+					completed, _, completedOK, _, rewriteErr := r.tryRawJSONChunks(p, true)
+					if completedOK {
+						chunks = completed
+					}
+					return chunks, joinStreamErrors(rewriteErr, err)
 				}
 			} else if consumed < len(p) {
 				sseChunks, err := r.writeSSESuffix(p[consumed:])
