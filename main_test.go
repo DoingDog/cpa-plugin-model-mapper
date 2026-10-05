@@ -6176,7 +6176,6 @@ func TestHandleExecutorExecuteStreamReturnsPreparedHostHeaders(t *testing.T) {
 				"x-request-id": {"request-1"},
 			},
 			wantContentType: "text/event-stream",
-			wantFramed:      true,
 		},
 		{
 			name: "event stream with parameters",
@@ -6185,7 +6184,6 @@ func TestHandleExecutorExecuteStreamReturnsPreparedHostHeaders(t *testing.T) {
 				"x-request-id": {"request-1"},
 			},
 			wantContentType: "text/event-stream; charset=utf-8",
-			wantFramed:      true,
 		},
 		{
 			name: "json profile mentioning event stream",
@@ -6432,7 +6430,7 @@ func TestRunStreamForwardTerminatesReframedOpenAIChat(t *testing.T) {
 		reads                 []pluginapi.HostModelStreamReadResponse
 		wantDone              int
 	}{
-		{name: "raw chat completion", format: "openai", payload: `{"model":"upstream","choices":[]}`, reads: []pluginapi.HostModelStreamReadResponse{{Payload: []byte(`{"model":"upstream","choices":[]}`)}, {Done: true}}, wantDone: 1},
+		{name: "raw chat completion", format: "openai", payload: `{"model":"upstream","choices":[]}`, reads: []pluginapi.HostModelStreamReadResponse{{Payload: []byte(`{"model":"upstream","choices":[]}`)}, {Done: true}}, wantDone: 0},
 		{name: "already framed done", format: "openai", reads: []pluginapi.HostModelStreamReadResponse{{Payload: []byte(`{"model":"upstream","choices":[]}`)}, {Payload: []byte("data: [DONE]\n\n")}, {Done: true}}, wantDone: 1},
 		{name: "responses", format: "openai-response", reads: []pluginapi.HostModelStreamReadResponse{{Payload: []byte(`{"type":"response.completed","response":{"model":"upstream"}}`)}, {Done: true}}},
 		{name: "claude", format: "claude", reads: []pluginapi.HostModelStreamReadResponse{{Payload: []byte(`{"type":"message_start","message":{"model":"upstream"}}`)}, {Done: true}}},
@@ -6765,9 +6763,6 @@ func TestRunStreamForwardProcessesTerminalPayload(t *testing.T) {
 				t.Fatalf("emitted=%q, want restored terminal payload", got)
 			}
 			wantEvents := "emit,host-close,plugin-close"
-			if tt.name == "done payload" {
-				wantEvents = "emit,emit,host-close,plugin-close"
-			}
 			if got := strings.Join(events, ","); got != wantEvents {
 				t.Fatalf("event order = %q, want %s", got, wantEvents)
 			}

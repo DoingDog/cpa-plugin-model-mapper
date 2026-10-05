@@ -194,11 +194,11 @@ When model restoration changes nonstream response bytes, the plugin removes `Con
 
 Opaque response content and tool text are not recursively rewritten. Before closing the plugin stream after a read error, the plugin flushes complete pending SSE bytes; incomplete raw JSON is rejected instead of being emitted as an invalid SSE event.
 
-Unframed raw JSON stream chunks preserve the bytes that separate complete JSON values. Gemini streamed JSON arrays restore the top-level `modelVersion` of each object element. Gemini raw core chunks are not double-framed.
+未添加 SSE framing 的 raw JSON stream chunks 保留完整 JSON values 之间的分隔字节。OpenAI 和 Gemini raw core chunks 保持 raw；CPA 的 OpenAI HTTP handler 负责添加 SSE framing 和正常结束的 `[DONE]`。Gemini streamed JSON arrays 恢复每个 object element 顶层的 `modelVersion`。
 
-When raw JSON is framed as SSE, `openai-response` and `claude` include an `event:` line from the top-level `type`. A clean `openai` Chat completion appends `data: [DONE]`, while Gemini does not append `[DONE]`.
+需要将 raw JSON 转为 SSE 时，`openai-response` 和 `claude` 从顶层 `type` 添加 `event:` line。
 
-Delimiterless OpenAI Responses logical events produced by CPA's provider translators are separated by their complete JSON `data:` values before model restoration; host stream-read boundaries alone are never treated as SSE delimiters.
+CPA provider translators 产生的 delimiterless OpenAI Responses 和 Interactions logical events 按完整 JSON `data:` value 分隔，再恢复 model。Responses 的 `type` 和 Interactions 的 `event_type` 必须与 `event:` 名称一致；host stream-read 边界不会作为 SSE delimiter。
 
 The plugin retains at most 16 MiB for one incomplete SSE event or raw JSON value per stream. This limit does not apply to cumulative stream traffic or batches of complete events. Exceeding it closes only that stream with an error and emits no partial oversized unit.
 
