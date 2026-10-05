@@ -13,30 +13,137 @@ import (
 )
 
 func TestFunctionalOpenAIRawCoreChunks(t *testing.T) {
-	t.Cleanup(func() { setLoadedConfigForTest(defaultConfig()) })
+	t.Cleanup(func() {
+		shutdownExecutorStreams()
+		resetExecutorStreamLifecycle()
+		setLoadedConfigForTest(defaultConfig())
+	})
 	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
-	req := rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
-		Model: "client", Format: "openai", SourceFormat: "openai", Stream: true,
-		OriginalRequest: []byte(`{"model":"client","stream":true}`),
-	}, StreamID: "functional-openai"}
-	reads := []pluginapi.HostModelStreamReadResponse{
-		{Payload: []byte(`{"model":"upstream","choices":[{"delta":{"content":"one"}}]} {"model":"upstream","choices":[{"delta":{"content":"two"}}]}`)},
-		{Done: true},
-	}
-	emitted, hostClosed, pluginClosed, _, err := runExecutorStreamTestWithHostContentType(req, reads, "text/event-stream; charset=utf-8")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !hostClosed || !pluginClosed || len(emitted) != 2 {
-		t.Fatalf("emitted=%q close=%v/%v", emitted, hostClosed, pluginClosed)
-	}
-	for _, chunk := range emitted {
-		if !json.Valid([]byte(chunk)) || strings.Contains(chunk, "data:") || strings.Contains(chunk, "upstream") {
-			t.Fatalf("core chunk=%q", chunk)
+	for _, contentType := range []string{"", "text/event-stream", "text/event-stream; charset=utf-8", "application/json"} {
+		for _, terminalPayload := range []bool{false, true} {
+			for _, tc := range []struct {
+				name, input string
+				want        []string
+			}{
+				{"two values", `{"model":"upstream","choices":[{"delta":{"content":"one"}}]} {"model":"upstream","choices":[{"delta":{"content":"two"}}]}`, []string{`{"model":"client","choices":[{"delta":{"content":"one"}}]}`, ` {"model":"client","choices":[{"delta":{"content":"two"}}]}`}},
+				{"single hello", `{"model":"upstream","choices":[{"delta":{"content":"hello"}}]}`, []string{`{"model":"client","choices":[{"delta":{"content":"hello"}}]}`}},
+			} {
+				t.Run(fmt.Sprintf("%s/header=%s/terminal=%v", tc.name, contentType, terminalPayload), func(t *testing.T) {
+					req := rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+						Model: "client", Format: "openai", SourceFormat: "openai", Stream: true,
+						OriginalRequest: []byte(`{"model":"client","stream":true}`),
+					}, StreamID: "functional-openai"}
+					reads := []pluginapi.HostModelStreamReadResponse{{Payload: []byte(tc.input), Done: terminalPayload}}
+					if !terminalPayload {
+						reads = append(reads, pluginapi.HostModelStreamReadResponse{Done: true})
+					}
+					emitted, hostClosed, pluginClosed, _, err := runExecutorStreamTestWithHostContentType(req, reads, contentType)
+					if err != nil || !hostClosed || !pluginClosed || len(emitted) != len(tc.want) {
+						t.Fatalf("emitted=%q close=%v/%v error=%v", emitted, hostClosed, pluginClosed, err)
+					}
+					for i, chunk := range emitted {
+						if !json.Valid([]byte(chunk)) || chunk != tc.want[i] || strings.Contains(chunk, "data:") || strings.Contains(chunk, "upstream") {
+							t.Fatalf("core chunk=%q, want %q", chunk, tc.want[i])
+						}
+					}
+					if strings.Contains(strings.Join(emitted, ""), "[DONE]") {
+						t.Fatal("plugin added OpenAI DONE")
+					}
+				})
+			}
 		}
 	}
-	if strings.Contains(strings.Join(emitted, ""), "[DONE]") {
-		t.Fatal("plugin added OpenAI DONE")
+}
+
+func TestFunctionalIssue8TerminalPayload(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "grok-4.6=>grok-4.7"})
+	t.Cleanup(func() { setLoadedConfigForTest(defaultConfig()) })
+	const output = `[{"id":"msg-issue8","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ordinary grok-4.7 opaque 中文 output","annotations":[]}]}]`
+	const payload = `{"type":"response.completed","response":{"id":"resp-issue8","object":"response","status":"completed","model":"grok-4.7","output":` + output + `}}`
+	const restored = `{"type":"response.completed","response":{"id":"resp-issue8","object":"response","status":"completed","model":"grok-4.6","output":` + output + `}}`
+	input := []byte("event: response.completed\ndata: " + payload + "\n\n")
+	want := []byte("event: response.completed\ndata: " + restored + "\n\n")
+	for _, tc := range []struct {
+		name, wantError string
+		reads           []pluginapi.HostModelStreamReadResponse
+	}{
+		{"Payload+Done", "", []pluginapi.HostModelStreamReadResponse{{Payload: input, Done: true}}},
+		{"split terminal", "", []pluginapi.HostModelStreamReadResponse{{Payload: input[:17]}, {Payload: input[17:], Done: true}}},
+		{"Payload+Error+Done", "probe upstream error", []pluginapi.HostModelStreamReadResponse{{Payload: input, Error: "probe upstream error", Done: true}}},
+		{"independent Done", "", []pluginapi.HostModelStreamReadResponse{{Payload: input}, {Done: true}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reads := tc.reads
+			var emitted []byte
+			var closeText string
+			var order []string
+			hostCloses, pluginCloses := 0, 0
+			call := func(method string, value any) (json.RawMessage, error) {
+				switch method {
+				case pluginabi.MethodHostModelExecuteStream:
+					raw, err := json.Marshal(value)
+					if err != nil {
+						return nil, err
+					}
+					var forwarded pluginapi.HostModelExecutionRequest
+					if err := json.Unmarshal(raw, &forwarded); err != nil {
+						return nil, err
+					}
+					if forwarded.Model != "grok-4.7" || string(forwarded.Body) != `{"model":"grok-4.7","stream":true}` || forwarded.EntryProtocol != "openai-response" || forwarded.ExitProtocol != "openai-response" {
+						return nil, fmt.Errorf("unexpected forwarded request=%+v", forwarded)
+					}
+					return json.Marshal(pluginapi.HostModelStreamResponse{StatusCode: 200, StreamID: "issue8-host", Headers: map[string][]string{"Content-Type": {"text/event-stream"}}})
+				case pluginabi.MethodHostModelStreamRead:
+					if len(reads) == 0 {
+						return nil, errors.New("unexpected extra read")
+					}
+					read := reads[0]
+					reads = reads[1:]
+					return json.Marshal(read)
+				case pluginabi.MethodHostStreamEmit:
+					raw, err := json.Marshal(value)
+					if err != nil {
+						return nil, err
+					}
+					var emit struct {
+						Payload []byte `json:"payload"`
+					}
+					if err := json.Unmarshal(raw, &emit); err != nil {
+						return nil, err
+					}
+					emitted = append(emitted, emit.Payload...)
+					order = append(order, "emit")
+				case pluginabi.MethodHostModelStreamClose:
+					hostCloses++
+					order = append(order, "host-close")
+				case pluginabi.MethodHostStreamClose:
+					pluginCloses++
+					order = append(order, "plugin-close")
+					raw, err := json.Marshal(value)
+					if err != nil {
+						return nil, err
+					}
+					var closed struct {
+						Error string `json:"error"`
+					}
+					if err := json.Unmarshal(raw, &closed); err != nil {
+						return nil, err
+					}
+					closeText = closed.Error
+				default:
+					return nil, fmt.Errorf("unexpected callback %s", method)
+				}
+				return json.RawMessage(`{}`), nil
+			}
+			stream, _, err := prepareExecutorStream(&executorRPCRequest{Model: "grok-4.6", Format: "openai-response", SourceFormat: "openai-response", OriginalRequest: []byte(`{"model":"grok-4.6","stream":true}`), StreamID: "issue8-plugin"}, call)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := runStreamForward(stream); err != nil || !bytes.Equal(emitted, want) || closeText != tc.wantError || hostCloses != 1 || pluginCloses != 1 || len(reads) != 0 || strings.Join(order, ",") != "emit,host-close,plugin-close" {
+				t.Fatalf("output=%q terminal=%q closes=%d/%d remaining=%d order=%v error=%v", emitted, closeText, hostCloses, pluginCloses, len(reads), order, err)
+			}
+			requireValidResponsesSSE(t, emitted, 1)
+		})
 	}
 }
 
@@ -149,6 +256,98 @@ func TestFunctionalEmitFailureStopsRawChunks(t *testing.T) {
 	}
 	if err := stream.flushAndEmit(r, true); err != nil || emits != 1 {
 		t.Fatalf("flush error=%v emits=%d, want no replay", err, emits)
+	}
+	if err := stream.processPayload(r, []byte(`{"model":"upstream","id":3}`)); err != nil || emits != 1 {
+		t.Fatalf("later payload error=%v emits=%d, want no further emission", err, emits)
+	}
+}
+
+func TestFunctionalEmitFailureStopsPendingUnits(t *testing.T) {
+	for _, tc := range []struct{ name, format, input, wantFirst string }{
+		{"SSE LF", "claude", "data: {\"model\":\"upstream\",\"id\":1}\n\ndata: {\"model\":\"upstream\",\"id\":2}", "data: {\"model\":\"client\",\"id\":1}\n\n"},
+		{"SSE CRLF", "claude", "data: {\"model\":\"upstream\",\"id\":1}\r\n\r\ndata: {\"model\":\"upstream\",\"id\":2}", "data: {\"model\":\"client\",\"id\":1}\r\n\r\n"},
+		{"SSE CR", "claude", "data: {\"model\":\"upstream\",\"id\":1}\r\rdata: {\"model\":\"upstream\",\"id\":2}", "data: {\"model\":\"client\",\"id\":1}\r\r"},
+		{"deferred scalar", "openai-response", `{"model":"upstream","id":1} true`, "data: {\"model\":\"client\",\"id\":1}\n\n"},
+	} {
+		for _, terminal := range []string{"continuing", "done", "error"} {
+			t.Run(tc.name+"/"+terminal, func(t *testing.T) {
+				emitErr := errors.New("expected first emit failure")
+				var attempted [][]byte
+				var order []string
+				var closeText string
+				reads, hostCloses, pluginCloses := 0, 0, 0
+				stream := &executorStream{originalModel: "client", format: tc.format, frameRawJSONAsSSE: true, hostStreamID: "host-pending", pluginStreamID: "plugin-pending"}
+				stream.call = func(method string, payload any) (json.RawMessage, error) {
+					switch method {
+					case pluginabi.MethodHostModelStreamRead:
+						reads++
+						order = append(order, "read")
+						if reads != 1 || payload.(pluginapi.HostModelStreamReadRequest).StreamID != "host-pending" {
+							return nil, fmt.Errorf("unexpected read %d: %+v", reads, payload)
+						}
+						chunk := pluginapi.HostModelStreamReadResponse{Payload: []byte(tc.input), Done: terminal != "continuing"}
+						if terminal == "error" {
+							chunk.Error = "expected upstream failure"
+						}
+						return json.Marshal(chunk)
+					case pluginabi.MethodHostStreamEmit:
+						order = append(order, "emit")
+						raw, err := json.Marshal(payload)
+						if err != nil {
+							return nil, err
+						}
+						var emit struct {
+							StreamID string `json:"stream_id"`
+							Payload  []byte `json:"payload"`
+						}
+						if err := json.Unmarshal(raw, &emit); err != nil {
+							return nil, err
+						}
+						if emit.StreamID != "plugin-pending" {
+							return nil, fmt.Errorf("emit stream id=%q", emit.StreamID)
+						}
+						attempted = append(attempted, bytes.Clone(emit.Payload))
+						return nil, emitErr
+					case pluginabi.MethodHostModelStreamClose:
+						hostCloses++
+						order = append(order, "host-close")
+						if payload.(pluginapi.HostModelStreamCloseRequest).StreamID != "host-pending" {
+							return nil, fmt.Errorf("host close payload=%+v", payload)
+						}
+					case pluginabi.MethodHostStreamClose:
+						pluginCloses++
+						order = append(order, "plugin-close")
+						raw, err := json.Marshal(payload)
+						if err != nil {
+							return nil, err
+						}
+						var closed struct {
+							Error string `json:"error"`
+						}
+						if err := json.Unmarshal(raw, &closed); err != nil {
+							return nil, err
+						}
+						closeText = closed.Error
+					default:
+						return nil, fmt.Errorf("unexpected callback %s", method)
+					}
+					return json.RawMessage(`{}`), nil
+				}
+				err := runStreamForward(stream)
+				if err != nil || reads != 1 || hostCloses != 1 || pluginCloses != 1 {
+					t.Fatalf("error=%v reads=%d closes=%d/%d", err, reads, hostCloses, pluginCloses)
+				}
+				if len(attempted) != 1 || string(attempted[0]) != tc.wantFirst {
+					t.Errorf("emit attempts=%q, want only %q", attempted, tc.wantFirst)
+				}
+				if strings.Join(order, ",") != "read,emit,host-close,plugin-close" || !strings.Contains(closeText, emitErr.Error()) {
+					t.Errorf("order=%v terminal=%q", order, closeText)
+				}
+				if terminal == "error" && (!strings.Contains(closeText, "expected upstream failure") || strings.Index(closeText, "expected upstream failure") > strings.Index(closeText, emitErr.Error())) {
+					t.Errorf("upstream error order=%q", closeText)
+				}
+			})
+		}
 	}
 }
 
@@ -1029,18 +1228,91 @@ func TestFunctionalCompleteRawScalarUnknownSSEPartitions(t *testing.T) {
 	input := append(bytes.Clone(value), []byte("\nx-vendor-field\ndata: {\"model\":\"upstream\"}\n\n")...)
 	want := append(bytes.Clone(value), []byte("\nx-vendor-field\ndata: {\"model\":\"client\"}\n\n")...)
 	boundary := len(value) + len("\nx-vendor-field\nd")
-	for _, tc := range []struct {
+	type partitionCase struct {
 		name  string
 		parts [][]byte
-	}{
+	}
+	cases := []partitionCase{
 		{"whole", [][]byte{input}},
 		{"pending at limit", [][]byte{input[:maxPendingStreamBytes], input[maxPendingStreamBytes:]}},
 		{"unknown field before split data", [][]byte{input[:len(value)], input[len(value):boundary], input[boundary:]}},
-	} {
+	}
+	for i := 0; i <= len("\nx-vendor-field"); i++ {
+		cut := len(value) + i
+		cases = append(cases,
+			partitionCase{fmt.Sprintf("unknown prefix=%d/two reads", i), [][]byte{input[:cut], input[cut:]}},
+			partitionCase{fmt.Sprintf("unknown prefix=%d/three reads", i), [][]byte{value, input[len(value):cut], input[cut:]}},
+		)
+	}
+	parts := [][]byte{value}
+	for i := len(value); i < len(input); i++ {
+		parts = append(parts, input[i:i+1])
+	}
+	cases = append(cases, partitionCase{"bytewise suffix", parts})
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := functionalProtocolParts(t, "openai-response", tc.parts...)
-			if !bytes.Equal(got, want) {
-				t.Fatalf("output=%d bytes, want %d; scalar unknown field must remain unchanged", len(got), len(want))
+			r := newStreamChunkRewriter("client")
+			r.format, r.frameRawJSONAsSSE = "openai-response", true
+			var out [][]byte
+			for i, part := range tc.parts {
+				chunks, err := r.Write(part)
+				if err != nil {
+					t.Fatalf("Write %d=(%d,%v)", i, len(chunks), err)
+				}
+				if i < len(tc.parts)-1 && len(chunks) != 0 {
+					t.Fatalf("Write %d prematurely framed ambiguous scalar: %d bytes", i, len(bytes.Join(chunks, nil)))
+				}
+				out = append(out, chunks...)
+			}
+			chunks, err := r.Finish()
+			got := bytes.Join(append(out, chunks...), nil)
+			if err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("output=%d bytes, want %d, error=%v; scalar unknown field must remain unchanged", len(got), len(want), err)
+			}
+		})
+	}
+}
+
+func TestFunctionalRawScalarSSEIncompleteLimit(t *testing.T) {
+	value, err := json.Marshal(strings.Repeat("x", maxPendingStreamBytes+1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, completed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("previous event completed=%v", completed), func(t *testing.T) {
+			r := newStreamChunkRewriter("client")
+			r.format, r.frameRawJSONAsSSE = "openai-response", true
+			input := append(bytes.Clone(value), []byte("\nx-vendor-field\ndata:")...)
+			if completed {
+				input = append(input, []byte(" {\"model\":\"upstream\"}\n\n")...)
+			}
+			chunks, err := r.Write(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if completed {
+				want := append(bytes.Clone(value), []byte("\nx-vendor-field\ndata: {\"model\":\"client\"}\n\n")...)
+				if !bytes.Equal(bytes.Join(chunks, nil), want) {
+					t.Fatal("completed SSE scalar prefix changed")
+				}
+			} else if len(chunks) != 0 {
+				t.Fatal("incomplete SSE event emitted")
+			}
+			tail := []byte(` {"text":"`)
+			if completed {
+				tail = append([]byte("data:"), tail...)
+			}
+			tail = append(tail, bytes.Repeat([]byte{'x'}, maxPendingStreamBytes+1-len(tail))...)
+			chunks, err = r.Write(tail)
+			if err == nil || !strings.Contains(err.Error(), "stream pending data exceeds") || len(chunks) != 0 {
+				t.Fatalf("incomplete suffix=(%d,%v)", len(chunks), err)
+			}
+			if r.pending != nil || r.sse.buf != nil || r.rawScan.active {
+				t.Fatal("oversized incomplete SSE suffix retained")
+			}
+			chunks, err = r.Finish()
+			if err != nil || len(chunks) != 0 {
+				t.Fatalf("cleared suffix Finish=(%d,%v)", len(chunks), err)
 			}
 		})
 	}
