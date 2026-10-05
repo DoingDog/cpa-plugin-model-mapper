@@ -4,7 +4,7 @@
 
 **Goal:** 修复普通规则错误处理、JSON 内容保持、流协议和 shutdown 问题，并用永久 unit 与 actual CPA integration 证明基线失败、修复通过。
 
-**Architecture:** 保持单 package 和 `main.go` 现有产品结构。共享 JSON 改写器用标准库定位原始 value spans；共享 stream rewriter 保留完整单位、错误和现有协议边界；生命周期使用现有同步点选择 terminal 结果。A、B、D 独立 worktree 并行，C 的共享 fixture 编码依赖 B，E 在全部修复合并后独立完成永久 integration 和终验。
+**Architecture:** 保持单 package 和 `main.go` 现有产品结构。共享 JSON 改写器用标准库定位原始 value spans；共享 stream rewriter 保留完整单位、错误和现有协议边界；生命周期使用现有同步点选择 terminal 结果。A、B、D 独立 worktree 并行，C 的共享 fixture 编码依赖 B。C 最终已验证提交 -> G 有限接口核查、语义条件满足后的必要完整 TDD／审查／提交 -> E 全部永久 actual 验收 -> F 发布。G2 未满足时停止产品编码，E/F 不放行。
 
 **Tech Stack:** Go `1.26.0`，`encoding/json`，现有 cgo ABI，CPA `v7.2.152`，现有 Go tests、Makefile 和 GitHub Actions。
 
@@ -14,7 +14,7 @@
 
 - Go 最低版本 `1.26.0`；CPA 固定 `v7.2.152`，integration revision 固定 `c76dfd4e0edabab9000628b1560ab8ab379eadb8`。
 - 不增加产品依赖、配置项或功能；不修改 CPA 源码、已安装 module cache、旧 `.claude` 或其他 worktree 的现有内容。
-- 沿用 `main.go` 的产品结构；新增回归按 A/B/C/D 使用独立测试文件。旧 fixture 只改变明确过时的字节、framing 或 emission 预期，其他断言保留。
+- 沿用 `main.go` 的产品结构；新增回归按 A/B/C/D/G 使用独立测试文件。旧 fixture 只改变明确过时的字节、framing 或 emission 预期，其他断言保留。
 - JSON 结构解析复用 `encoding/json` 的 `Decoder.Token`、`Decode(json.RawMessage)` 和 `InputOffset`；不新增手写 JSON parser。
 - 请求只改写顶层 string `model`；响应仅恢复 `model`、`modelVersion`、`response.model`、`response.modelVersion`、`message.model`、`interaction.model`。
 - `maxPendingStreamBytes` 保持 `16 << 20`；完整单位和完整累计流量不计入 incomplete 上限。此前未完成前缀已经超限并被清空时，不承诺后续补完能恢复。
@@ -46,11 +46,14 @@
 | B | 修改 `main.go:2256-2728` 的 JSON 相关函数；创建 `json_rewrite_regression_test.go`；修改 `main_test.go` 中必须保序的旧 expected bytes。 | 负责全部 JSON 保序 fixture，不修改 SSE marker scanner、framing 或 emission 次数。独立达到 root GREEN 后提交。 |
 | C | 修改 `main.go:32-1214`，`emitRewritten`、`prepareExecutorStream`、`processPayload`、`flushAndEmit`；创建 `stream_protocol_regression_test.go`；修改 `main_test.go` 的协议职责 fixture、必要 `performance_regression_test.go`、`README.md:180-205`。 | 可提前分析和准备独立 RED；共享 fixture 编码从 B 已验证提交开始。不得改 D 的 struct/terminal 函数。 |
 | D | 修改 `executorStream` 生命周期字段、生命周期函数、`closeHost`、`closePlugin`、`startExecutorStream`、`finish`、`runStreamForward`；创建 `stream_lifecycle_regression_test.go`；必要时修改 `main_test.go` 的生命周期测试。 | 与 A、B 并行；不得改 C 的 payload/flush 函数。 |
-| E | 修改 `.github/scripts/smoke-local_test.go`；创建唯一的 `.github/scripts/testdata/cpa-functional-regression_test.go`；仅在实际入口变化时改 `Makefile`、`.github/workflows/build.yml`。 | 依赖已合并 A/B/C/D，在单独 worktree 完成实际 CPA RED/GREEN、全部终验和独立覆盖审查。 |
+| G | 修改 C 最终 HEAD 上共享 `streamChunkRewriter.Write/Flush/Finish`、`sseRewriter.Write/drain`、delimiterless scanner/reset/classification 的 F15 必要部分；创建 `stream_native_fields_regression_test.go`；必要协议／性能 fixture。 | 等 C 连续完成独立审查、修正、复审与提交，固定该最终 SHA 为 reviewBASE；有限核查 G2 后才决定是否可编码。只消费 C 的 `batchSSEOutput`、framing/batching 和 chunks+error，不改 C executor helper 或 A/B/D。缺可靠区分信息时停止；满足后连续完成必要 TDD、全部测试／性能、审查、修正、复审和提交。 |
+| E | 修改 `.github/scripts/smoke-local_test.go`；创建唯一的 `.github/scripts/testdata/cpa-functional-regression_test.go`；仅在实际入口变化时改 `Makefile`、`.github/workflows/build.yml`。 | 依赖已合并 A/B/C/D/G，在单独 worktree 完成实际 CPA RED/GREEN、全部终验和独立覆盖审查。F15 baseline 固定 `6c7f060`，F01..F14 原 baseline 保持。 |
 
 B 的已知保序 fixture 包括 `TestRestoreResponseModelFastPathPreservesEscapedSemantics`、`TestStreamChunkRewriterFramesRawJSONBeforeSSEDoneInSameWrite`、`TestStreamChunkRewriterFramesRawJSONBeforeSSEDoneAcrossPartitions`、`BenchmarkSSEMarkerGuardRestore`、`BenchmarkSSEMarkerGuardCandidate`（`main_test.go:2332-2369`），以及全量 suite 显示仅因原 map 排序或 escaped key 归一化而过时的 exact-byte 测试。B 对这些 fixture 保持同样输入、同样 framing/opaque/ownership 断言，只更改新的精确字节表示。两个 benchmark 不随 root tests 运行，B 必须独立运行其 byte-exact preflight 并达到 GREEN 后交给 C/E。
 
 C 的职责 fixture 包括 `TestHandleExecutorExecuteStreamReturnsPreparedHostHeaders`、`TestRunStreamForwardTerminatesReframedOpenAIChat`、`TestRunStreamForwardProcessesTerminalPayload`、`TestRunStreamForwardBatchesOnlySSEOutput`。B 若必须修改这些测试中的 JSON 字节，先完成保序部分并提交，C 从该提交开始修改 framing/emit 部分。任何同一测试的双重修改都按此依赖执行；函数边界不代替 fixture 依赖。
+
+G 的共享函数修改必须从协调者主动交付的 C 最终完整审查提交开始，不读取或轮询 C 在修改 worktree。只有限核查交付 HEAD 的 Write 分发、scanner/reset、drain 候选提交、complete/incomplete 限额和 batching/chunks+error。G2 语义检查未满足时停止产品编码，不能以全部积存到 EOF 或启发式取得产品 GREEN。
 
 ## Task A：运行期空结果交给 executor
 
@@ -616,7 +619,7 @@ func TestFunctionalMixedRawSSEABI(t *testing.T) {
 ### C5：全量验证、审查与提交
 
 - [ ] issue8 复用既有 C terminal 控制和 E2 的同一完整 Responses fixture，规则为 `grok-4.6=>grok-4.7`，`Format/SourceFormat=openai-response`。覆盖 `Payload+Done`、在第 17 字节拆分后末段携带 Done、`Payload+Error+Done`（原错误 `probe upstream error`），以及 payload 后独立 Done 的控制；检查上游请求 `Model` 和顶层 `model=grok-4.7`、下游 `response.model=grok-4.6`、完整 output 原样、emit -> host-close -> plugin-close 与成功 close 次数。保留 D 的 terminal/error 断言和函数所有权。执行 `go test . -run 'TestRunStreamForward(ProcessesTerminalPayload|FlushesPendingBytesOnReadError|PreservesInBandErrorAcrossCleanupFailures)' -count=1 -v`。早期独立 fake callback 探测的完整 SSE terminal 控制已通过，按控制记录，不要求人为制造 RED；该结果不覆盖 E2 两个无 LF field chunks，也不证明补充调查中的 mapped 502 已解决。
-- [ ] E2 引用的 `issue8-alternative-verification.json` 已正式确认 `6c7f060` 的无 LF 字段边界缺陷和 native/HTTP mapped 502。以 C 原范围最终已验证 HEAD 为前置依赖，由同一共享 rewriter 的已分派后续任务在 `stream_protocol_regression_test.go` 的 `TestFunctional` 范围内原样检查 E2 的两个无 LF event/data payload、18 字段九事件、单 terminal data-only 和九个独立 data-only payload；不预拼接、不补 LF，保留 XAI core 空 chunk 和正常独立 Done。单 terminal 对照保持一帧、模型恢复和完整 opaque output；九个 data-only payload 保持九个有序有效帧、完整 delta/output 和 `response.completed`。保存实际 source HEAD、原始输入和 baseline/fixed 结果；仍为目标 RED 时顺序完成 focused TDD、共享 scanner 修正、完整验证、独立规格／质量复审、必要修正及提交，已有 GREEN 时保存永久回归，不新增猜测性 workaround 或共享函数的并行实现。运行 `go test . -run '^TestFunctional|TestRunStreamForward(ProcessesTerminalPayload|FlushesPendingBytesOnReadError|PreservesInBandErrorAcrossCleanupFailures)' -count=1 -v`，既有完整 SSE、合法字节分片、metadata、incomplete 上限和 D 的 terminal/error 条件不变。E 等该后续任务最终提交通过并整合后完成唯一入口的真实 producer/native/framer/HTTP 验收。
+- [ ] E2 引用的 `issue8-alternative-verification.json` 已正式确认 `6c7f060` 的无 LF 字段边界缺陷和 native/HTTP mapped 502。以 C 原范围最终已验证 HEAD 为前置依赖，由 Task G 在 `stream_native_fields_regression_test.go` 的 `TestFunctionalNativeSSEField` 范围内原样检查 E2 的两个无 LF event/data payload、18 字段九事件、单 terminal data-only 和九个独立 data-only payload；不预拼接、不补 LF，保留 XAI core 空 chunk 和正常独立 Done。单 terminal 对照保持一帧、模型恢复和完整 opaque output；九个 data-only payload 保持九个有序有效帧、完整 delta/output 和 `response.completed`。保存实际 source HEAD、原始输入和 baseline/fixed 结果；G 必须先完成 G2 同前缀／迟到 delimiter 的有限接口语义核查。缺可靠区分信息时停止产品编码并报告冲突，不能把全部积存到 EOF 或候选提前 emit 作为修复。仍为目标 RED 且 G2 条件满足时，顺序完成 focused TDD、共享 scanner 修正、完整验证、独立规格／质量复审、必要修正及提交；已有 GREEN 时记录 C 修复归属并保存永久回归，不新增猜测性 workaround 或共享函数的并行实现。运行 `go test . -run '^TestFunctional|TestRunStreamForward(ProcessesTerminalPayload|FlushesPendingBytesOnReadError|PreservesInBandErrorAcrossCleanupFailures)' -count=1 -v`，既有完整 SSE、合法字节分片、metadata、incomplete 上限和 D 的 terminal/error 条件不变。E 等该后续任务最终提交通过并整合后完成唯一入口的真实 producer/native/framer/HTTP 验收。
 - [ ] 运行 `go test -count=1 ./...`、`go vet ./...`、`go test -race -count=3 . -run '^TestFunctional'`。不能留下 B fixture、C framing 或 parser 的已知失败给协调会话。
 - [ ] 运行现有 markerless SSE、escaped SSE、fragmented raw JSON、delimiterless scan、owned delimiter 和 request/response allocation checks。门槛保持规格的既有值，不删除 benchmark preflight。
 - [ ] reviewer 核对 F04/F07/F08/F09/F10/F11/F12 与 F13/F14 的真实层级；检查所有返回 `chunks,error` 的上层调用、普通 SSE metadata、framing/batching 分工和 opaque 字节。修正后复审。
@@ -860,6 +863,1374 @@ func TestFunctionalShutdownLifecycleReset(t *testing.T) {
 - [ ] 运行 `go test -race -count=3 . -run 'TestFunctionalShutdown|TestShutdownExecutorStreams|TestExecutorStreamLifecycle'`、`go test -count=1 ./...`、`go vet ./...`。reader、cleanup、多个 shutdown 和 preparing stream 都完成，不提前清除 callback。
 - [ ] 独立规格/质量 reviewer 核对 F05/F06、自然先选定、已有错误、成功 close 次数和已有失败补救。修正、复审后提交：`git add main.go main_test.go stream_lifecycle_regression_test.go && git commit -m "fix: interrupt active streams during shutdown"`。
 
+## Task G：native SSE field boundary，F15
+
+> For agentic workers：沿用既定 workflow 分工。产品任务在独立分配 worktree 连续完成测试、实现、审查、修正、复审和提交。补充草稿与回归已独立复审并整合，G2 产品语义条件尚未满足；本阶段仅允许 G1/G2 有限核查和回归，缺可靠区分信息时停止产品编码。
+
+**Goal：**覆盖并修复 F15 的 field-pair 与多事件 data-only 共用边界问题，同时保留单 terminal data-only、普通 SSE 分片和完整内容。
+
+**Architecture：**使用共享 rewriter/scanner、现有增量状态、SSE helpers 与 encoding/json。候选记录和不可逆派发分开处理。G2 必须先通过同前缀/迟到 delimiter 的接口语义检查点；不满足时停止产品修改并交回具体冲突。
+
+**使用的技术：**Go >=1.26.0，现有 encoding/json，固定 CPA v7.2.152 与 c-shared 插件。没有新产品依赖或配置。
+
+**Spec：**`docs/superpowers/specs/2026-10-02-functional-fixes-design.md` 中 G/F15 的绑定规格。完整草稿来源为 `C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/functional-fixes-20261002/.superpowers/sdd/2026-10-02-functional-fixes-implementation/task-G-native-fields-design-1.json`，SHA-256 `4cc5cdb512e520af2fcdc2486af640fa00e5c510acda28e5ac6e5b2fd2922b72`；独立复审为同目录 `task-G-native-fields-plan-review-1.json`（approved=true、findings=[]），批准范围仅为草稿。以下设计核验结果来自该草稿和复审，文档整合未重跑产品测试。
+
+### Global Constraints
+
+- 保留 F01..F14；F13 是 helper 回归，F14 是合法 ABI 层级；F15 包含 field-pair 和 data-only，不单列 provider 修复。
+- CPA v7.2.152，module Sum `h1:FkvGzpOCvuDGswaOyoVfbY5Ua7OlP/wMXw3agiNMUQI=`，integration binary revision `c76dfd4e0edabab9000628b1560ab8ab379eadb8`。
+- maxPendingStreamBytes 保持 16 << 20；完整单位和完整累计流量不计入 incomplete 上限；超限未完成单位清空并报错。
+- 使用 encoding/json 和现有 SSE helpers/state，不新增手写 parser、配置、产品依赖或 ABI 字段。
+- 保留 B 的 JSON/opaque/ownership、C 的 framing/batching 与 chunks+error、D 的终止和关闭；A/B/D 不修改。
+- 只在分配 worktree 或本任务 OS 临时副本执行；不读取 C 在修改 worktree、不轮询、不修改 CPA/module cache。
+- E 保留唯一 TestCPAPluginIntegration smoke 入口与唯一 cpa-functional-regression_test.go CPA fixture。
+- pluginVersion 默认 0.0.0-dev；issue8 用 Refs；PR7 相关新提交注明 #7 与 @leolmq。发版、评论、推送和关闭不在本任务内。
+
+### Review Focus
+
+1. field-pair 与 data-only 两/九事件必须同时通过；单 terminal data-only 正常不能代替多事件。G1 的 Sequence 和 DataOnlyTerminalControl 分别断言。
+2. 普通单 event field 可以包含两个 canonical field-pair 字符串，并分四次 Write 后才收到标准 delimiter。G1 的 LateDelimiter whole/全部 split/延迟 LF、CRLF 控制必须保留原文且 delimiter 前不 emit；LateDataDelimiter 保留普通 data 字符串。
+3. header 候选已记录后不得重扫整个 JSON。Continuation/ContinuationAllocations 与 2 MiB、8 MiB、8 KiB benchmark 检查模型、opaque、输出长度、ownership 与扫描成本。
+4. 完整大单位和 overflow tail 分开检查；Limit 的每个 complete/incomplete subtest 独立运行，不因首个 RED 跳过控制。EOF、错误和 close 由 Forwarder 及 C/D 既有控制覆盖。
+5. 根 callback mock、真实 core/host producer、native DLL、实际 Responses HTTP framer 分层记录。G4 的完整 CPA 代码和 E 唯一入口验证两种 builtin、两种形状、全部 route 与非流，不用 callback mock 代替实际链路。
+
+### 文件与接口
+
+G 的源文件位置以其分配的绝对 worktree 根目录为准。当前固定设计源为 `C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/functional-fixes-20261002/main.go`、`main_test.go`、`performance_regression_test.go`。
+
+- 创建 `stream_native_fields_regression_test.go`，内容为 G1 的完整 Go 文件。
+- 仅修改 main.go 共用 streamChunkRewriter/sseRewriter/scanner 的 F15 必要部分；必要协议 fixture 修改限于 main_test.go，不改 B 的保序期望或 D 的 lifecycle fixture。
+- 新 native continuation benchmark 可随新回归文件保存；只有共用检查确需调整才改 performance_regression_test.go，门槛和旧 preflight 不放宽。
+- E 将 G4 的完整 Go 代码合入其唯一 `.github/scripts/testdata/cpa-functional-regression_test.go`，imports 与已有函数合并；不覆盖其他 F01..F14 fixture，不另建第二文件。
+
+保留接口：`(*streamChunkRewriter).Write([]byte) ([][]byte,error)`、Flush/Finish 同返回类型；`emitRewritten(chunks [][]byte, batch bool, emit func([]byte) error) error`；`(*executorStream).processPayload(*streamChunkRewriter, []byte) error`；`(*executorStream).flushAndEmit(*streamChunkRewriter, bool) error`。非空 chunks 可与 error 同时存在；由 C 的既有调用者发送并合并错误。
+
+### G1：固定起点、完整 focused 回归与归属
+
+- [ ] 等待协调者主动交付 C 最终完整审查提交、SHA 和完成通知。由既定 workflow 分配 G 的独立 worktree，不读取其他在修改目录。检查 worktree clean、实际 HEAD 等于交付 SHA，将该完整 SHA 写入 review receipt。
+
+以下命令在 G 分配 worktree 执行，Git Bash 变量仅在同一调用有效；多次调用重新给 G/reviewBASE 赋相同值。
+
+```bash
+G=$(git rev-parse --show-toplevel)
+reviewBASE=$(git -C "$G" rev-parse HEAD)
+git -C "$G" status --short
+git -C "$G" log -1 --format='%H %s'
+go -C "$G" version
+```
+
+- [ ] 重新核对 C 最终 HEAD 的有限位置：Write 向 sse.Write 分发及格式设置；scanner header/data/typed-complete 状态及 reset；drain 的标准 delimiter/logical 候选选择与提交；complete/incomplete 限额；batchSSEOutput 和 processPayload/flushAndEmit 的 chunks+error 消费。固定设计源对应 main.go:32..1214、1656..1685、1982..2013。不复制未交付 C 的函数，不重新全仓审计。
+- [ ] 加入下列完整、已编译的 root Go 回归文件。现有 requireValidResponsesSSE、splitSSELine、sseFieldValue、newStreamChunkRewriter、runStreamForward 均为固定源码真实符号，其他 gNative helpers 在本文件定义。C 如已有同输入、同断言的回归，复用并补足缺失矩阵，不重复定义。
+
+```go
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+
+	pluginabi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
+	pluginapi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+)
+
+const gNativeOutput = `[{"id":"msg-issue8","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ordinary grok-4.7 opaque 中文 output","annotations":[]}]}]`
+const gNativeCompleted = `{"type":"response.completed","response":{"id":"resp-issue8","object":"response","status":"completed","model":"grok-4.7","output":` + gNativeOutput + `}}`
+const gNativeCompletedWant = `{"type":"response.completed","response":{"id":"resp-issue8","object":"response","status":"completed","model":"grok-4.6","output":` + gNativeOutput + `}}`
+
+func gNativeParts(t *testing.T, format string, finish bool, parts ...[]byte) []byte {
+	t.Helper()
+	r := newStreamChunkRewriter("grok-4.6")
+	r.format, r.frameRawJSONAsSSE = format, true
+	var out []byte
+	for _, part := range parts {
+		chunks, err := r.Write(part)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, bytes.Join(chunks, nil)...)
+	}
+	var chunks [][]byte
+	var err error
+	if finish {
+		chunks, err = r.Finish()
+	} else {
+		chunks, err = r.Flush()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append(out, bytes.Join(chunks, nil)...)
+}
+
+func TestFunctionalNativeSSEFieldBoundary(t *testing.T) {
+	for _, finish := range []bool{false, true} {
+		t.Run(fmt.Sprintf("finish=%v", finish), func(t *testing.T) {
+			got := gNativeParts(t, "openai-response", finish,
+				[]byte("event: response.completed"), []byte("data: "+gNativeCompleted))
+			want := []byte("event: response.completed\ndata: " + gNativeCompletedWant + "\n\n")
+			if !bytes.Equal(got, want) {
+				t.Fatalf("native fields output=%q, want %q", got, want)
+			}
+			requireValidResponsesSSE(t, got, 1)
+			var event struct {
+				Response struct {
+					Model  string
+					Output json.RawMessage
+				}
+			}
+			_, _, rest := splitSSELine(got)
+			data, _, _ := splitSSELine(rest)
+			if err := json.Unmarshal(sseFieldValue(data), &event); err != nil {
+				t.Fatal(err)
+			}
+			if event.Response.Model != "grok-4.6" || string(event.Response.Output) != gNativeOutput {
+				t.Fatalf("response=%+v", event.Response)
+			}
+		})
+	}
+}
+
+func gNativeSequence() ([]string, []string) {
+	names := []string{"response.created", "response.in_progress", "response.output_item.added", "response.content_part.added", "response.output_text.delta", "response.output_text.done", "response.content_part.done", "response.output_item.done", "response.completed"}
+	payloads := []string{
+		`{"type":"response.created","response":{"model":"grok-4.7","status":"in_progress","output":[]}}`,
+		`{"type":"response.in_progress","response":{"model":"grok-4.7","status":"in_progress","output":[]}}`,
+		`{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}`,
+		`{"type":"response.content_part.added","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}`,
+		`{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"ordinary grok-4.7 opaque 中文 output"}`,
+		`{"type":"response.output_text.done","output_index":0,"content_index":0,"text":"ordinary grok-4.7 opaque 中文 output"}`,
+		`{"type":"response.content_part.done","output_index":0,"content_index":0,"part":{"type":"output_text","text":"ordinary grok-4.7 opaque 中文 output","annotations":[]}}`,
+		`{"type":"response.output_item.done","output_index":0,"item":{"id":"msg-issue8","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ordinary grok-4.7 opaque 中文 output","annotations":[]}]}}`,
+		gNativeCompleted,
+	}
+	return names, payloads
+}
+
+func TestFunctionalNativeSSEFieldForwarder(t *testing.T) {
+	for _, terminal := range []string{"natural", "in-band-error", "callback-error"} {
+		t.Run(terminal, func(t *testing.T) {
+			reads := []pluginapi.HostModelStreamReadResponse{
+				{Payload: []byte("event: response.completed")},
+				{Payload: []byte("data: " + gNativeCompleted)},
+				{Done: true},
+			}
+			if terminal == "in-band-error" {
+				reads[1].Error, reads[1].Done = "controlled upstream read error", true
+			}
+			var emitted []byte
+			var closeText string
+			hostCloses, pluginCloses := 0, 0
+			readErr := errors.New("controlled callback read error")
+			stream := &executorStream{pluginStreamID: "g-native", hostStreamID: "g-host", originalModel: "grok-4.6", format: "openai-response", frameRawJSONAsSSE: true}
+			stream.call = func(method string, payload any) (json.RawMessage, error) {
+				switch method {
+				case pluginabi.MethodHostModelStreamRead:
+					if terminal == "callback-error" && len(reads) == 1 {
+						return nil, readErr
+					}
+					if len(reads) == 0 {
+						return nil, errors.New("unexpected extra host read")
+					}
+					read := reads[0]
+					reads = reads[1:]
+					return json.Marshal(read)
+				case pluginabi.MethodHostStreamEmit:
+					raw, err := json.Marshal(payload)
+					if err != nil {
+						return nil, err
+					}
+					var emit struct {
+						Payload []byte `json:"payload"`
+					}
+					if err := json.Unmarshal(raw, &emit); err != nil {
+						return nil, err
+					}
+					emitted = append(emitted, emit.Payload...)
+				case pluginabi.MethodHostModelStreamClose:
+					hostCloses++
+				case pluginabi.MethodHostStreamClose:
+					pluginCloses++
+					raw, err := json.Marshal(payload)
+					if err != nil {
+						return nil, err
+					}
+					var closed struct {
+						Error string `json:"error"`
+					}
+					if err := json.Unmarshal(raw, &closed); err != nil {
+						return nil, err
+					}
+					closeText = closed.Error
+				default:
+					return nil, fmt.Errorf("unexpected callback %s", method)
+				}
+				return json.RawMessage(`{}`), nil
+			}
+			err := runStreamForward(stream)
+			want := []byte("event: response.completed\ndata: " + gNativeCompletedWant + "\n\n")
+			if !bytes.Equal(emitted, want) {
+				t.Fatalf("forwarded native fields=%q, want %q", emitted, want)
+			}
+			if hostCloses != 1 {
+				t.Fatalf("host closes=%d", hostCloses)
+			}
+			if terminal == "callback-error" {
+				if !errors.Is(err, readErr) || pluginCloses != 0 {
+					t.Fatalf("error=%v plugin closes=%d", err, pluginCloses)
+				}
+			} else {
+				if err != nil || pluginCloses != 1 {
+					t.Fatalf("error=%v plugin closes=%d", err, pluginCloses)
+				}
+				if terminal == "natural" && closeText != "" {
+					t.Fatal(closeText)
+				}
+				if terminal == "in-band-error" && closeText != "controlled upstream read error" {
+					t.Fatalf("terminal error=%q", closeText)
+				}
+			}
+		})
+	}
+}
+
+func TestFunctionalNativeSSEFieldWireControls(t *testing.T) {
+	for _, eol := range []string{"\n", "\r\n", "\r"} {
+		input := []byte("event: response.completed" + eol + "data: " + gNativeCompleted + eol + "id: event-1" + eol + "retry: 100" + eol + "x-vendor-field: grok-4.7" + eol + ": opaque grok-4.7" + eol + eol)
+		want := []byte("event: response.completed" + eol + "data: " + gNativeCompletedWant + eol + "id: event-1" + eol + "retry: 100" + eol + "x-vendor-field: grok-4.7" + eol + ": opaque grok-4.7" + eol + eol)
+		for split := 0; split <= len(input); split++ {
+			got := gNativeParts(t, "openai-response", true, input[:split], input[split:])
+			if !bytes.Equal(got, want) {
+				t.Fatalf("eol=%q split=%d output=%q, want %q", eol, split, got, want)
+			}
+		}
+		parts := make([][]byte, len(input))
+		for i := range input {
+			parts[i] = input[i : i+1]
+		}
+		if got := gNativeParts(t, "openai-response", true, parts...); !bytes.Equal(got, want) {
+			t.Fatalf("eol=%q bytewise output differs", eol)
+		}
+	}
+	literal := []byte("event: response.completeddata: " + gNativeCompleted + "\n\n")
+	for split := 0; split <= len(literal); split++ {
+		if got := gNativeParts(t, "openai-response", true, literal[:split], literal[split:]); !bytes.Equal(got, literal) {
+			t.Fatalf("literal event value split=%d changed to %q", split, got)
+		}
+	}
+	r := newStreamChunkRewriter("grok-4.6")
+	r.format, r.frameRawJSONAsSSE = "openai-response", true
+	if chunks, err := r.Write([]byte("event: response.completed\ndata: " + gNativeCompleted)); err != nil || len(chunks) != 0 {
+		t.Fatalf("ordinary pre-metadata output=%q error=%v", chunks, err)
+	}
+	chunks, err := r.Write([]byte("\nid: event-1\n\n"))
+	want := []byte("event: response.completed\ndata: " + gNativeCompletedWant + "\nid: event-1\n\n")
+	if err != nil || !bytes.Equal(bytes.Join(chunks, nil), want) {
+		t.Fatalf("metadata output=%q error=%v", chunks, err)
+	}
+}
+
+func TestFunctionalNativeSSEFieldFormatIsolation(t *testing.T) {
+	for _, format := range []string{"openai", "claude", "gemini", "interactions"} {
+		parts := [][]byte{[]byte("event: response.completed"), []byte("data: " + gNativeCompleted)}
+		got := gNativeParts(t, format, true, parts...)
+		if !bytes.Equal(got, bytes.Join(parts, nil)) {
+			t.Fatalf("format=%s inactive native recovery=%q", format, got)
+		}
+	}
+}
+
+func TestFunctionalNativeSSEFieldDiscriminator(t *testing.T) {
+	for _, unused := range []string{"17", "false"} {
+		t.Run("unused="+unused, func(t *testing.T) {
+			data := `{"type":"response.completed","event_type":` + unused + `,"response":{"model":"grok-4.7"},"opaque":{"text":"event: response.completed data: grok-4.7","n":1.00}}`
+			wantData := `{"type":"response.completed","event_type":` + unused + `,"response":{"model":"grok-4.6"},"opaque":{"text":"event: response.completed data: grok-4.7","n":1.00}}`
+			got := gNativeParts(t, "openai-response", true, []byte("event: response.completed"), []byte("data: "+data))
+			want := []byte("event: response.completed\ndata: " + wantData + "\n\n")
+			if !bytes.Equal(got, want) {
+				t.Fatalf("unused=%s output=%q, want %q", unused, got, want)
+			}
+		})
+	}
+	t.Run("mismatch-control", func(t *testing.T) {
+		parts := [][]byte{[]byte("event: response.completed"), []byte(`data: {"type":"response.created","response":{"model":"grok-4.7"}}`)}
+		if got := gNativeParts(t, "openai-response", true, parts...); !bytes.Equal(got, bytes.Join(parts, nil)) {
+			t.Fatalf("mismatched discriminator changed to %q", got)
+		}
+	})
+}
+
+func TestFunctionalNativeSSEFieldLimit(t *testing.T) {
+	if maxPendingStreamBytes != 16<<20 {
+		t.Fatal("pending limit changed")
+	}
+	for _, dataOnly := range []bool{false, true} {
+		header := []byte("event: response.output_text.done")
+		if dataOnly {
+			header = nil
+		}
+		value := `{"type":"response.output_text.done","text":"` + strings.Repeat("x", maxPendingStreamBytes) + `"}`
+		data := []byte("data: " + value)
+		unitWant := []byte("data: " + value + "\n\n")
+		if !dataOnly {
+			unitWant = append([]byte("event: response.output_text.done\n"), unitWant...)
+		}
+		cut := maxPendingStreamBytes - len(header)
+		for name, parts := range map[string][][]byte{
+			"single-complete":                {header, data},
+			"two-complete":                   {header, data, header, data},
+			"pending-at-limit-then-complete": {header, data[:cut], data[cut:], header, data},
+		} {
+			t.Run(fmt.Sprintf("dataOnly=%v/%s", dataOnly, name), func(t *testing.T) {
+				want := bytes.Clone(unitWant)
+				if name != "single-complete" {
+					want = append(want, unitWant...)
+				}
+				got := gNativeParts(t, "openai-response", true, parts...)
+				if !bytes.Equal(bytes.TrimSuffix(got, []byte("\n\n")), bytes.TrimSuffix(want, []byte("\n\n"))) {
+					t.Fatalf("complete native bytes=%d want=%d", len(got), len(want))
+				}
+			})
+		}
+		t.Run(fmt.Sprintf("dataOnly=%v/incomplete-control", dataOnly), func(t *testing.T) {
+			r := newStreamChunkRewriter("grok-4.6")
+			r.format, r.frameRawJSONAsSSE = "openai-response", true
+			if _, err := r.Write(header); err != nil {
+				t.Fatal(err)
+			}
+			chunks, err := r.Write([]byte(`data: {"type":"response.output_text.done","text":"` + strings.Repeat("x", maxPendingStreamBytes)))
+			if err == nil || !strings.Contains(err.Error(), "stream pending data exceeds") || len(chunks) != 0 {
+				t.Fatalf("incomplete native=(%d chunks,%v)", len(chunks), err)
+			}
+			chunks, err = r.Flush()
+			if err != nil || len(bytes.Join(chunks, nil)) != 0 {
+				t.Fatalf("cleared incomplete flush=(%d chunks,%v)", len(chunks), err)
+			}
+		})
+	}
+}
+
+func gNativeFields(dataOnly bool, count int) ([][]byte, []byte, []string) {
+	names, payloads := gNativeSequence()
+	indices := []int{8}
+	if count == 2 {
+		indices = []int{0, 8}
+	} else if count == 9 {
+		indices = []int{0, 1, 2, 3, 4, 5, 6, 7, 8}
+	}
+	var parts [][]byte
+	var want bytes.Buffer
+	var types []string
+	for _, i := range indices {
+		if !dataOnly {
+			parts = append(parts, []byte("event: "+names[i]))
+			fmt.Fprintf(&want, "event: %s\n", names[i])
+		}
+		parts = append(parts, []byte("data: "+payloads[i]))
+		restored := payloads[i]
+		if i < 2 || i == 8 {
+			restored = strings.Replace(restored, `"model":"grok-4.7"`, `"model":"grok-4.6"`, 1)
+		}
+		fmt.Fprintf(&want, "data: %s\n\n", restored)
+		types = append(types, names[i])
+	}
+	return parts, want.Bytes(), types
+}
+
+func gRequireNativeFrames(t *testing.T, got []byte, types []string, dataOnly bool) {
+	t.Helper()
+	requireValidResponsesSSE(t, got, len(types))
+	frames := bytes.Split(bytes.TrimSuffix(got, []byte("\n\n")), []byte("\n\n"))
+	for i, frame := range frames {
+		var name string
+		var data []byte
+		for rest := frame; len(rest) > 0; {
+			line, _, next := splitSSELine(rest)
+			rest = next
+			if bytes.HasPrefix(line, []byte("event: ")) {
+				name = string(line[len("event: "):])
+			}
+			if bytes.HasPrefix(line, []byte("data:")) {
+				data = sseFieldValue(line)
+			}
+		}
+		var value struct {
+			Type, Delta, Text string
+			Response          struct {
+				Model  string
+				Output json.RawMessage
+			}
+		}
+		if err := json.Unmarshal(data, &value); err != nil {
+			t.Fatal(err)
+		}
+		if value.Type != types[i] || (!dataOnly && name != types[i]) || (dataOnly && name != "") {
+			t.Fatalf("frame %d name=%q type=%q want=%q", i, name, value.Type, types[i])
+		}
+		switch value.Type {
+		case "response.created", "response.in_progress", "response.completed":
+			if value.Response.Model != "grok-4.6" {
+				t.Fatalf("frame %d model=%q", i, value.Response.Model)
+			}
+		}
+		if value.Type == "response.completed" && string(value.Response.Output) != gNativeOutput {
+			t.Fatalf("completed output=%s", value.Response.Output)
+		}
+		if value.Type == "response.output_text.delta" && value.Delta != "ordinary grok-4.7 opaque 中文 output" {
+			t.Fatalf("delta=%q", value.Delta)
+		}
+		if value.Type == "response.output_text.done" && value.Text != "ordinary grok-4.7 opaque 中文 output" {
+			t.Fatalf("done text=%q", value.Text)
+		}
+	}
+}
+
+func TestFunctionalNativeSSEFieldSequence(t *testing.T) {
+	for _, dataOnly := range []bool{false, true} {
+		for _, count := range []int{2, 9} {
+			for _, finish := range []bool{false, true} {
+				t.Run(fmt.Sprintf("dataOnly=%v/count=%d/finish=%v", dataOnly, count, finish), func(t *testing.T) {
+					parts, want, types := gNativeFields(dataOnly, count)
+					got := gNativeParts(t, "openai-response", finish, parts...)
+					if !bytes.Equal(got, want) {
+						t.Fatalf("native sequence bytes=%d want=%d, prefix=%q", len(got), len(want), got[:min(len(got), 250)])
+					}
+					gRequireNativeFrames(t, got, types, dataOnly)
+				})
+			}
+		}
+	}
+}
+
+func TestFunctionalNativeSSEFieldDataOnlyTerminalControl(t *testing.T) {
+	for _, finish := range []bool{false, true} {
+		parts, _, types := gNativeFields(true, 1)
+		got := gNativeParts(t, "openai-response", finish, parts...)
+		if string(bytes.TrimSuffix(got, []byte("\n\n"))) != "data: "+gNativeCompletedWant {
+			t.Fatalf("single data-only control finish=%v output=%q", finish, got)
+		}
+		gRequireNativeFrames(t, got, types, true)
+	}
+}
+
+func TestFunctionalNativeSSEFieldLateDelimiter(t *testing.T) {
+	parts, _, _ := gNativeFields(false, 2)
+	for _, eol := range []string{"\n", "\r\n"} {
+		literal := append(bytes.Join(parts, nil), []byte(eol+eol)...)
+		if got := gNativeParts(t, "openai-response", true, literal); !bytes.Equal(got, literal) {
+			t.Fatalf("whole literal event field changed: %q", got)
+		}
+		for split := 0; split <= len(literal); split++ {
+			if got := gNativeParts(t, "openai-response", true, literal[:split], literal[split:]); !bytes.Equal(got, literal) {
+				t.Fatalf("eol=%q split=%d literal event field changed: %q", eol, split, got)
+			}
+		}
+		r := newStreamChunkRewriter("grok-4.6")
+		r.format, r.frameRawJSONAsSSE = "openai-response", true
+		for i, part := range parts {
+			if chunks, err := r.Write(part); err != nil || len(chunks) != 0 {
+				t.Fatalf("eol=%q write=%d dispatched before standard delimiter: chunks=%q error=%v", eol, i, chunks, err)
+			}
+		}
+		chunks, err := r.Write([]byte(eol + eol))
+		if err != nil || !bytes.Equal(bytes.Join(chunks, nil), literal) {
+			t.Fatalf("eol=%q delayed delimiter output=%q error=%v", eol, chunks, err)
+		}
+		flushed, err := r.Finish()
+		if err != nil || len(flushed) != 0 {
+			t.Fatalf("literal finish=(%q,%v)", flushed, err)
+		}
+		line, _, remaining := splitSSELine(literal)
+		if !bytes.HasPrefix(line, []byte("event:")) || hasSSEDataField(line) || hasSSEDataField(remaining) {
+			t.Fatal("control must be one event field with zero data fields")
+		}
+	}
+}
+
+func TestFunctionalNativeSSEFieldLateDataDelimiter(t *testing.T) {
+	parts, _, _ := gNativeFields(true, 2)
+	literal := append(bytes.Join(parts, nil), '\n', '\n')
+	for split := 0; split <= len(literal); split++ {
+		if got := gNativeParts(t, "openai-response", true, literal[:split], literal[split:]); !bytes.Equal(got, literal) {
+			t.Fatalf("single ordinary data field split=%d changed: %q", split, got)
+		}
+	}
+	if got := gNativeParts(t, "openai-response", true, parts[0], parts[1], []byte("\n\n")); !bytes.Equal(got, literal) {
+		t.Fatalf("late ordinary data delimiter changed: %q", got)
+	}
+}
+
+func gNativeLargeFixture(size int, dataOnly bool) ([][]byte, []byte) {
+	value := `{"type":"response.output_text.done","response":{"model":"grok-4.7"},"text":"` + strings.Repeat("x", size) + `","opaque":{"text":"grok-4.7 中文","n":1.00}}`
+	wantValue := `{"type":"response.output_text.done","response":{"model":"grok-4.6"},"text":"` + strings.Repeat("x", size) + `","opaque":{"text":"grok-4.7 中文","n":1.00}}`
+	data := []byte("data: " + value)
+	var parts [][]byte
+	want := "data: " + wantValue + "\n\n"
+	if !dataOnly {
+		parts = append(parts, []byte("event: response.output_text.done"))
+		want = "event: response.output_text.done\n" + want
+	}
+	for start := 0; start < len(data); start += 8 << 10 {
+		parts = append(parts, data[start:min(start+(8<<10), len(data))])
+	}
+	return parts, []byte(want)
+}
+
+func gNativeContinue(parts [][]byte) ([][]byte, error) {
+	r := newStreamChunkRewriter("grok-4.6")
+	r.format, r.frameRawJSONAsSSE = "openai-response", true
+	var chunks [][]byte
+	for _, part := range parts {
+		out, err := r.Write(part)
+		chunks = append(chunks, out...)
+		if err != nil {
+			return chunks, err
+		}
+	}
+	out, err := r.Finish()
+	return append(chunks, out...), err
+}
+
+func TestFunctionalNativeSSEFieldContinuation(t *testing.T) {
+	for _, dataOnly := range []bool{false, true} {
+		for _, size := range []int{2 << 20, 8 << 20} {
+			t.Run(fmt.Sprintf("dataOnly=%v/bytes=%d", dataOnly, size), func(t *testing.T) {
+				parts, want := gNativeLargeFixture(size, dataOnly)
+				chunks, err := gNativeContinue(parts)
+				got := bytes.Join(chunks, nil)
+				if err != nil || !bytes.Equal(bytes.TrimSuffix(got, []byte("\n\n")), bytes.TrimSuffix(want, []byte("\n\n"))) {
+					t.Fatalf("native continuation error=%v bytes=%d want=%d", err, len(got), len(want))
+				}
+				for _, part := range parts {
+					for i := range part {
+						part[i] = 'z'
+					}
+				}
+				if !bytes.Equal(bytes.TrimSuffix(bytes.Join(chunks, nil), []byte("\n\n")), bytes.TrimSuffix(want, []byte("\n\n"))) {
+					t.Fatal("native chunks alias input bytes")
+				}
+				frozen := bytes.Clone(got)
+				r := newStreamChunkRewriter("grok-4.6")
+				r.format, r.frameRawJSONAsSSE = "openai-response", true
+				var previous [][]byte
+				fresh, _ := gNativeLargeFixture(size, dataOnly)
+				for _, part := range fresh {
+					out, writeErr := r.Write(part)
+					if writeErr != nil {
+						t.Fatal(writeErr)
+					}
+					previous = append(previous, out...)
+				}
+				out, finishErr := r.Finish()
+				if finishErr != nil {
+					t.Fatal(finishErr)
+				}
+				previous = append(previous, out...)
+				if _, writeErr := r.Write([]byte("data: {}\n\n")); writeErr != nil {
+					t.Fatal(writeErr)
+				}
+				if !bytes.Equal(bytes.Join(previous, nil), frozen) {
+					t.Fatal("native chunks changed after future write")
+				}
+			})
+		}
+	}
+}
+
+func BenchmarkStreamChunkRewriterNativeFieldContinuation(b *testing.B) {
+	for _, dataOnly := range []bool{false, true} {
+		for _, size := range []int{2 << 20, 8 << 20} {
+			b.Run(fmt.Sprintf("dataOnly=%v/bytes=%d/fragment=8192", dataOnly, size), func(b *testing.B) {
+				parts, want := gNativeLargeFixture(size, dataOnly)
+				chunks, err := gNativeContinue(parts)
+				got := bytes.Join(chunks, nil)
+				if err != nil || !bytes.Equal(bytes.TrimSuffix(got, []byte("\n\n")), bytes.TrimSuffix(want, []byte("\n\n"))) {
+					b.Fatalf("byte-exact native preflight error=%v bytes=%d want=%d", err, len(got), len(want))
+				}
+				b.ReportAllocs()
+				b.SetBytes(int64(len(want)))
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					chunks, err = gNativeContinue(parts)
+					if err != nil || len(chunks) == 0 {
+						b.Fatalf("native continuation=(%d,%v)", len(chunks), err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestFunctionalNativeSSEFieldContinuationAllocations(t *testing.T) {
+	for _, dataOnly := range []bool{false, true} {
+		t.Run(fmt.Sprintf("dataOnly=%v", dataOnly), func(t *testing.T) {
+			parts, want := gNativeLargeFixture(2<<20, dataOnly)
+			chunks, err := gNativeContinue(parts)
+			if err != nil || !bytes.Equal(bytes.TrimSuffix(bytes.Join(chunks, nil), []byte("\n\n")), bytes.TrimSuffix(want, []byte("\n\n"))) {
+				t.Fatalf("native allocation preflight=(%d,%v)", len(chunks), err)
+			}
+			allocations := testing.AllocsPerRun(1, func() {
+				out, err := gNativeContinue(parts)
+				if err != nil || !bytes.Equal(bytes.TrimSuffix(bytes.Join(out, nil), []byte("\n\n")), bytes.TrimSuffix(want, []byte("\n\n"))) {
+					panic(fmt.Sprintf("native allocation output=(%d,%v)", len(out), err))
+				}
+			})
+			if allocations > 200 {
+				t.Fatalf("native continuation allocations=%v want <=200", allocations)
+			}
+		})
+	}
+}
+
+func TestFunctionalNativeSSEFieldInputOwnership(t *testing.T) {
+	for _, dataOnly := range []bool{false, true} {
+		t.Run(fmt.Sprintf("dataOnly=%v", dataOnly), func(t *testing.T) {
+			parts, want, _ := gNativeFields(dataOnly, 2)
+			r := newStreamChunkRewriter("grok-4.6")
+			r.format, r.frameRawJSONAsSSE = "openai-response", true
+			var chunks [][]byte
+			for _, part := range parts {
+				out, err := r.Write(part)
+				if err != nil {
+					t.Fatal(err)
+				}
+				chunks = append(chunks, out...)
+				for i := range part {
+					part[i] = 'z'
+				}
+			}
+			out, err := r.Finish()
+			if err != nil {
+				t.Fatal(err)
+			}
+			chunks = append(chunks, out...)
+			if got := bytes.Join(chunks, nil); !bytes.Equal(got, want) {
+				t.Fatalf("native input ownership output=%q want=%q", got, want)
+			}
+			frozen := bytes.Join(chunks, nil)
+			if _, err := r.Write([]byte("data: {}\n\n")); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(bytes.Join(chunks, nil), frozen) {
+				t.Fatal("previous native output changed after future Write")
+			}
+		})
+	}
+}
+```
+
+- [ ] 运行新回归和所有控制。先确认实际编译成功，再把缺少内部 LF/派发边界、模型未恢复或完整大单位误限长记录为 RED；编译/启动/缺依赖错误不能充当 RED。
+
+```bash
+go -C "$G" test -mod=readonly -count=1 -v . -run '^TestFunctionalNativeSSEField'
+```
+
+当前 6c7f060 的 Boundary、Sequence 两类两个/九个事件、Forwarder、Discriminator 正例、field-pair Continuation 与 InputOwnership 为目标 RED。Limit 的两类完整单位误触发 `stream pending data exceeds 16777216 bytes`，两类 incomplete 控制正常。单 terminal data-only、WireControls、FormatIsolation、LateDelimiter/LateDataDelimiter 为 GREEN。native benchmark 的 field-pair byte-exact preflight 失败，不能计时错误输出后宣称性能通过。
+
+只有两类目标、单 terminal 控制、全部 wire/迟到 delimiter、格式/opaque/ownership、限额与错误控制均通过，才可判定 C 已覆盖新函数层验收。已 GREEN 时不撤销 C 取得 RED、不重复改产品，记录 C 修复 commit，仍补缺失永久 producer/native/HTTP 回归并完成 G2 的语义审查、G3..G5。
+
+### G2：候选提交时点和最小共用修复检查点
+
+- [ ] 对相同的四次输入逐次记录返回 chunks。Native 两事件 field-pair 和普通单 event field 使用 G1 的同一 parts 数组；普通情况随后才送 LF/CRLF blank delimiter。G1 的 LateDelimiter 已要求每次此前 Write 返回零 chunks，最后原文完整，只有一个普通 event field、零个 data field。
+- [ ] 核对 `HostModelStreamReadResponse` 的真实字段和 C 最终 Write 的输入来源。固定 CPA 只有 Payload/Error/Done；format=openai-response、匹配 type、后续 event/data 前缀都在两种解释中相同，不是派发证明。不得把旧候选状态注入当作最终 C 的实际实现；旧状态实验只在固定 6c7f060 测试实例做过，其第3次 Write 已输出125 bytes及空行。
+- [ ] 把候选发现、完整 JSON 验证、候选记录和不可逆 emit 分成明确时点。后续 field 只新增可逆边界；发现真实标准 delimiter 时，F15 新候选走 ordinary frame 分支并保留原始 bytes。没有 delimiter 时，EOF/读错误提供本次流结束的提交点。现有 C 的内部已有 LF 的 logical-event 支持继续按其规格处理，不用 F15 普遍覆盖它。
+- [ ] 若 C 最终能提供经过真实 fixture 证明的额外 logical/wire 判定语境，记录其准确位置、值来源和保护普通分片的理由，然后只在共用 Write/scanner/drain 修改 F15。复用其增量 header/JSON/complete-end 状态；field-pair 记录 header/data 的原始边界，data-only 记录连续单位边界。资格校验使用 encoding/json 的 type，普通和闲置字段保持 opaque，派发阶段才生成必要 LF/blank delimiter并调用原 rewriteEvent。reset、错误返回和完整前缀保持，既有接口/调用者不变。
+- [ ] 若仍只有上述同前缀 bytes 信息，停止产品编码，交回同前缀数组、迟到 delimiter 控制和需要提前交付/保存候选的具体冲突。当前固定接口已确认缺少区分信息，本轮草稿没有给出声称满足全部时机条件的产品实现片段。有限 EOF 结果可以延迟恢复，但不能未经规格确认把持续 native stream 的全部 complete units 积存到 EOF。必须先修订公共规格的输入语义/交付时机，再启动实现；这一步不能用广泛启发式、超时或新增配置省略。
+- [ ] 可继续实现时，header 路径先检查 format、是否仍需候选及当前 payload 的 field 前缀，再执行必要 helper。复用 C 的增量 header游标；记录后不再对增长的 JSON buffer 调用从0开始的 splitSSELine。data-only 不依赖 event header。完整值验证/响应恢复按现有标准库和 B helper 各自职责完成；不把每个 Write 当 delimiter、不手写 parser、不创建 provider 专用分支。
+- [ ] 保持16 MiB规则：本次调用已补成的完整单位可超限；以前未完成 prefix已超限则保持原 error/清空；完整前缀与尾部错误可共存；C 的 chunks+error 调用者先发送有效 prefix再合并错误。不得提高常量、删除错误或通过 benchmark 特定分支取巧。
+- [ ] 重跑完整 F15 与既有控制，返回成功才进入 G3；仍有语义冲突则保持阻塞状态，不进入产品提交。
+
+```bash
+go -C "$G" test -mod=readonly -count=1 -v . -run '^TestFunctionalNativeSSEField'
+go -C "$G" test -mod=readonly -count=1 -v . -run '^(TestRunStreamForward(ProcessesTerminalPayload|SeparatesDelimiterlessKimiResponsesLifecycle|FlushesPendingBytesOnReadError|BatchesOnlySSEOutput|PreservesInBandErrorAcrossCleanupFailures)|TestStreamChunkRewriter(DelimiterlessResponsesPartitionInvariant|DoesNotEndOrdinarySSEAtReadBoundary|DoesNotTreatReadBoundaryAsLineEnding|BOMPartitionInvariant|FramesRawJSONByFormat|RawJSONArrayPartitions|PreservesUnframedRawJSONSeparators)|TestSSERewriter(DoesNotInventLineBreakAtChunkBoundary|OutputOwnershipAcrossFutureWrites))$'
+```
+
+检查完整输出后再核对原错误与 close；callback mock 仅证明函数调用路径。
+
+### G3：完整 suite、race、allocation 和增量性能
+
+- [ ] 在相同 G worktree 运行所有 root tests、vet 和 race，不留下 C framing、B 保序或 D lifecycle 失败。
+
+```bash
+go -C "$G" test -mod=readonly -count=1 ./...
+go -C "$G" vet -mod=readonly ./...
+go -C "$G" test -mod=readonly -race -count=1 ./...
+go -C "$G" test -mod=readonly -race -count=3 . -run '^TestFunctionalNativeSSEField'
+```
+
+- [ ] 运行全部相关既有 allocation 与新增 native continuation 检查，门槛保持。no-model response <=1 clone，complete markerless/escaped SSE <=6，fragmented raw JSON <100，delimiterless 2 MiB/8 KiB <=200；新的两类 native 2 MiB/8 KiB 也先检查完整输出再测 <=200，不能只跑正常单 data 控制。
+
+```bash
+go -C "$G" test -mod=readonly -count=1 -v . -run '^(TestRestoreResponseWithoutModelUsesCloneOnly|TestStreamChunkRewriter(FastPathsCompleteSSEBatchWithoutModelMarker|FastPathsEscapedSSEBatchWithoutModelMarker|ScansFragmentedDelimiterlessResponsesEventLinearly|LargeFragmentedRawJSONAllocations|RawJSONUsesOneRestorePass)|TestSSERewriter(SingleDataFastPathAllocations|MultiEventBatchAvoidsPerEventChunkSliceAllocation)|TestFunctionalNativeSSEFieldContinuationAllocations)$'
+```
+
+- [ ] 在同一机器、同 Go、同参数下顺序测 reviewBASE 与 G。reviewBASE 源码通过自己的 Git object 导出到 OS temp，禁止 checkout/reset 当前分支。G 的必要产品变化只在 main.go，旧测试/性能变化只在 main_test.go、performance_regression_test.go，三个文件的 BASE overlay 足以固定这些差异；其他源码须经 diff 确认与 BASE相同。
+
+准备 BASE overlay 的可执行步骤如下，普通 Git 操作分开执行。临时 Python 文件是另一工具的输入，任务结束删除；不提交。
+
+```bash
+BASE_TEMP=$(mktemp -d)
+git -C "$G" archive --format=tar --output="$BASE_TEMP/base.tar" "$reviewBASE" main.go main_test.go performance_regression_test.go
+tar -xf "$BASE_TEMP/base.tar" -C "$BASE_TEMP"
+```
+
+把以下完整 Python 保存到系统临时目录的 build_base_overlay.py，执行时传入 G 和 BASE_TEMP 的 Windows绝对路径。
+
+```python
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+base = Path(sys.argv[2]).resolve()
+files = ("main.go", "main_test.go", "performance_regression_test.go")
+for name in files:
+    if not (root / name).is_file() or not (base / name).is_file():
+        raise RuntimeError(f"missing source: {name}")
+replace = {str(root / name): str(base / name) for name in files}
+(base / "overlay.json").write_text(json.dumps({"Replace": replace}), encoding="utf-8")
+```
+
+```bash
+python "$BASE_TEMP/build_base_overlay.py" "$G" "$(cygpath -m "$BASE_TEMP")"
+BASE_OVERLAY="$BASE_TEMP/overlay.json"
+go -C "$G" test -mod=readonly -overlay "$BASE_OVERLAY" -run '^$' -bench '^BenchmarkSSEMarkerGuard(Restore|Candidate)$' -benchtime=1x -count=1 -benchmem .
+go -C "$G" test -mod=readonly -run '^$' -bench '^BenchmarkSSEMarkerGuard(Restore|Candidate)$' -benchtime=1x -count=1 -benchmem .
+go -C "$G" test -mod=readonly -overlay "$BASE_OVERLAY" -run '^$' -bench '^Benchmark(RewriteTopLevelModel|RestoreResponseModel|RestoreResponseWithoutModel|ResponseModelMarkerScan|SSEMarkerGuard(Restore|Candidate)|StreamChunkRewriter(FragmentedRawJSON|SingleJSON|CompleteSSEBatch|EscapedSSEBatch|UnicodeEscapedSSEBatch)|EmitRewrittenBatch)$' -benchmem -count=5 .
+go -C "$G" test -mod=readonly -run '^$' -bench '^Benchmark(RewriteTopLevelModel|RestoreResponseModel|RestoreResponseWithoutModel|ResponseModelMarkerScan|SSEMarkerGuard(Restore|Candidate)|StreamChunkRewriter(FragmentedRawJSON|SingleJSON|CompleteSSEBatch|EscapedSSEBatch|UnicodeEscapedSSEBatch)|EmitRewrittenBatch)$' -benchmem -count=5 .
+```
+
+- [ ] 新 native benchmark 同时覆盖 field-pair/data-only、2 MiB/8 KiB 和8 MiB/8 KiB。保留 byte-exact preflight、模型、opaque 1.00/Unicode、全部长度和 ownership。只在 preflight通过时记录耗时；BASE错误输入不作为正确输出的性能基准，正常 data-only 控制可以单独比较。
+
+```bash
+go -C "$G" test -mod=readonly -run '^$' -bench '^BenchmarkStreamChunkRewriterNativeFieldContinuation$' -benchtime=1x -count=1 -benchmem .
+go -C "$G" test -mod=readonly -run '^$' -bench '^BenchmarkStreamChunkRewriterNativeFieldContinuation$' -benchmem -count=5 .
+go -C "$G" test -mod=readonly -overlay "$BASE_OVERLAY" -run '^$' -bench '^BenchmarkStreamChunkRewriterNativeFieldContinuation/dataOnly=true/' -benchmem -count=5 .
+```
+
+检查增量游标和相关 helper 调用：候选记录后每次续写只推进新 bytes；不得重新搜索完整 pending header/JSON。结合 2/8 MiB ns/op、B/op、allocs/op检查增长；本轮旧示例的约16倍增长是已核实的问题，不把 <=200 allocation当线性证据。发现稳定新增扫描或复制成本，由 G 修正并重跑全部相关检查，不设未经测量的百分比门槛。
+
+### G4：交 E 的唯一永久 producer/native/HTTP fixture
+
+- [ ] E 把下面完整、已编译的 Go 代码合入其唯一 CPA fixture。保留 package pluginhost 和所需 imports，重复 import 合并；已有完全相同 fixture/helper可复用，保留本文件的两类输入和全部断言。TestModelMapperFunctional 前缀由 E 原 runner自动选中，不增加 smoke入口或独立 CPA fixture。
+- [ ] 新代码的四层分别为真实 core/host producer、真实 native DLL 映射、真实 Responses HTTP handler/framer 的 enabled mapped/unmatched/disabled 与非流，以及无 mapper的纯 producer/HTTP控制。只有外部 httptest upstream 使用固定正常内容。
+
+```go
+package pluginhost
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/gin-contrib/sse"
+	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	runtimeexecutor "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
+	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	openaihandlers "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/openai"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"gopkg.in/yaml.v3"
+)
+
+const gCPAOutput = `[{"id":"msg-issue8","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ordinary grok-4.7 opaque 中文 output","annotations":[]}]}]`
+const gCPACompleted = `{"type":"response.completed","response":{"id":"resp-issue8","object":"response","status":"completed","model":"grok-4.7","output":` + gCPAOutput + `}}`
+
+func gCPAPayloads(model string, count int) []string {
+	values := []string{
+		`{"type":"response.created","response":{"model":"grok-4.7","status":"in_progress","output":[]}}`,
+		`{"type":"response.in_progress","response":{"model":"grok-4.7","status":"in_progress","output":[]}}`,
+		`{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}`,
+		`{"type":"response.content_part.added","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}`,
+		`{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"ordinary grok-4.7 opaque 中文 output"}`,
+		`{"type":"response.output_text.done","output_index":0,"content_index":0,"text":"ordinary grok-4.7 opaque 中文 output"}`,
+		`{"type":"response.content_part.done","output_index":0,"content_index":0,"part":{"type":"output_text","text":"ordinary grok-4.7 opaque 中文 output","annotations":[]}}`,
+		`{"type":"response.output_item.done","output_index":0,"item":{"id":"msg-issue8","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ordinary grok-4.7 opaque 中文 output","annotations":[]}]}}`,
+		gCPACompleted,
+	}
+	for i := range values {
+		values[i] = strings.Replace(values[i], `"model":"grok-4.7"`, `"model":"`+model+`"`, 1)
+	}
+	if count == 1 {
+		return values[8:]
+	}
+	return values
+}
+
+type gCPAFieldsFixture struct {
+	name, eol, contentType string
+	step                   int
+	dataOnly               bool
+	count                  int
+}
+
+func gCPAFieldsFixtures() []gCPAFieldsFixture {
+	var out []gCPAFieldsFixture
+	for _, dataOnly := range []bool{false, true} {
+		for _, count := range []int{1, 9} {
+			for _, transport := range []gCPAFieldsFixture{
+				{name: "LF-whole", eol: "\n", contentType: "text/event-stream"},
+				{name: "CRLF-whole", eol: "\r\n", contentType: "text/event-stream"},
+				{name: "LF-7bytes", eol: "\n", contentType: "text/event-stream", step: 7},
+				{name: "CRLF-bytewise", eol: "\r\n", contentType: "text/event-stream", step: 1},
+				{name: "LF-charset", eol: "\n", contentType: "text/event-stream; charset=utf-8", step: 11},
+				{name: "CRLF-charset", eol: "\r\n", contentType: "text/event-stream; charset=utf-8", step: 7},
+			} {
+				transport.dataOnly, transport.count = dataOnly, count
+				transport.name = fmt.Sprintf("dataOnly=%v/count=%d/%s", dataOnly, count, transport.name)
+				out = append(out, transport)
+			}
+		}
+	}
+	return out
+}
+
+func gCPAFields(f gCPAFieldsFixture, model string) ([]string, []byte) {
+	var fields []string
+	var wire bytes.Buffer
+	for _, payload := range gCPAPayloads(model, f.count) {
+		var event struct{ Type string }
+		if err := json.Unmarshal([]byte(payload), &event); err != nil {
+			panic(err)
+		}
+		if !f.dataOnly {
+			fields = append(fields, "event: "+event.Type)
+			fmt.Fprintf(&wire, "event: %s%s", event.Type, f.eol)
+		}
+		fields = append(fields, "data: "+payload)
+		fmt.Fprintf(&wire, "data: %s%s%s", payload, f.eol, f.eol)
+	}
+	return fields, wire.Bytes()
+}
+
+type gCPAUpstreamRecord struct {
+	body, response []byte
+	model, path    string
+}
+
+type gCPALocalProducer struct {
+	mu       sync.Mutex
+	fixture  gCPAFieldsFixture
+	records  []gCPAUpstreamRecord
+	provider coreauth.ProviderExecutor
+	auth     *coreauth.Auth
+	base     *handlers.BaseAPIHandler
+	cfg      *config.Config
+}
+
+func gCPANewLocalProducer(t *testing.T, name string) *gCPALocalProducer {
+	t.Helper()
+	p := &gCPALocalProducer{cfg: &config.Config{}}
+	p.provider = runtimeexecutor.NewXAIExecutor(p.cfg)
+	if name == "codex" {
+		p.provider = runtimeexecutor.NewCodexExecutor(p.cfg)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		var request struct {
+			Model  string
+			Stream bool
+		}
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Error(err)
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if r.URL.Path != "/v1/responses" || !request.Stream || (request.Model != "grok-4.6" && request.Model != "grok-4.7") {
+			t.Errorf("upstream path=%s request=%+v", r.URL.Path, request)
+		}
+		p.mu.Lock()
+		f := p.fixture
+		p.mu.Unlock()
+		_, wire := gCPAFields(f, request.Model)
+		p.mu.Lock()
+		p.records = append(p.records, gCPAUpstreamRecord{body: bytes.Clone(body), response: bytes.Clone(wire), model: request.Model, path: r.URL.Path})
+		p.mu.Unlock()
+		w.Header().Set("Content-Type", f.contentType)
+		step := f.step
+		if step == 0 {
+			step = len(wire)
+		}
+		for start := 0; start < len(wire); start += step {
+			if _, err := w.Write(wire[start:min(start+step, len(wire))]); err != nil {
+				t.Error(err)
+				return
+			}
+			w.(http.Flusher).Flush()
+		}
+	}))
+	t.Cleanup(server.Close)
+	p.auth = &coreauth.Auth{ID: "g-fields-" + name, Provider: name, Status: coreauth.StatusActive, Attributes: map[string]string{"api_key": "fake-upstream-key", "base_url": server.URL + "/v1", "proxy_url": "direct"}}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetConfig(p.cfg)
+	manager.RegisterExecutor(p.provider)
+	if _, err := manager.Register(context.Background(), p.auth); err != nil {
+		t.Fatal(err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(p.auth.ID, p.auth.Provider, []*registry.ModelInfo{{ID: "grok-4.6"}, {ID: "grok-4.7"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(p.auth.ID) })
+	p.base = handlers.NewBaseAPIHandlers(&p.cfg.SDKConfig, manager)
+	return p
+}
+
+func (p *gCPALocalProducer) setFixture(f gCPAFieldsFixture) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.fixture, p.records = f, nil
+}
+
+func gCPARequest(model string, stream bool) []byte {
+	return []byte(fmt.Sprintf(`{"model":%q,"input":"say ok","stream":%v,"prompt_cache_key":"task-g-local"}`, model, stream))
+}
+
+func gCPARequireFields(t *testing.T, parts []string, f gCPAFieldsFixture, model string) {
+	t.Helper()
+	want, _ := gCPAFields(f, model)
+	if !reflect.DeepEqual(parts, want) {
+		t.Fatalf("producer fields=%q, want=%q", parts, want)
+	}
+	for _, part := range parts {
+		if strings.ContainsAny(part, "\r\n") {
+			t.Fatalf("logical field unexpectedly contains line ending: %q", part)
+		}
+	}
+}
+
+func gCPACoreFields(t *testing.T, p *gCPALocalProducer, ctx context.Context) []string {
+	t.Helper()
+	body := gCPARequest("grok-4.7", true)
+	stream, err := p.provider.ExecuteStream(ctx, p.auth, coreexecutor.Request{Model: "grok-4.7", Payload: body}, coreexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, ResponseFormat: sdktranslator.FormatOpenAIResponse, OriginalRequest: body, Stream: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parts []string
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			t.Fatal(chunk.Err)
+		}
+		if len(chunk.Payload) > 0 {
+			parts = append(parts, string(chunk.Payload))
+		}
+	}
+	return parts
+}
+
+func gCPAHostFields(t *testing.T, p *gCPALocalProducer, ctx context.Context) []string {
+	t.Helper()
+	result, errMsg := p.base.ExecuteModelStream(ctx, handlers.ModelExecutionRequest{EntryProtocol: "openai-response", ExitProtocol: "openai-response", Model: "grok-4.7", Stream: true, Body: gCPARequest("grok-4.7", true)})
+	if errMsg != nil {
+		t.Fatal(errMsg.Error)
+	}
+	var parts []string
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatal(chunk.Err)
+		}
+		if len(chunk.Payload) > 0 {
+			parts = append(parts, string(chunk.Payload))
+		}
+	}
+	return parts
+}
+
+func gCPARequireResponse(t *testing.T, raw []byte, model string) {
+	t.Helper()
+	var response struct {
+		Model, Status string
+		Output        json.RawMessage
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Model != model || response.Status != "completed" || string(response.Output) != gCPAOutput {
+		t.Fatalf("response model=%q status=%q output=%s", response.Model, response.Status, response.Output)
+	}
+}
+
+func gCPARequireEvents(t *testing.T, raw []byte, f gCPAFieldsFixture, model string) {
+	t.Helper()
+	// 现有 sse.Decode 只识别 LF；仅为该 parser 统一已知 CRLF 行结束，原始 bytes 继续保留。
+	events, err := sse.Decode(bytes.NewReader(bytes.ReplaceAll(raw, []byte("\r\n"), []byte("\n"))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := gCPAPayloads(model, f.count)
+	var payloads []string
+	for _, event := range events {
+		payload, ok := event.Data.(string)
+		if !ok || payload == "" {
+			continue
+		}
+		if payload == "[DONE]" {
+			t.Fatal("Responses must not acquire DONE")
+		}
+		var value struct {
+			Type, Delta string
+			Response    json.RawMessage
+		}
+		if err := json.Unmarshal([]byte(payload), &value); err != nil {
+			t.Fatal(err)
+		}
+		if !f.dataOnly && event.Event != value.Type {
+			t.Fatalf("event=%q type=%q", event.Event, value.Type)
+		}
+		if f.dataOnly && event.Event != "message" {
+			t.Fatalf("data-only decoder event=%q, want default message", event.Event)
+		}
+		if value.Type == "response.output_text.delta" && value.Delta != "ordinary grok-4.7 opaque 中文 output" {
+			t.Fatalf("delta=%q", value.Delta)
+		}
+		if value.Type == "response.completed" {
+			gCPARequireResponse(t, value.Response, model)
+		}
+		payloads = append(payloads, payload)
+	}
+	if !reflect.DeepEqual(payloads, want) {
+		t.Fatalf("data events=%q want=%q", payloads, want)
+	}
+}
+
+func gCPALoadNative(t *testing.T, p *gCPALocalProducer, enabled bool) *Host {
+	t.Helper()
+	plugin := os.Getenv("CPA_SMOKE_PLUGIN")
+	if plugin == "" {
+		t.Fatal("CPA_SMOKE_PLUGIN is required")
+	}
+	library, err := os.ReadFile(plugin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pluginDir := filepath.Join(t.TempDir(), "plugins")
+	target := filepath.Join(pluginDir, runtime.GOOS, runtime.GOARCH, "model-mapper"+filepath.Ext(plugin))
+	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, library, 0600); err != nil {
+		t.Fatal(err)
+	}
+	copied, err := os.ReadFile(target)
+	if err != nil || sha256.Sum256(copied) != sha256.Sum256(library) {
+		t.Fatalf("DLL copy error=%v", err)
+	}
+	data := fmt.Sprintf("plugins:\n  enabled: %v\n  dir: %q\n  configs:\n    model-mapper:\n      enabled: true\n      priority: 1\n      global_rules: 'grok-4.6=>grok-4.7'\n", enabled, filepath.ToSlash(pluginDir))
+	var cfg config.Config
+	if err := yaml.Unmarshal([]byte(data), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	host := New()
+	host.SetModelExecutor(p.base)
+	host.ApplyConfig(context.Background(), &cfg)
+	active := host.activeRecords()
+	if enabled {
+		if len(active) != 1 || active[0].id != "model-mapper" || active[0].plugin.Capabilities.Executor == nil {
+			t.Fatal("native executor is not active")
+		}
+		t.Cleanup(func() {
+			if !host.UnloadPlugin("model-mapper") {
+				t.Error("native unload failed")
+			}
+		})
+	} else if len(active) != 0 {
+		t.Fatal("disabled control unexpectedly has an active plugin")
+	}
+	t.Logf("native enabled=%v source=%s copied=%s SHA256=%x", enabled, plugin, target, sha256.Sum256(library))
+	return host
+}
+
+func TestModelMapperFunctionalNativeProducerFields(t *testing.T) {
+	for _, name := range []string{"xai", "codex"} {
+		t.Run(name, func(t *testing.T) {
+			p := gCPANewLocalProducer(t, name)
+			for _, f := range gCPAFieldsFixtures() {
+				t.Run(f.name, func(t *testing.T) {
+					p.setFixture(f)
+					ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+					defer cancel()
+					gCPARequireFields(t, gCPACoreFields(t, p, ctx), f, "grok-4.7")
+					gCPARequireFields(t, gCPAHostFields(t, p, ctx), f, "grok-4.7")
+				})
+			}
+		})
+	}
+}
+
+func TestModelMapperFunctionalNativeSSEFields(t *testing.T) {
+	for _, name := range []string{"xai", "codex"} {
+		t.Run(name, func(t *testing.T) {
+			p := gCPANewLocalProducer(t, name)
+			host := gCPALoadNative(t, p, true)
+			for _, f := range gCPAFieldsFixtures() {
+				t.Run(f.name, func(t *testing.T) {
+					p.setFixture(f)
+					ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+					defer cancel()
+					gCPARequireFields(t, gCPACoreFields(t, p, ctx), f, "grok-4.7")
+					gCPARequireFields(t, gCPAHostFields(t, p, ctx), f, "grok-4.7")
+					body := gCPARequest("grok-4.6", true)
+					result, err := host.activeRecords()[0].plugin.Capabilities.Executor.ExecuteStream(ctx, pluginapi.ExecutorRequest{Model: "grok-4.6", Format: "openai-response", SourceFormat: "openai-response", Stream: true, Payload: body, OriginalRequest: body})
+					if err != nil {
+						t.Fatal(err)
+					}
+					var raw bytes.Buffer
+					var parts []string
+					for chunk := range result.Chunks {
+						if chunk.Err != nil {
+							t.Fatal(chunk.Err)
+						}
+						raw.Write(chunk.Payload)
+						parts = append(parts, string(chunk.Payload))
+					}
+					t.Logf("native field input shape=%s output chunks=%q", f.name, parts)
+					gCPARequireEvents(t, raw.Bytes(), f, "grok-4.6")
+				})
+			}
+		})
+	}
+}
+
+func TestModelMapperFunctionalNativeFieldsHTTP(t *testing.T) {
+	for _, name := range []string{"xai", "codex"} {
+		for _, enabled := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/enabled=%v", name, enabled), func(t *testing.T) {
+				p := gCPANewLocalProducer(t, name)
+				host := gCPALoadNative(t, p, enabled)
+				p.base.SetPluginHost(host)
+				p.base.SetModelRouterHost(host)
+				router := gin.New()
+				router.POST("/v1/responses", openaihandlers.NewOpenAIResponsesAPIHandler(p.base).Responses)
+				server := httptest.NewServer(router)
+				defer server.Close()
+				for _, f := range gCPAFieldsFixtures() {
+					for _, stream := range []bool{true, false} {
+						var mapped *gCPAUpstreamRecord
+						for _, model := range []string{"grok-4.6", "grok-4.7"} {
+							t.Run(fmt.Sprintf("%s/stream=%v/model=%s", f.name, stream, model), func(t *testing.T) {
+								p.setFixture(f)
+								ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+								defer cancel()
+								request, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/v1/responses", bytes.NewReader(gCPARequest(model, stream)))
+								if err != nil {
+									t.Fatal(err)
+								}
+								request.Header.Set("Content-Type", "application/json")
+								response, err := http.DefaultClient.Do(request)
+								if err != nil {
+									t.Fatal(err)
+								}
+								raw, err := io.ReadAll(response.Body)
+								closeErr := response.Body.Close()
+								if err != nil || closeErr != nil {
+									t.Fatalf("read=%v close=%v", err, closeErr)
+								}
+								p.mu.Lock()
+								records := append([]gCPAUpstreamRecord(nil), p.records...)
+								p.mu.Unlock()
+								wantUpstream := model
+								if enabled && model == "grok-4.6" {
+									wantUpstream = "grok-4.7"
+								}
+								if len(records) != 1 || records[0].model != wantUpstream || records[0].path != "/v1/responses" {
+									t.Fatalf("upstream calls/route=%+v", records)
+								}
+								if enabled {
+									if model == "grok-4.6" {
+										snapshot := records[0]
+										mapped = &snapshot
+									} else if mapped == nil || !bytes.Equal(mapped.body, records[0].body) || !bytes.Equal(mapped.response, records[0].response) {
+										t.Fatal("mapped/direct upstream bytes differ")
+									}
+								}
+								t.Logf("HTTP %s stream=%v client=%s upstream=%s status=%d body=%s", f.name, stream, model, wantUpstream, response.StatusCode, raw)
+								if response.StatusCode != http.StatusOK {
+									t.Fatalf("native HTTP status=%d body=%s", response.StatusCode, raw)
+								}
+								if stream {
+									if !strings.HasPrefix(response.Header.Get("Content-Type"), "text/event-stream") {
+										t.Fatalf("Content-Type=%q", response.Header.Get("Content-Type"))
+									}
+									gCPARequireEvents(t, raw, f, model)
+								} else {
+									gCPARequireResponse(t, raw, model)
+								}
+							})
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestModelMapperFunctionalNativeFieldsHTTPUnmappedControl(t *testing.T) {
+	for _, name := range []string{"xai", "codex"} {
+		t.Run(name, func(t *testing.T) {
+			p := gCPANewLocalProducer(t, name)
+			router := gin.New()
+			router.POST("/v1/responses", openaihandlers.NewOpenAIResponsesAPIHandler(p.base).Responses)
+			server := httptest.NewServer(router)
+			defer server.Close()
+			for _, f := range gCPAFieldsFixtures() {
+				for _, stream := range []bool{true, false} {
+					t.Run(fmt.Sprintf("%s/stream=%v", f.name, stream), func(t *testing.T) {
+						p.setFixture(f)
+						ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+						defer cancel()
+						request, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/v1/responses", bytes.NewReader(gCPARequest("grok-4.7", stream)))
+						if err != nil {
+							t.Fatal(err)
+						}
+						request.Header.Set("Content-Type", "application/json")
+						response, err := http.DefaultClient.Do(request)
+						if err != nil {
+							t.Fatal(err)
+						}
+						raw, err := io.ReadAll(response.Body)
+						closeErr := response.Body.Close()
+						if err != nil || closeErr != nil {
+							t.Fatalf("read=%v close=%v", err, closeErr)
+						}
+						if response.StatusCode != http.StatusOK {
+							t.Fatalf("HTTP status=%d body=%s", response.StatusCode, raw)
+						}
+						if stream {
+							gCPARequireEvents(t, raw, f, "grok-4.7")
+						} else {
+							gCPARequireResponse(t, raw, "grok-4.7")
+						}
+						p.mu.Lock()
+						records := append([]gCPAUpstreamRecord(nil), p.records...)
+						p.mu.Unlock()
+						if len(records) != 1 || records[0].model != "grok-4.7" || records[0].path != "/v1/responses" {
+							t.Fatalf("upstream=%+v", records)
+						}
+					})
+				}
+			}
+		})
+	}
+}
+```
+
+- [ ] E 复用现有 prepareFunctionalCPAOverlay/runFunctionalCPAOverlay：先 go list 核对 CPA version/Sum，把原模块完整复制到 t.TempDir 可写副本，overlay target 位于副本 internal/pluginhost。源 module cache 保持只读。普通 import 直接使用该模块已有 gin、sse、yaml 与 SDK，不改根 go.mod。
+CPA_MODULE_COPY/OVERLAY_JSON 由 E 既有 prepareFunctionalCPAOverlay 的实际返回值设置。先完成下方两组DLL构建与身份核验，再运行同一永久fixture及唯一smoke命令；不能把 -run '^$' 的编译结果记成native GREEN。
+
+- [ ] 在唯一 TestCPAPluginIntegration 入口保存 actual binary 的相同矩阵，复用 smokeEnv、prepareDirs、copyFile、buildConfig、startCPA、waitReady、stopCPA。当前 G4 的 HTTP 函数在真正 CPA handler/framer 上运行；binary smoke继续核对真实进程、版本、配置、management注册和shadow hash，不用该函数结果替代 binary状态检查。
+
+配置使用实际 `xai-api-key`/`codex-api-key`，本地 base-url 和 fake-upstream-key，移除 native组的openai-compatibility；模型列表为 `name=alias=grok-4.6` 与 `name=alias=grok-4.7`，不使用disabled alias。plugins.enabled=true时规则固定grok-4.6=>grok-4.7；false时仍保存同一DLL/规则配置并确认没有active native executor。请求为 G4 的gCPARequest，prompt_cache_key固定task-g-local；nonstream只改stream=false。upstream response.model来自实际request model，opaque output始终保持完整常量。
+
+| 输入 | producer/host要求 | native/HTTP验收 |
+| --- | --- | --- |
+| completed-only field-pair | 两个无LF fields，core空chunk可记录，host非空字段恰好2个。 | 1条completed data事件，完整output/model，HTTP200。 |
+| 九事件 field-pair | 18个字段，按G4全部JSON与名称顺序。 | 9条有序data事件，完整delta/done/part/item/completed，HTTP200。 |
+| completed-only data-only | 1个data field，保持既有正常控制。 | 实际Responses framer派发1条，JSON type=completed，opaque/model完整，HTTP200；不因ABI缺末尾空行报错。 |
+| 九事件 data-only | 9个独立data fields。 | 9条有序data事件，decoder默认message、JSON type序列正确，全部payload/output/opaque/model完整，HTTP200。 |
+| 全部非流 | builtin实际上游可仍为stream=true。 | HTTP200、completed对象、完整output与route期望model。 |
+
+上述两类1/9事件都使用G4的六种transport：LF/CRLF whole、LF7bytes、CRLF bytewise、LF/CRLF charset，分别运行mapped、direct/unmatched、disabled .6/.7。网络Write/Flush经builtin重新形成logical fields，必须记录实际core/host边界，不声称逐网络fragment穿透ABI。保留完整SSE/terminal、Payload+Done及旧原错误控制，不制造正常bridge不存在的非空Payload+Done状态冒充生产捕获。
+
+- [ ] F15 baseline使用固定6c7f060，来源独立于E的旧F01..F14 baseline。只从E自己worktree的Git object读取固定源码，OS temp做构建输入；不回退G/E，不访问C工作区。以下完整命令构建Windows本地两组资产。
+
+```bash
+E=$(git rev-parse --show-toplevel)
+F15_BASE_DIR=$(mktemp -d)
+git -C "$E" archive --format=tar --output="$F15_BASE_DIR/base.tar" 6c7f060f4da5bb33e7b2ecd74c44499c9676a93c main.go abi_cgo.go go.mod go.sum
+tar -xf "$F15_BASE_DIR/base.tar" -C "$F15_BASE_DIR"
+mkdir -p "$E/dist/native-field-baseline" "$E/dist/native-field-fixed"
+F15_BASE_DLL="$E/dist/native-field-baseline/model-mapper.dll"
+F15_FIXED_DLL="$E/dist/native-field-fixed/model-mapper.dll"
+CGO_ENABLED=1 GOOS=windows GOARCH=amd64 go -C "$F15_BASE_DIR" build -mod=readonly -buildvcs=false -trimpath -buildmode=c-shared -o "$F15_BASE_DLL" .
+GIT_DIR="$(git -C "$E" rev-parse --absolute-git-dir)" GIT_WORK_TREE="$E" CGO_ENABLED=1 GOOS=windows GOARCH=amd64 go -C "$E" build -mod=readonly -trimpath -buildmode=c-shared -o "$F15_FIXED_DLL" .
+sha256sum "$F15_BASE_DIR/main.go" "$F15_BASE_DIR/abi_cgo.go" "$F15_BASE_DLL" "$F15_FIXED_DLL"
+go version -m "$F15_BASE_DLL"
+go version -m "$F15_FIXED_DLL"
+go version -m 'C:/Users/user/Downloads/cpa-plugin/dist/integration/cpa.exe'
+```
+
+baseline明确关闭VCS stamping，真实sourceHead来自Git archive6c7f060和源文件hash，不把临时目录上层仓库metadata当来源。fixed记录实际E整合HEAD和vcs.modified状态，不把未提交测试阶段声称为clean Release。开发版本不注入正式版本；baseline/fixed构建参数差别与源码hash如实记录。确认binary固定revision、DLL与实际shadow内容hash、注册与effective_enabled后执行。
+
+- [ ] 使用同一永久fixture运行F15 baseline RED与最终C/G GREEN。producer与无mapper HTTP控制两边都正常；field-pair与九事件data-only在baseline应出现实际目标失败，单terminal data-only保持正常。原始capture/控制成功不替代mapped正确性。
+
+```bash
+CPA_SMOKE_PLUGIN="$F15_BASE_DLL" go -C "$CPA_MODULE_COPY" test -mod=readonly -overlay "$OVERLAY_JSON" -count=1 -v ./internal/pluginhost -run '^TestModelMapperFunctionalNative' -timeout 180s
+CPA_SMOKE_PLUGIN="$F15_FIXED_DLL" go -C "$CPA_MODULE_COPY" test -mod=readonly -overlay "$OVERLAY_JSON" -count=1 -v ./internal/pluginhost -run '^TestModelMapperFunctionalNative' -timeout 180s
+```
+
+- [ ] 从唯一smoke入口运行相同baseline/fixed完整binary matrix，保留原有其他F01..F14验收。
+
+```bash
+CPA_SMOKE_INTEGRATION=1 CPA_SMOKE_CPA_BIN='C:/Users/user/Downloads/cpa-plugin/dist/integration/cpa.exe' CPA_SMOKE_PLUGIN="$F15_BASE_DLL" go -C "$E" test -mod=readonly -count=1 -v "$E/.github/scripts/smoke-local.go" "$E/.github/scripts/smoke-local_test.go" -run '^TestCPAPluginIntegration$' -timeout 600s
+CPA_SMOKE_INTEGRATION=1 CPA_SMOKE_CPA_BIN='C:/Users/user/Downloads/cpa-plugin/dist/integration/cpa.exe' CPA_SMOKE_PLUGIN="$F15_FIXED_DLL" go -C "$E" test -mod=readonly -count=1 -v "$E/.github/scripts/smoke-local.go" "$E/.github/scripts/smoke-local_test.go" -run '^TestCPAPluginIntegration$' -timeout 600s
+```
+
+RED只认可真实mapped结果和内容失败；编译、启动、DLL加载或TempDir清理错误应单独修正，不能当RED。真实native不关闭checkptr或race；Windows loader的已知限制按E既有要求如实报告，root生命周期另跑race。
+
+### G5：自审、独立审查、修正复审与任务提交
+
+- [ ] 自审逐项对应 F15 绑定规格：两类输入和单terminal控制、迟到delimiter/no-early-emit、C依赖与固定BASE、16MiB、JSON/opaque/metadata/ownership、错误与batching、真实层级、性能扫描与allocation、署名和发布边界。语义检查点未解决时，状态保持阻塞，只有草稿交付，不提交产品fix。
+- [ ] 检查diff仅涉及G-owned范围，没有新增parser/provider/config/dependency，没有改A/B/D或CPA/module cache；确认测试expected独立于产品输出。
+
+```bash
+git -C "$G" diff --check
+git -C "$G" diff "$reviewBASE" -- main.go main_test.go stream_native_fields_regression_test.go performance_regression_test.go
+```
+
+- [ ] 向独立reviewer交付相对reviewBASE的完整diff、完整spec/plan及真实命令结果。reviewer必须核对所有共享Write/Flush/Finish调用者、field-pair与data-only、候选/提交时点、实际wire优先可执行性、增量游标/reset、C的batch flag与chunks+error、真实E层级及署名。按既定workflow要求选择可用[1m]型号，完成后主动回报；草稿设计／文档整合阶段不派 agent；产品 G 的独立审查仍由既定 workflow 分配。
+- [ ] 每项确认finding由G在同一worktree修正，重跑受影响focused/control，再跑root/vet/race；性能相关修正重跑allocation与bench。独立复审通过后才能提交。若审查发现信息冲突，回到G2停止条件，不通过降规格或省略控制取得GREEN。
+- [ ] 产品仍RED且语义已解决时，最小共用修复与必要回归一起提交；C已覆盖时只提交缺失test，记录C的产品fix归属。下列subject按实际分支二选一，不产生未修改文件变更。
+
+```bash
+git -C "$G" add -- main.go main_test.go stream_native_fields_regression_test.go performance_regression_test.go
+git -C "$G" commit -m "fix: preserve native Responses SSE field boundaries" -m 'Refs: #8
+Related-PR: #7
+PR-Author: @leolmq'
+```
+
+C已修复、G无产品diff时subject为 `test: cover native Responses SSE field boundaries`，body相同。不编造Co-authored-by姓名/email，不改写旧历史。
+
+```bash
+git -C "$G" show --stat --oneline HEAD
+git -C "$G" status --short
+```
+
+- [ ] G主动回报commit、reviewBASE、复审结果、所有测试/性能结果与E接收内容；E在自己的worktree提交唯一入口/fixture及完成永久baseline RED/fixed GREEN。只提交本任务相关文件，不push、不评论、不Release、不提前关闭issue。实际Release成功与资产核验后由协调者填最终comment/版本。
+- [ ] 删除本任务创建且不需保留的OS临时输入/模块副本，保留需要复查的JSON和diff在已忽略的专用目录，不删除已有文件。
+
+### 本次设计核验结果与限制
+
+固定源码通过Git archive导出，产品和永久tests只读。最终root草稿编译exit0，完整F15命令exit1，失败为真实field拼接/模型恢复/完整单位限额断言；控制分别GREEN。原有root suite在base-only overlay下exit0；最终草稿vet exit0；新普通控制和单data terminal的race exit0。没有声称全部F15 race GREEN。
+
+真实CPA草稿编译exit0。两种builtin的core/host producer控制和无mapper的HTTP handler/framer控制实际运行exit0；确认两类1/9事件、六种transport、完整payload/output及模型。映射native DLL/HTTP新草稿本轮没有运行；已保存producer trace/归档HTTP与framer证据提供原实际RED，新永久baseline/fixed由E执行。
+
+旧候选实验仅在固定源码测试实例设置现有scanner状态，没有改产品；第3次Write提前输出125 bytes。旧全buffer header helper扫描probe，2MiB约90ms、8MiB约1.44s且零allocation。新增native续写benchmark的field-pair preflight为目标RED，data-only正常单单位计时约9.05ms/37.97ms，B/op与allocs/op已保留为控制，未将其称为多事件修复。
+
+C最终HEAD未交付，G2仍需有限接口语义核验；本草稿不包含未经证明的产品实现。原Linux/Docker现场唯一根因未确认。补充草稿已独立复审并整合至两份 tracked 文档；G 只能按 C 最终提交依赖执行有限核查，G2 条件未满足时停止产品编码。
+
 ## Task E：永久 actual CPA integration 和完整终验
 
 **Files:** 修改 `.github/scripts/smoke-local_test.go`，创建唯一永久 fixture `.github/scripts/testdata/cpa-functional-regression_test.go`；仅实际需要时修改 `Makefile`、`.github/workflows/build.yml`。
@@ -868,7 +2239,7 @@ func TestFunctionalShutdownLifecycleReset(t *testing.T) {
 
 ### E1：保存 baseline，并证明新增实际回归 RED
 
-- [ ] 在 A/B/C/D 合并后的独立 E worktree 建立 `dist/functional-baseline/` 和 `dist/functional-fixed/`，两者已被 `dist/` ignore 覆盖。用独立 baseline worktree 从 `7855e55904f9a208ef915aa7878b77db8577a294` 构建 DLL，不回退或修改当前 E worktree。
+- [ ] 在 A/B/C/D/G 完成并合并后的独立 E worktree 建立 `dist/functional-baseline/` 和 `dist/functional-fixed/`，两者已被 `dist/` ignore 覆盖。用独立 baseline worktree 从 `7855e55904f9a208ef915aa7878b77db8577a294` 构建 DLL，不回退或修改当前 E worktree。F01..F14 的上述 baseline 不变；F15 另按 G4 从固定 `6c7f060f4da5bb33e7b2ecd74c44499c9676a93c` Git object 构建，独立记录 source hash、构建参数和资产身份，不混用两个 baseline。
 
 ```bash
 CGO_ENABLED=1 GOOS=windows GOARCH=amd64 go build -trimpath -buildmode=c-shared -o dist/functional-baseline/model-mapper.dll .
@@ -959,7 +2330,7 @@ go test -count=1 -v .github/scripts/smoke-local.go .github/scripts/smoke-local_t
 | `interactions-agent` | 非空 agent 的 native 非流/流，路由未处理，行为与未启用映射的控制相同。 |
 | `count-tokens`、`reconfigure-reload` | 现有 Claude guard，正常注册、reconfigure、reload 和 clean stream 对照；不新增 Gemini countTokens 辨别能力。 |
 
-- [ ] 公共报告验收依赖 C 最终已验证 HEAD 上共享 rewriter 后续回归／必要修正的最终提交；新增缺陷的正式交叉核验已完成，证据见下文。全部新增永久 integration 由本任务的唯一入口和唯一 CPA fixture 管理。PR7 的 HTTP matrix 在 E1 的同一 fake upstream 分别使用缺少 `Content-Type`、`text/event-stream`、`text/event-stream; charset=utf-8`、`application/json`，记录真实 translator/host 后实际到达插件的 headers/core bytes。两个 HTTP endpoint 的 mapped/unmapped 流均检查 200、完整 `onetwo`、对应 model、可派发 JSON SSE、`data: data:` 为零、DONE 恰好一次。native core/header 对照用真实 loader、ABI callback 和 host bridge，给正常可控 executor 的 raw JSON `delta.content=hello` 和四类 headers，精确检查 `hello`、对应模型和零插件 SSE/DONE；最后一个有效 payload 后关闭 producer，记录真实 host read 的非空 Payload/Done=false，再记录空 Payload/Done=true。复用 CPA parser 和现有 validators，HTTP 侧的 header 归一化据实际路径报告，不将上游缺失 header 等同于插件侧缺失。后续 PR7 相关 E 永久回归／复审修正提交按 C1 约束在 E3 的既有 `git commit` 命令追加 `-m $'Related-PR: #7\nPR-Author: @leolmq'`，提交后用 `git log -1 --format='%H%n%B'` 核对实际正文。
+- [ ] 公共报告验收依赖 C 最终已验证提交以及 G 完成有限接口语义核查、必要 TDD／审查／复审后的最终提交；G2 未满足时 E/F 不放行。新增缺陷的正式交叉核验已完成，证据见下文。全部新增永久 integration 由本任务的唯一入口和唯一 CPA fixture 管理。PR7 的 HTTP matrix 在 E1 的同一 fake upstream 分别使用缺少 `Content-Type`、`text/event-stream`、`text/event-stream; charset=utf-8`、`application/json`，记录真实 translator/host 后实际到达插件的 headers/core bytes。两个 HTTP endpoint 的 mapped/unmapped 流均检查 200、完整 `onetwo`、对应 model、可派发 JSON SSE、`data: data:` 为零、DONE 恰好一次。native core/header 对照用真实 loader、ABI callback 和 host bridge，给正常可控 executor 的 raw JSON `delta.content=hello` 和四类 headers，精确检查 `hello`、对应模型和零插件 SSE/DONE；最后一个有效 payload 后关闭 producer，记录真实 host read 的非空 Payload/Done=false，再记录空 Payload/Done=true。复用 CPA parser 和现有 validators，HTTP 侧的 header 归一化据实际路径报告，不将上游缺失 header 等同于插件侧缺失。后续 PR7 相关 E 永久回归／复审修正提交按 C1 约束在 E3 的既有 `git commit` 命令追加 `-m $'Related-PR: #7\nPR-Author: @leolmq'`，提交后用 `git log -1 --format='%H%n%B'` 核对实际正文。
 - [ ] issue8 在临时 CPA 与同一 mock upstream 的正常 provider 配置注册 `grok-4.6`／`grok-4.7`，对照禁用 plugin 请求 `grok-4.6`、启用原规则 `grok-4.6=>grok-4.7` 请求 `grok-4.6`、相同启用配置直接请求 unmatched `grok-4.7`。每组独立 CPA/native DLL 进程、相同请求序列，保留非流／流控制；避免会话 reasoning replay 影响比较。使用下列正常完整 terminal fixture，末尾包含派发空行；native 对照的 `Format/SourceFormat` 均为 `openai-response`。
 
 ```plaintext
@@ -1145,6 +2516,8 @@ Windows native loader 的 checkptr/race 限制按已完成复核如实记录：n
 - [ ] F07/F11/F14 的 actual host 检查在同一永久 fixture 中完成。需要 Responses validator 时，使用公开的 `handlers.NewBaseAPIHandlers(cfg *config.SDKConfig, authManager *coreauth.Manager) *handlers.BaseAPIHandler`，把该真实 handler 交给 `Host.SetModelExecutor`；可控 core executor 只提供固定 payload，实际 `BaseAPIHandler.ExecuteModelStream(ctx context.Context, req handlers.ModelExecutionRequest) (handlers.ModelExecutionStream, *interfaces.ErrorMessage)` 调用现有 `sseJSONValidationState.AddChunk`/`Finish`。`package pluginhost` 不直接访问 `package handlers` 的私有 validator 类型，也不复制其实现。F11 使用 C4 的相同 220 字节 fixture，核对原始 host read bytes 全部保留，再核对插件输出的三个有序 data events；该结论覆盖合法 ABI 输入。F14 检查真实 validator 原样放行 `x-vendor-field\nd` 和后续 `ata: {"model":"upstream"}\n\n` 两个片段。F07 按各协议可达层核对完整前缀与原错误。F13 的混合单 chunk 若被 CPA validator 前置拒绝，记录该层级，保留 C 的 helper 回归。
 - [ ] 仅当创建额外 script test 入口使当前命令无法覆盖时，同步 `Makefile` 和 `.github/workflows/build.yml` 的显式文件清单；优先保持现有两个 smoke 文件和唯一 `TestCPAPluginIntegration` 入口，不运行整个 `.github/scripts` package。
 
+- [ ] F15 的完整永久输入、Go fixture、两组 DLL 身份核验和 baseline/fixed 命令沿用 G4，合入本任务的唯一 fixture／入口。原公共报告的 disabled same-input alias 控制和历史结果继续保留；G4 新矩阵注册实际 `grok-4.6`／`grok-4.7`，disabled 按实际请求 model 验收，不用 alias 替换其 upstream model。两种真正 builtin 的 field-pair/data-only 各含 1/9 事件和六种 transport，mapped/direct-unmatched/disabled `.6/.7` 及全部非流逐项检查完整 JSON、事件顺序、delta/output、opaque、model、HTTP 200。core/host 与无 mapper HTTP 控制 GREEN、新 native DLL 草稿仅编译、新永久 baseline RED／fixed GREEN分别记录。
+
 ### E3：GREEN、性能与构建
 
 - [ ] 在 fixed worktree 构建新 DLL，然后对同一永久 integration 命令运行 GREEN。
@@ -1180,6 +2553,8 @@ go test . -run '^$' -bench '^Benchmark(RewriteTopLevelModel|RestoreResponseModel
 
 比较真实 ns/op、B/op、allocs/op；保留 benchmark preflight 中全部模型、opaque、payload 长度和数组检查。no-model response <=1 clone allocation，complete markerless/escaped SSE <=6，fragmented raw JSON <100，delimiterless 2 MiB/8 KiB <=200。出现稳定回归定位新增重复解析/复制并修正，不能无证据改门槛。
 
+- [ ] F15 同时重跑 G3 的两类 native 2 MiB/8 KiB allocation（<=200）及 2 MiB、8 MiB／8 KiB continuation benchmark。先通过 byte-exact preflight 和 ownership，再比较同环境 ns/op、B/op、allocs/op，并核查候选记录后的增量游标；BASE 的错误 field-pair 输出不参与正确输出计时，不能用正常单 data-only 控制代替两类新目标。
+
 - [ ] 实际 Windows/Linux 构建打包和 compatibility。Linux 使用已有可用 Zig compiler，保持 GLIBC target，打包器在 host Go 环境运行。
 
 ```bash
@@ -1189,14 +2564,14 @@ make package VERSION=0.5.12 GOOS=linux GOARCH=amd64 BUILD_CC="zig cc -target x86
 
 版本 `0.5.12` 为候选构建标签；发布前再核对是否被占用。核对 DLL/.so 的 metadata、sidecar、zip 根目录、LICENSE 和 sha256 checksum，不修改开发默认版本。
 
-- [ ] 独立 reviewer 逐项检查规格表 F01..F14 的归属和控制条件，确认 F13 无独立生产任务、F14 无生产网络分片误述、每个 layer 的实际结果据实记录。覆盖不足由 E 在自己的 worktree 补查和复审，不交给主会话代写。
+- [ ] 独立 reviewer 逐项检查规格表 F01..F15 的归属和控制条件，确认 F13 无独立生产任务、F14 无生产网络分片误述、F15 已满足 G2 语义条件且两类 native 永久矩阵完整、每个 layer 的实际结果据实记录。完整核对 G4 的两类 1/9 事件、六种 transport、全部 route／非流、两个 baseline 来源，以及编译、core/host／无 mapper HTTP 控制和新 native DLL GREEN 的区别。覆盖不足由 E 在自己的 worktree 补查和复审，不交给主会话代写。
 - [ ] `git diff --check` 后仅提交 E 实际修改的 integration/CI 文件，永久 fixture 必须随同入口提交：`git add .github/scripts/smoke-local_test.go .github/scripts/testdata/cpa-functional-regression_test.go && git commit -m "test: cover model mapper functional paths in CPA"`。Makefile/CI 只有实际必要修改才加入。
 
 ## Task F：合并、授权核对和 patch 发布
 
 **Files:** 不新增产品文件。仅合并已完成提交；版本通过现有 build flags 注入。
 
-- [ ] 确认 A/B/C/D/E 全部完成，检查 `git show --stat`、函数/fixture 所有权和独立审查结果。E 固定集成点若后续变动，重跑相关终验；不将未完成任务 cherry-pick 到 main。
+- [ ] 确认 A/B/C/D/G/E 全部完成，检查 `git show --stat`、函数/fixture 所有权和独立审查结果；F15 的 G2 冲突必须已解决，E 的唯一永久 fixture／入口必须完成两类 native 全矩阵 baseline RED／fixed GREEN。E 固定集成点若后续变动，重跑相关终验；不将未完成任务 cherry-pick 到 main。
 - [ ] 按原工作区状态保护规则结束主整合 worktree并合并本地 `main`。合并目标与既有修改由主会话核对；禁止用 reset --hard 或丢弃其他改动解决合并问题。
 - [ ] 主会话核对真实用户消息确已授权 main/tag 推送和 Release。没有该授权时停在已验证本地提交，不把本计划当作授权，不创建 PR。
 - [ ] 在授权和本地终验都满足时重新读取 remote/tag 状态，确认下一 patch 候选未被占用。
@@ -1247,8 +2622,8 @@ gh pr view 7 --repo DoingDog/cpa-plugin-model-mapper --json state,comments
 
 ## 计划自审与交接完成条件
 
-- [ ] 规格逐项映射：F01->A，F02/F03->B，F04/F07/F08/F09/F10/F11/F12->C，F05/F06->D，F13->C 共用 delimiterless 回归，F14->C 分类回归；actual integration 和全部控制->E，发布->F。
+- [ ] 规格逐项映射：F01->A，F02/F03->B，F04/F07/F08/F09/F10/F11/F12->C，F05/F06->D，F13->C 共用 delimiterless 回归，F14->C 分类回归，F15->G 共享 native field boundary 回归及必要修复；actual integration 和全部控制->E，发布->F。
 - [ ] 公共报告映射：PR7->C/F04 统一 TDD、E 实际 HTTP/core/header/native 控制；issue8->C 既有 terminal 控制及最终已验证 HEAD 上的两个无 LF 输入、18 字段九事件、单 terminal data-only 一帧／九个独立 data-only payload 九帧回归，共享 rewriter 已分派后续任务顺序完成必要修正，E 唯一入口的真实 XAI/Codex／三组请求体／producer/native/framer/HTTP 对照；现场信息请求->既有补充复现负责人独立核验后的条件评论，不等待 E 终验或 Release；发布后的实际 commit/版本说明及条件性关闭->F。核对 `hello`/`onetwo`、四类 headers、完整 delta/output/opaque、组合 ABI flags 与正常 producer read 的层级、既有全部分片及唯一永久 fixture。核对请求体独立核验和两种 native 方法的正式交叉核验均已完成、`6c7f060` 字段边界缺陷已确认、`originalIssueReproduced=true`／`commentAllowed=false`，保留 Windows 独立重跑、Windows/WSL2 发布结果来源及资产已清理／Linux 未重跑限制；不把 framer 结果充当未经运行的 HTTP 结果。报告者部署唯一根因与最终修复 HEAD/Release 仍未确定，未证实发布修复时保持 open；后续相关提交／Release／最终 PR 评论保留 #7／@leolmq 署名，不重复实施 A/B/D 或另派共享 scanner 的并行实现。
 - [ ] 核对 Go 测试块能够在现有类型/helper 上编译；RED 必须为目标行为失败，不能是缺失符号、fixture 启动或依赖错误。
-- [ ] 占位、自相矛盾、未经测量性能承诺、额外配置/功能和共享函数冲突检查完成。C 依赖 B fixture，E 依赖全部修复；独立任务仍并行。
+- [ ] 占位、自相矛盾、未经测量性能承诺、额外配置/功能和共享函数冲突检查完成。C 依赖 B fixture，G 依赖 C 最终完整审查提交，E 依赖 A/B/C/D/G 全部修复；独立任务仍并行。F15 草稿已独立复审，G2 产品语义条件尚未满足，文档整合不表示产品已修复；缺可靠 logical/wire 判定信息时停止产品编码。完整核对同前缀四次 Write、迟到 LF/CRLF delimiter 前零输出、可逆候选与不可逆 emit、逐单位交付、opaque、任意合法 wire 分片、16 MiB，以及两个完整 Go 草稿与已编译复审输入一致。
 - [ ] 当前文档提交只暂存两份文档，运行 `git diff --check`，不修改或暂存产品代码、旧 `.claude`、build artifact 或中间结果。
