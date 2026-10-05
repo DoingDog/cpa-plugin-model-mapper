@@ -289,6 +289,8 @@ stream.frameRawJSONAsSSE = req.Format != "gemini" &&
 go test . -run 'TestFunctionalOpenAIRawCoreChunks|TestHandleExecutorExecuteStreamReturnsPreparedHostHeaders|TestRunStreamForward(TerminatesReframedOpenAIChat|ProcessesTerminalPayload|BatchesOnlySSEOutput)|TestPrepareExecutorStreamGeminiKeepsCoreChunksRaw' -count=1 -v
 ```
 
+- [ ] 公共报告补充约束：PR7 原始 JSON 已核实 `user.login=leolmq`，候选 head 为 `9fe917c031f0a7ed8b43897220a1eea237acc88b`。后续相关 C 产品修复、复审修正、E 永久回归和文档修正提交均注明 #7／@leolmq。C5 的既有 `git commit` 命令必须追加 `-m $'Related-PR: #7\nPR-Author: @leolmq'`，每次提交后执行 `git log -1 --format='%H%n%B'` 核对实际 body；E3 和相关文档提交同样执行。Release／最终 PR 评论注明该作者贡献，不编造姓名、email 或 `Co-authored-by`，不改写已经完成的历史。
+
 ### C2：完整前缀和并存错误，F07
 
 - [ ] 加入以下跨路径回归，完整前缀 expected bytes 与 B 的保序规则一致。
@@ -613,7 +615,8 @@ func TestFunctionalMixedRawSSEABI(t *testing.T) {
 
 ### C5：全量验证、审查与提交
 
-- [ ] issue8 复用既有 C terminal 控制和 E2 的同一完整 Responses fixture，规则为 `grok-4.6=>grok-4.7`，`Format/SourceFormat=openai-response`。覆盖 `Payload+Done`、在第 17 字节拆分后末段携带 Done、`Payload+Error+Done`（原错误 `probe upstream error`），以及 payload 后独立 Done 的控制；检查上游请求 `Model` 和顶层 `model=grok-4.7`、下游 `response.model=grok-4.6`、完整 output 原样、emit -> host-close -> plugin-close 与成功 close 次数。保留 D 的 terminal/error 断言和函数所有权。执行 `go test . -run 'TestRunStreamForward(ProcessesTerminalPayload|FlushesPendingBytesOnReadError|PreservesInBandErrorAcrossCleanupFailures)' -count=1 -v`。独立 fake callback 探测的正常 terminal 控制在核查 HEAD 已通过，按控制记录，不要求人为制造 RED，也不新增针对原 502 的猜测性产品修复。
+- [ ] issue8 复用既有 C terminal 控制和 E2 的同一完整 Responses fixture，规则为 `grok-4.6=>grok-4.7`，`Format/SourceFormat=openai-response`。覆盖 `Payload+Done`、在第 17 字节拆分后末段携带 Done、`Payload+Error+Done`（原错误 `probe upstream error`），以及 payload 后独立 Done 的控制；检查上游请求 `Model` 和顶层 `model=grok-4.7`、下游 `response.model=grok-4.6`、完整 output 原样、emit -> host-close -> plugin-close 与成功 close 次数。保留 D 的 terminal/error 断言和函数所有权。执行 `go test . -run 'TestRunStreamForward(ProcessesTerminalPayload|FlushesPendingBytesOnReadError|PreservesInBandErrorAcrossCleanupFailures)' -count=1 -v`。早期独立 fake callback 探测的完整 SSE terminal 控制已通过，按控制记录，不要求人为制造 RED；该结果不覆盖 E2 两个无 LF field chunks，也不证明补充调查中的 mapped 502 已解决。
+- [ ] 补充调查已报告当前 DLL 和官方 `v0.5.8`／`v0.5.11` DLL 的真实 native/HTTP mapped 502，以及 XAI/Codex 的两个无 LF producer payload；正式交叉核验尚未返回。在 C 最终已验证 HEAD 上原样检查 E2 列出的两个 payload，不预拼接、不补 LF，保留 XAI 的额外空 chunk 和正常独立 Done。正式确认且仍为目标 RED 时，由 C 所有者在 `stream_protocol_regression_test.go` 的 `TestFunctional` 范围内完成 focused TDD，再顺序修正共享 scanner、完整验证、独立规格／质量复审、必要修正及提交；不另派共享函数的并行实现。运行 `go test . -run '^TestFunctional|TestRunStreamForward(ProcessesTerminalPayload|FlushesPendingBytesOnReadError|PreservesInBandErrorAcrossCleanupFailures)' -count=1 -v`，同时保留既有分片、metadata、incomplete 上限与 D 的 terminal/error 条件。E 等该最终提交通过并整合后执行真实 builtin producer 验收；若该 HEAD 已通过，保存实际结果及正式核验结论，不新增猜测性 workaround。
 - [ ] 运行 `go test -count=1 ./...`、`go vet ./...`、`go test -race -count=3 . -run '^TestFunctional'`。不能留下 B fixture、C framing 或 parser 的已知失败给协调会话。
 - [ ] 运行现有 markerless SSE、escaped SSE、fragmented raw JSON、delimiterless scan、owned delimiter 和 request/response allocation checks。门槛保持规格的既有值，不删除 benchmark preflight。
 - [ ] reviewer 核对 F04/F07/F08/F09/F10/F11/F12 与 F13/F14 的真实层级；检查所有返回 `chunks,error` 的上层调用、普通 SSE metadata、framing/batching 分工和 opaque 字节。修正后复审。
@@ -944,7 +947,9 @@ go test -count=1 -v .github/scripts/smoke-local.go .github/scripts/smoke-local_t
 | `response-duplicate-content` | upstream 两次 choices 和 upstream-first/client-last model；客户端保留两次 choices，所有白名单 string model 恢复。 |
 | `chat`、`completions` | mapped/unmapped 非流/流、精确 `onetwo`、model、status、DONE 一次。 |
 | `pr7-core-headers-terminal` | 同一 native fixture 的正常 OpenAI raw core、四类 host headers、最后一个 payload 后独立 Done；单 payload 的完整内容为 `hello`，mapped/unmapped 模型正确，零插件 framing/DONE。HTTP wire 的验收沿用 `chat`、`completions`。 |
-| `responses-terminal-model-restoration` | 原规则 `grok-4.6=>grok-4.7` 的完整 `response.completed`；上游请求 Model/顶层 model、下游 response.model、完整 output/opaque 文本、mapped/unmapped HTTP 200 和可派发 terminal；正常 native producer 与 C 的组合 terminal flags 分层核对。 |
+| `responses-terminal-model-restoration` | 原规则 `grok-4.6=>grok-4.7` 的完整 `response.completed`；上游请求 Model/顶层 model、下游 response.model、完整 output/opaque 文本、mapped/unmapped/禁用 plugin HTTP 200 和可派发 terminal；正常 native producer 与 C 的组合 terminal flags 分层核对。 |
+| `responses-builtin-field-chunks` | 真实 `NewXAIExecutor`／`NewCodexExecutor` 的两个无 LF field chunks、XAI 空 chunk、正常独立 Done；completed-only 和正常九事件 lifecycle 的 mapped/unmapped/禁用 plugin native/HTTP 对照，完整内容、模型、opaque、terminal/error 和分片控制。 |
+| `responses-request-body-controls` | 每组独立 CPA/native DLL 进程，禁用 plugin 的 `grok-4.6`、启用原规则的 `grok-4.6`、相同配置直接 unmatched `grok-4.7`；非流／流的完整 raw/parsed body、非 model member 顺序／字节、opaque、headers 与 HTTP 结果对应。 |
 | `responses-http` | OpenAI-compatible 的九条正常 Responses lifecycle，HTTP SSE 可派发、created/completed 模型正确；markerless delta 保留。 |
 | `responses-truncated-prefix` | actual native Codex 的有效 created 后 e/ev/eve/even/event，终止时保留有效事件和原错误；完整 `event:` 对照。 |
 | `responses-large-complete` | 257 个 64 KiB 普通文本 delta，使真实 translator 生成已测 16,842,937 字节 done；mapped/unmapped 完整文本及 completed；不以降低输出长度绕过。 |
@@ -954,8 +959,8 @@ go test -count=1 -v .github/scripts/smoke-local.go .github/scripts/smoke-local_t
 | `interactions-agent` | 非空 agent 的 native 非流/流，路由未处理，行为与未启用映射的控制相同。 |
 | `count-tokens`、`reconfigure-reload` | 现有 Claude guard，正常注册、reconfigure、reload 和 clean stream 对照；不新增 Gemini countTokens 辨别能力。 |
 
-- [ ] 公共报告验收依赖 C 的已验证提交，全部新增永久 integration 由本任务的唯一入口和唯一 CPA fixture 管理。PR7 的 HTTP matrix 在 E1 的同一 fake upstream 分别使用缺少 `Content-Type`、`text/event-stream`、`text/event-stream; charset=utf-8`、`application/json`，记录真实 translator/host 后实际到达插件的 headers/core bytes。两个 HTTP endpoint 的 mapped/unmapped 流均检查 200、完整 `onetwo`、对应 model、可派发 JSON SSE、`data: data:` 为零、DONE 恰好一次。native core/header 对照用真实 loader、ABI callback 和 host bridge，给正常可控 executor 的 raw JSON `delta.content=hello` 和四类 headers，精确检查 `hello`、对应模型和零插件 SSE/DONE；最后一个有效 payload 后关闭 producer，记录真实 host read 的非空 Payload/Done=false，再记录空 Payload/Done=true。复用 CPA parser 和现有 validators，HTTP 侧的 header 归一化据实际路径报告，不将上游缺失 header 等同于插件侧缺失。
-- [ ] issue8 为 fake upstream 注册 `grok-4.7`，仅设置原规则 `grok-4.6=>grok-4.7`，在 `/v1/responses` 分别请求 mapped `grok-4.6` 与 unmapped `grok-4.7`。使用下列同一正常完整 terminal fixture，末尾包含派发空行；native 对照的 `Format/SourceFormat` 均为 `openai-response`。
+- [ ] 公共报告验收依赖 C 的最终已验证提交及新增缺陷的正式核验，全部新增永久 integration 由本任务的唯一入口和唯一 CPA fixture 管理。PR7 的 HTTP matrix 在 E1 的同一 fake upstream 分别使用缺少 `Content-Type`、`text/event-stream`、`text/event-stream; charset=utf-8`、`application/json`，记录真实 translator/host 后实际到达插件的 headers/core bytes。两个 HTTP endpoint 的 mapped/unmapped 流均检查 200、完整 `onetwo`、对应 model、可派发 JSON SSE、`data: data:` 为零、DONE 恰好一次。native core/header 对照用真实 loader、ABI callback 和 host bridge，给正常可控 executor 的 raw JSON `delta.content=hello` 和四类 headers，精确检查 `hello`、对应模型和零插件 SSE/DONE；最后一个有效 payload 后关闭 producer，记录真实 host read 的非空 Payload/Done=false，再记录空 Payload/Done=true。复用 CPA parser 和现有 validators，HTTP 侧的 header 归一化据实际路径报告，不将上游缺失 header 等同于插件侧缺失。后续 PR7 相关 E 永久回归／复审修正提交按 C1 约束在 E3 的既有 `git commit` 命令追加 `-m $'Related-PR: #7\nPR-Author: @leolmq'`，提交后用 `git log -1 --format='%H%n%B'` 核对实际正文。
+- [ ] issue8 在临时 CPA 与同一 mock upstream 的正常 provider 配置注册 `grok-4.6`／`grok-4.7`，对照禁用 plugin 请求 `grok-4.6`、启用原规则 `grok-4.6=>grok-4.7` 请求 `grok-4.6`、相同启用配置直接请求 unmatched `grok-4.7`。每组独立 CPA/native DLL 进程、相同请求序列，保留非流／流控制；避免会话 reasoning replay 影响比较。使用下列正常完整 terminal fixture，末尾包含派发空行；native 对照的 `Format/SourceFormat` 均为 `openai-response`。
 
 ```plaintext
 event: response.completed
@@ -963,7 +968,20 @@ data: {"type":"response.completed","response":{"model":"grok-4.7","output":[{"ty
 
 ```
 
-上游请求 `Model` 和顶层 JSON `model` 均为 `grok-4.7`，每次请求调用 upstream 一次；正常 HTTP 均为 200，JSON data 与 `response.completed` 均有效可派发，mapped `response.model=grok-4.6`、unmapped `response.model=grok-4.7`。逐项精确比较完整 `response.output`，包括 message/content 类型、数组顺序和文本 `grok-4.7`，opaque 文本不改。C5 的三个组合 terminal flags 属于可控 ABI 接受对照；E 在真实 native fixture 核对正常 payload 后独立 Done，并在真实 bridge 可达的错误路径保留 `probe upstream error` 和已接受的完整 payload，报告实际 read/terminal 序列及 error 通道。mock、native、完整 HTTP 的结果分别记录，fake callbacks 不作为 Linux/Docker 现场复现。上述用例随 E1/E3 的既有 baseline/fixed integration 命令执行；PR7 必须得到目标 RED/GREEN，C5 的正常 terminal 控制在两者均保持 GREEN，issue8 的 native/HTTP 基线结果据实记录。
+启用 plugin 的 mapped/unmatched 上游请求 `Model` 和顶层 JSON `model` 均为 `grok-4.7`，每次请求调用 upstream 一次；fixed 三组正常 HTTP 均须为 200，JSON data 与 `response.completed` 均有效可派发，mapped `response.model=grok-4.6`、unmatched `response.model=grok-4.7`。禁用组不执行映射，按实际请求模型参数化 terminal fixture 的 `response.model`，其余 output 保持同样内容并独立记录模型预期。逐项精确比较完整 `response.output`，包括 message/content 类型、数组顺序和文本 `grok-4.7`，opaque 文本不改。C5 的三个组合 terminal flags 属于可控 ABI 接受对照；E 在真实 native fixture 核对正常 payload 后独立 Done，并在真实 bridge 可达的错误路径保留 `probe upstream error` 和已接受的完整 payload，报告实际 read/terminal 序列及 error 通道。mock、native、完整 HTTP 的结果分别记录，fake callbacks 不作为 Linux/Docker 现场复现。上述用例随 E1/E3 的既有 baseline/fixed integration 命令执行；PR7 必须得到目标 RED/GREEN，C5 的完整 SSE terminal 控制在两者均保持 GREEN，issue8 的 native/HTTP 基线结果据实记录。
+
+- [ ] 补充进度已报告当前 `6c7f060` Windows DLL 的真实 XAI/Codex native/HTTP mapped 502，官方 `v0.5.8`／`v0.5.11` Windows DLL 的真实 xAI 对照也复现；正式交叉核验仍待返回，不把进度消息作为完成的独立结论。无 LF 候选输入与上面的完整 SSE 分开检查，连续两次 host read 的 payload 原样如下，随后为正常空 Payload／独立 Done；XAI 多返回一个空 chunk 的控制也保留：
+
+```go
+reads := []pluginapi.HostModelStreamReadResponse{
+    {Payload: []byte("event: response.completed")},
+    {Payload: []byte(`data: {"type":"response.completed","response":{"model":"grok-4.7","output":[{"type":"message","content":[{"type":"output_text","text":"grok-4.7"}]}]}}`)},
+    {Done: true},
+}
+```
+
+- [ ] 复用同一 CPA fixture，把本地 mock upstream 接入真实 `NewXAIExecutor`／`NewCodexExecutor`，经实际 Manager/BaseAPIHandler、validator、native loader/ABI/host bridge 和 `/v1/responses`，保存真实 producer payload、host read 与插件输出，不能以 fake callback 输入代替 builtin producer 验收。completed-only 与既有正常九事件 lifecycle 各自精确比较完整 output、模型和 opaque；mapped/unmatched/禁用 plugin 均保留正常非流、HTTP 状态、有效 data/terminal 与原错误控制。LF/CRLF、七字节／单字节网络 writes 和 charset 对照沿用已有调查，网络分片与实际 host chunk 分别记录；既有 C 分片、metadata 和 incomplete 条件不变，不把任意 host read 当 event delimiter。正式核验确认后，在 C 最终 HEAD 和 E1/E3 同一 baseline/fixed 命令中证明新增目标的实际 RED/GREEN；仍 RED 时退回 C 所有者连续修正及复审，E/F 不以旧 terminal 控制 GREEN 放行，也不新建第二永久入口。
+- [ ] 请求体检查复用已保存的临时 CPA/mock upstream 调查和本入口三组控制，捕获真正到达 upstream 的完整 raw/parsed body、非 `model` member 顺序／字节表示、opaque、相关 request/response headers、URI、HTTP 状态和完整错误，按请求对应比较；解析用现有 CPA parser／`encoding/json`，原始字节必须另保留。已有独立进程调查报告正常 minimal-message 输入的 mapped/direct-unmatched 上游 raw body 和 headers 一致，xAI mapped 流仍为 502，正式核验仍待返回；据实记录各组实际结果及差异，不把差异本身判为缺陷或原 502 根因，不重新分派重复调查／产品任务。临时进程和 OS 临时目录按既有 helper 清理，所需证据保存到 E 自有 ignored workspace。
 
 - [ ] 创建唯一永久 fixture `.github/scripts/testdata/cpa-functional-regression_test.go`，使用 `package pluginhost`。复用固定 CPA 模块已有 `gorilla/websocket`、`fakeHostModelExecutor`、loader 和真实 model/downstream bridge；根模块不增加依赖。Go 1.26.5 禁止 overlay 的 replacement target 位于 `GOMODCACHE`，新增虚拟文件同样受限。以下 helper 加入 `.github/scripts/smoke-local_test.go`，把核对为 `v7.2.152` 的全部源文件复制到本次 `t.TempDir()`，只在这个可写副本新增测试 target。补充 imports `context` 和 `io/fs`，复用该文件已有 imports 与 `copyFile`。
 
@@ -1203,23 +1221,33 @@ git push origin v0.5.12
 
 - [ ] 通过 CI 的完成通知或允许的远端 run 等待机制等待 test、七个平台 build 和 Release 完成，不用本地 journal/file polling。任何失败由负责发布验证的 workflow 修正、复审和提交后处理，不把未成功的 Release 记为完成。
 - [ ] 下载 Release 的七个 zip 和 `checksums.txt`，用标准库 `archive/zip` 或现有 packager 检查根目录 library/LICENSE；按 checksum 行逐个计算 SHA-256，核对 metadata 注入版本和 tag commit。全部一致后发布完成。
-- [ ] 公共报告回复由 F 在发布核验后执行，评论和关闭另核对真实用户授权。`C_FIX_COMMIT` 取 C 实际完成并合入的产品修复 commit；结合全部已发布 Release、tag ancestry 和 E 结果确定首个包含它的 `FIX_RELEASE_VERSION`。`PR7_COMMENT_FILE` 是 F 自有 ignored workspace 内的评论正文，写明该 commit、Release 版本、E 的真实 CPA/DLL Chat/Completions 结果与证据层级；不得把 `9fe917c031f0a7ed8b43897220a1eea237acc88b` 候选或真实仍有问题的 `v0.5.7` 写成已交付修复。变量须有经核验的实际值后执行：
+- [ ] issue8 现场信息请求由既有补充复现／条件评论负责人执行，独立于本任务的发布依赖。其他有效方法完成并经独立核验仍未复现时，核对真实用户授权后即可评论请求 CPA 失败请求日志、准确插件版本与 CPA revision、部署／endpoint、相关配置、原始 SSE 和 host read 信息，无需等待 E 全部终验或 Release。`ISSUE8_INFO_REQUEST_FILE` 为该负责人自有 ignored workspace 内的实际评论正文，写明已核查的范围与限制，不声称修复；执行以下命令核对返回的评论 URL、实际正文和 issue 仍为 open。正式确认已复现时跳过这项无法复现评论，进度消息不代替正式判定。
 
 ```bash
+gh issue comment 8 --repo DoingDog/cpa-plugin-model-mapper --body-file "$ISSUE8_INFO_REQUEST_FILE"
+gh issue view 8 --repo DoingDog/cpa-plugin-model-mapper --json state,comments
+```
+
+- [ ] 发布后的修复说明由 F 在成功发布及 assets 核验后执行，评论和关闭另核对真实用户授权。`C_FIX_COMMIT` 取 C 实际完成并合入的产品修复 commit；结合全部已发布 Release、tag ancestry 和 E 结果确定首个包含它的 `FIX_RELEASE_VERSION`，未知时不填候选。逐项核对后续 PR7 相关产品、复审、永久回归和文档修正提交的实际 `Related-PR: #7`／`PR-Author: @leolmq`，不要求改写已有提交。`PR7_COMMENT_FILE` 是 F 自有 ignored workspace 内的评论正文，写明该 commit、Release 版本、E 的真实 CPA/DLL Chat/Completions 结果与证据层级，以及已核实 #7／@leolmq 的贡献。`RELEASE_NOTES_FILE` 保留实际 Release 现有正文并补充相同作者贡献，读取 Release body 核验；不得把 `9fe917c031f0a7ed8b43897220a1eea237acc88b` 候选或真实仍有问题的 `v0.5.7` 写成已交付修复，不编造姓名、email 或 `Co-authored-by`。变量须有经核验的实际值后执行：
+
+```bash
+git show -s --format='%H%n%B' "$C_FIX_COMMIT"
 git tag --contains "$C_FIX_COMMIT"
 gh api --paginate repos/DoingDog/cpa-plugin-model-mapper/releases --jq '.[] | {tag_name,published_at,draft,prerelease}'
 git merge-base --is-ancestor "$C_FIX_COMMIT" "${FIX_RELEASE_VERSION}^{commit}"
-gh release view "$FIX_RELEASE_VERSION" --repo DoingDog/cpa-plugin-model-mapper --json tagName,publishedAt,isDraft,isPrerelease,url
+gh release view "$FIX_RELEASE_VERSION" --repo DoingDog/cpa-plugin-model-mapper --json tagName,publishedAt,isDraft,isPrerelease,body,url
+gh release edit "$FIX_RELEASE_VERSION" --repo DoingDog/cpa-plugin-model-mapper --notes-file "$RELEASE_NOTES_FILE"
+gh release view "$FIX_RELEASE_VERSION" --repo DoingDog/cpa-plugin-model-mapper --json body,url
 gh pr comment 7 --repo DoingDog/cpa-plugin-model-mapper --body-file "$PR7_COMMENT_FILE"
-gh pr view 7 --repo DoingDog/cpa-plugin-model-mapper --json comments
+gh pr view 7 --repo DoingDog/cpa-plugin-model-mapper --json state,comments
 ```
 
-- [ ] `ISSUE8_COMMENT_FILE` 同样位于 F 自有 ignored workspace，内容依据 E 的最终 Responses/native/HTTP 实际结果。只有已证实与原报告相关的修复才填写对应 commit/首个 Release；规格中的历史 terminal 修复不归因于原 issue。原 502 未复现时，正文说明已核查的 fixture、平台和层级，并列出仍缺的部署版本、原始 SSE/host read、CPA revision，保持 open。执行 `gh issue comment 8 --repo DoingDog/cpa-plugin-model-mapper --body-file "$ISSUE8_COMMENT_FILE"`，再用 `gh issue view 8 --repo DoingDog/cpa-plugin-model-mapper --json state,comments` 核对实际评论与状态。后续已发布版本确实解决原报告且获用户授权时，按同样的 ancestry、首个 Release 和 assets 检查填写已证实 commit/版本，评论后执行 `gh issue close 8 --repo DoingDog/cpa-plugin-model-mapper --reason completed`，再次核对 state/comments；未满足这些条件不得关闭。
+- [ ] `ISSUE8_COMMENT_FILE` 同样位于 F 自有 ignored workspace，发布后的正文依据正式补充核验及 E 最终 Responses/native/HTTP 实际结果。当前补充调查已报告本地 builtin producer mapped 502 和无 LF field chunks 候选，正式核验／C 最终修复 HEAD／首个 Release 尚未确定，不沿用早期未复现结论，不填写猜测。只有已证实与报告相关的修复才填写对应 commit/首个 Release；历史 `8b7bd9a0d135251878792b3740bc06a7da7ede00`／`v0.5.2` terminal 修复早于提问，不归因于原 issue。本地复现与报告者 Linux/Docker 的唯一部署根因分开说明；未复现或未证实已发布版本解决报告时，正文说明核查范围及仍缺的部署版本、原始 SSE/host read、CPA revision，保持 open。前述现场信息请求按独立时点执行。执行 `gh issue comment 8 --repo DoingDog/cpa-plugin-model-mapper --body-file "$ISSUE8_COMMENT_FILE"`，再用 `gh issue view 8 --repo DoingDog/cpa-plugin-model-mapper --json state,comments` 核对实际评论 URL／正文与状态。后续已发布版本确实解决报告且获真实用户授权时，按同样的 ancestry、首个 Release 和 assets 检查填写已证实 commit/版本，涉及 PR7 的贡献按 C1 署名，评论后执行 `gh issue close 8 --repo DoingDog/cpa-plugin-model-mapper --reason completed`，再次核对 state/comments；未满足这些条件不得关闭。
 
 ## 计划自审与交接完成条件
 
 - [ ] 规格逐项映射：F01->A，F02/F03->B，F04/F07/F08/F09/F10/F11/F12->C，F05/F06->D，F13->C 共用 delimiterless 回归，F14->C 分类回归；actual integration 和全部控制->E，发布->F。
-- [ ] 公共报告映射：PR7->C/F04 统一 TDD、E 实际 HTTP/core/header/native 控制；issue8->C 既有 terminal 控制、E 原规则/完整 output/正常 producer 对照；发布后的实际 commit/版本评论及条件性关闭->F。核对 `hello`/`onetwo` 各自完整内容、四类 headers、组合 ABI flags 与 native read 的层级、唯一永久入口/fixture，以及原 502 未复现时保持 open 的条件；不重复实施 A/B/D 或另派相同根因修复。
+- [ ] 公共报告映射：PR7->C/F04 统一 TDD、E 实际 HTTP/core/header/native 控制；issue8->C 既有 terminal 控制及最终 HEAD 的原样两个无 LF 输入检查、正式确认且仍 RED 后由 C 顺序修正，E 唯一入口的真实 XAI/Codex／三组请求体／native/HTTP 对照；现场信息请求->既有补充复现负责人独立核验后的条件评论，不等待 E 终验或 Release；发布后的实际 commit/版本说明及条件性关闭->F。核对 `hello`/`onetwo`、四类 headers、完整 output/opaque、组合 ABI flags 与正常 producer read 的层级、既有全部分片及唯一永久 fixture。核对当前本地复现与正式核验待返回的状态、报告者部署限制、未证实发布修复时保持 open，以及后续相关提交／Release／最终 PR 评论的 #7／@leolmq 署名；不填未知修复 HEAD/版本，不重复实施 A/B/D 或另派共享 scanner 的并行实现。
 - [ ] 核对 Go 测试块能够在现有类型/helper 上编译；RED 必须为目标行为失败，不能是缺失符号、fixture 启动或依赖错误。
 - [ ] 占位、自相矛盾、未经测量性能承诺、额外配置/功能和共享函数冲突检查完成。C 依赖 B fixture，E 依赖全部修复；独立任务仍并行。
 - [ ] 当前文档提交只暂存两份文档，运行 `git diff --check`，不修改或暂存产品代码、旧 `.claude`、build artifact 或中间结果。
