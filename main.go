@@ -838,7 +838,7 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 		}
 	}
 	if couldStartJSONValue(p) {
-		chunks, consumed, ok, incomplete, err := r.tryRawJSONChunks(p)
+		chunks, consumed, ok, incomplete, err := r.tryRawJSONChunks(p, false)
 		if err != nil {
 			return chunks, err
 		}
@@ -848,12 +848,7 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 					return chunks, err
 				}
 			} else if consumed < len(p) {
-				suffix := p[consumed:]
-				if r.frameRawJSONAsSSE {
-					suffix = bytes.TrimLeft(suffix, " \t\r\n")
-				}
-				r.rawJSONBoundary = false
-				sseChunks, err := r.sse.Write(suffix)
+				sseChunks, err := r.writeSSESuffix(p[consumed:])
 				return append(chunks, sseChunks...), err
 			}
 			return chunks, nil
@@ -972,8 +967,16 @@ func (r *streamChunkRewriter) writeRawJSONArray(p []byte, opening bool) ([][]byt
 	return out, nil
 }
 
+func (r *streamChunkRewriter) writeSSESuffix(p []byte) ([][]byte, error) {
+	if r.frameRawJSONAsSSE {
+		p = bytes.TrimLeft(p, " \t\r\n")
+	}
+	r.rawJSONBoundary = false
+	return r.sse.Write(p)
+}
+
 func (r *streamChunkRewriter) rawJSONChunks(p []byte) ([][]byte, error) {
-	chunks, _, ok, incomplete, err := r.tryRawJSONChunks(p)
+	chunks, consumed, ok, incomplete, err := r.tryRawJSONChunks(p, true)
 	if err != nil {
 		return chunks, err
 	}
@@ -986,10 +989,14 @@ func (r *streamChunkRewriter) rawJSONChunks(p []byte) ([][]byte, error) {
 		}
 		return [][]byte{bytes.Clone(p)}, nil
 	}
+	if consumed < len(p) {
+		sseChunks, err := r.writeSSESuffix(p[consumed:])
+		return append(chunks, sseChunks...), err
+	}
 	return chunks, nil
 }
 
-func (r *streamChunkRewriter) tryRawJSONChunks(p []byte) ([][]byte, int, bool, bool, error) {
+func (r *streamChunkRewriter) tryRawJSONChunks(p []byte, eof bool) ([][]byte, int, bool, bool, error) {
 	start := skipTopLevelModelJSONSpace(p, 0)
 	end := len(p)
 	for end > start {
@@ -1057,7 +1064,7 @@ trimmed:
 			return [][]byte{out}, len(p), true, false, nil
 		}
 	}
-	values, consumed, ok, incomplete := splitJSONValues(p)
+	values, consumed, ok, incomplete := splitJSONValues(p, r.frameRawJSONAsSSE, eof)
 	if !ok {
 		return nil, 0, false, incomplete, nil
 	}
@@ -1089,7 +1096,7 @@ trimmed:
 	return out, consumed, true, incomplete, nil
 }
 
-func splitJSONValues(p []byte) ([][]byte, int, bool, bool) {
+func splitJSONValues(p []byte, framed, eof bool) ([][]byte, int, bool, bool) {
 	if len(bytes.TrimSpace(p)) == 0 {
 		return nil, len(p), true, false
 	}
@@ -1097,6 +1104,17 @@ func splitJSONValues(p []byte) ([][]byte, int, bool, bool) {
 	values := make([][]byte, 0, 1)
 	consumed := 0
 	for {
+		suffix := p[consumed:]
+		start := skipTopLevelModelJSONSpace(suffix, 0)
+		if len(values) > 0 && start < len(suffix) && suffix[start] != '{' && suffix[start] != '[' {
+			if isSSEChunk(suffix) || isIncompleteSSEPrefix(suffix) {
+				return values, consumed, true, false
+			}
+			// scalar 与 unknown field 的分界需要后续字节或 EOF，已完成的 raw 前缀仍可发送。
+			if !eof && (framed || !couldStartJSONValue(suffix)) {
+				return values, consumed, true, true
+			}
+		}
 		var raw json.RawMessage
 		err := dec.Decode(&raw)
 		if err == io.EOF {
@@ -1133,7 +1151,8 @@ func (r *streamChunkRewriter) Flush() ([][]byte, error) {
 	if len(r.pending) > 0 {
 		pending := append([]byte(nil), r.pending...)
 		r.pending = nil
-		if couldStartJSONValue(pending) {
+		start := skipTopLevelModelJSONSpace(pending, 0)
+		if couldStartJSONValue(pending) && (pending[start] == '{' || pending[start] == '[' || !isSSEChunk(pending)) {
 			chunks, err := r.rawJSONChunks(pending)
 			flushed, flushErr := r.sse.Flush()
 			return append(chunks, flushed...), joinStreamErrors(err, flushErr)
@@ -1241,12 +1260,16 @@ func couldStartJSONValue(p []byte) bool {
 	}
 }
 func isSSEChunk(p []byte) bool {
-	if hasSSEFieldPrefix(p) {
-		return true
+	for remaining := p; len(remaining) > 0; {
+		line, _, next := splitSSELine(remaining)
+		remaining = next
+		if !couldStartJSONValue(line) && hasSSEFieldPrefix(line) {
+			return true
+		}
 	}
 	_, delimiterLength, _ := findSSEEventDelimiter(p, 0, true)
 	trimmed := bytes.TrimLeft(p, " \t\r\n")
-	return delimiterLength > 0 || hasSSEDataField(p) || len(trimmed) > 0 && !couldStartJSONValue(trimmed) && bytes.ContainsAny(trimmed, "\r\n")
+	return delimiterLength > 0 || len(trimmed) > 0 && !couldStartJSONValue(trimmed) && bytes.ContainsAny(trimmed, "\r\n")
 }
 
 func isIncompleteSSEPrefix(p []byte) bool {

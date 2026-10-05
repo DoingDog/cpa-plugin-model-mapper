@@ -757,3 +757,184 @@ func TestFunctionalSSEClassificationLineEndings(t *testing.T) {
 		}
 	}
 }
+
+func functionalForwardProtocolParts(t *testing.T, format string, parts ...[]byte) []byte {
+	t.Helper()
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	t.Cleanup(func() {
+		shutdownExecutorStreams()
+		resetExecutorStreamLifecycle()
+		setLoadedConfigForTest(defaultConfig())
+	})
+	req := rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+		Model: "client", Format: format, SourceFormat: format, Stream: true,
+		OriginalRequest: []byte(`{"model":"client","stream":true}`),
+	}, StreamID: "functional-unknown-suffix"}
+	reads := make([]pluginapi.HostModelStreamReadResponse, 0, len(parts)+1)
+	for _, part := range parts {
+		reads = append(reads, pluginapi.HostModelStreamReadResponse{Payload: part})
+	}
+	reads = append(reads, pluginapi.HostModelStreamReadResponse{Done: true})
+	emitted, hostClosed, pluginClosed, _, err := runExecutorStreamTestWithForwarded(req, reads, nil)
+	if err != nil || !hostClosed || !pluginClosed {
+		t.Fatalf("forwarder error=%v close=%v/%v", err, hostClosed, pluginClosed)
+	}
+	return []byte(strings.Join(emitted, ""))
+}
+
+func TestFunctionalRawPrefixUnknownSSESuffix(t *testing.T) {
+	for _, format := range []string{"openai-response", "claude", "interactions"} {
+		for _, field := range []string{"x-vendor-field", "true", "false", "null", "123", `"scalar"`, "-1"} {
+			for _, lineEnd := range []string{"\n", "\r\n", "\r"} {
+				for _, bom := range []bool{false, true} {
+					t.Run(fmt.Sprintf("%s/%s/%q/bom=%v", format, field, lineEnd, bom), func(t *testing.T) {
+						input := []byte("{\"model\":\"upstream\"}" + lineEnd + field + lineEnd + "data: {\"model\":\"upstream\",\"opaque\":{\"model\":\"upstream\"}}" + lineEnd + lineEnd)
+						want := []byte("data: {\"model\":\"client\"}\n\n" + field + lineEnd + "data: {\"model\":\"client\",\"opaque\":{\"model\":\"upstream\"}}" + lineEnd + lineEnd)
+						if bom {
+							input = append([]byte{0xef, 0xbb, 0xbf}, input...)
+						}
+						for split := 0; split <= len(input); split++ {
+							for _, next := range []int{split, min(split+1, len(input))} {
+								got := functionalProtocolParts(t, format, input[:split], input[split:next], input[next:])
+								if !bytes.Equal(got, want) {
+									t.Fatalf("splits=%d,%d output=%q, want %q", split, next, got, want)
+								}
+								normalized := bytes.ReplaceAll(bytes.ReplaceAll(got, []byte("\r\n"), []byte("\n")), []byte("\r"), []byte("\n"))
+								requireValidResponsesSSE(t, normalized, 2)
+							}
+						}
+						parts := make([][]byte, len(input))
+						for i := range input {
+							parts[i] = input[i : i+1]
+						}
+						if got := functionalProtocolParts(t, format, parts...); !bytes.Equal(got, want) {
+							t.Fatalf("bytewise output=%q, want %q", got, want)
+						}
+					})
+				}
+			}
+			t.Run(format+"/"+field+"/forwarder", func(t *testing.T) {
+				input := []byte("{\"model\":\"upstream\"}\n" + field + "\ndata: {\"model\":\"upstream\"}\n\n")
+				want := []byte("data: {\"model\":\"client\"}\n\n" + field + "\ndata: {\"model\":\"client\"}\n\n")
+				for _, split := range []int{0, 22, len(input)} {
+					if got := functionalForwardProtocolParts(t, format, input[:split], input[split:]); !bytes.Equal(got, want) {
+						t.Fatalf("split=%d output=%q, want %q", split, got, want)
+					}
+				}
+				parts := make([][]byte, len(input))
+				for i := range input {
+					parts[i] = input[i : i+1]
+				}
+				if got := functionalForwardProtocolParts(t, format, parts...); !bytes.Equal(got, want) {
+					t.Fatalf("bytewise forwarder output=%q, want %q", got, want)
+				}
+			})
+		}
+	}
+}
+
+func TestFunctionalUnknownSSEMetadataEOF(t *testing.T) {
+	for _, format := range []string{"openai-response", "claude", "interactions"} {
+		for _, metadata := range []string{"id: cursor", "retry: 1000", ": keep", "x-vendor-field: keep"} {
+			for _, field := range []string{"true", "false", "null", "123", `"scalar"`, "-1"} {
+				for _, lineEnd := range []string{"\n", "\r\n", "\r"} {
+					for _, delimiter := range []bool{false, true} {
+						t.Run(fmt.Sprintf("%s/%s/%s/%q/delimiter=%v", format, metadata, field, lineEnd, delimiter), func(t *testing.T) {
+							input := []byte("data: {\"model\":\"upstream\"}" + lineEnd + lineEnd + field + lineEnd + metadata + lineEnd)
+							want := []byte("data: {\"model\":\"client\"}" + lineEnd + lineEnd + field + lineEnd + metadata + lineEnd)
+							if delimiter {
+								input = append(input, lineEnd...)
+								want = append(want, lineEnd...)
+							}
+							for split := 0; split <= len(input); split++ {
+								for _, next := range []int{split, min(split+1, len(input))} {
+									if got := functionalProtocolParts(t, format, input[:split], input[split:next], input[next:]); !bytes.Equal(got, want) {
+										t.Fatalf("splits=%d,%d output=%q, want %q", split, next, got, want)
+									}
+								}
+							}
+							parts := make([][]byte, len(input))
+							for i := range input {
+								parts[i] = input[i : i+1]
+							}
+							if got := functionalProtocolParts(t, format, parts...); !bytes.Equal(got, want) {
+								t.Fatalf("bytewise output=%q, want %q", got, want)
+							}
+						})
+					}
+				}
+			}
+			t.Run(format+"/"+metadata+"/forwarder", func(t *testing.T) {
+				input := []byte("data: {\"model\":\"upstream\"}\n\ntrue\n" + metadata + "\n")
+				want := []byte("data: {\"model\":\"client\"}\n\ntrue\n" + metadata + "\n")
+				for _, split := range []int{0, 28, len(input)} {
+					if got := functionalForwardProtocolParts(t, format, input[:split], input[split:]); !bytes.Equal(got, want) {
+						t.Fatalf("split=%d output=%q, want %q", split, got, want)
+					}
+				}
+				parts := make([][]byte, len(input))
+				for i := range input {
+					parts[i] = input[i : i+1]
+				}
+				if got := functionalForwardProtocolParts(t, format, parts...); !bytes.Equal(got, want) {
+					t.Fatalf("bytewise forwarder output=%q, want %q", got, want)
+				}
+			})
+		}
+	}
+}
+
+func TestFunctionalRawJSONFlushRetainsMetadataSuffix(t *testing.T) {
+	for _, format := range []string{"openai-response", "claude", "interactions"} {
+		for _, suffix := range []string{"true\nid: cursor\n", "false\nretry: 1000\n", "null\n: keep\n"} {
+			t.Run(format+"/"+suffix, func(t *testing.T) {
+				r := newStreamChunkRewriter("client")
+				r.format, r.frameRawJSONAsSSE = format, true
+				chunks, err := r.rawJSONChunks([]byte("{\"model\":\"upstream\"}\n" + suffix))
+				if err != nil {
+					t.Fatal(err)
+				}
+				flushed, flushErr := r.Flush()
+				want := "data: {\"model\":\"client\"}\n\n" + suffix
+				if got := string(bytes.Join(append(chunks, flushed...), nil)); flushErr != nil || got != want {
+					t.Fatalf("output=%q error=%v, want %q", got, flushErr, want)
+				}
+			})
+		}
+	}
+}
+
+func TestFunctionalRawScalarEOFPartitions(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{"true", "data: true\n\n"},
+		{"false", "data: false\n\n"},
+		{"null", "data: null\n\n"},
+		{"123", "data: 123\n\n"},
+		{"-1", "data: -1\n\n"},
+		{"1.5", "data: 1.5\n\n"},
+		{`"scalar"`, "data: \"scalar\"\n\n"},
+		{`"opaque: data: event: upstream"`, "data: \"opaque: data: event: upstream\"\n\n"},
+		{`{"model":"upstream"} true`, "data: {\"model\":\"client\"}\n\ndata: true\n\n"},
+		{`{"model":"upstream"} "scalar"`, "data: {\"model\":\"client\"}\n\ndata: \"scalar\"\n\n"},
+		{`{"model":"upstream"} 123 {"model":"upstream"}`, "data: {\"model\":\"client\"}\n\ndata: 123\n\ndata: {\"model\":\"client\"}\n\n"},
+	}
+	for _, format := range []string{"openai-response", "claude", "interactions"} {
+		for _, tc := range cases {
+			t.Run(format+"/"+tc.input, func(t *testing.T) {
+				input := []byte(tc.input)
+				for split := 0; split <= len(input); split++ {
+					if got := string(functionalProtocolParts(t, format, input[:split], input[split:])); got != tc.want {
+						t.Fatalf("split=%d output=%q, want %q", split, got, tc.want)
+					}
+				}
+				parts := make([][]byte, len(input))
+				for i := range input {
+					parts[i] = input[i : i+1]
+				}
+				if got := string(functionalProtocolParts(t, format, parts...)); got != tc.want {
+					t.Fatalf("bytewise output=%q, want %q", got, tc.want)
+				}
+			})
+		}
+	}
+}

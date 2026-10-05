@@ -5500,7 +5500,7 @@ func TestStreamChunkRewriterRawJSONUsesOneRestorePass(t *testing.T) {
 }
 
 func legacyRawJSONChunksForTest(r *streamChunkRewriter, p []byte) ([][]byte, error) {
-	values, _, ok, _ := splitJSONValues(p)
+	values, _, ok, _ := splitJSONValues(p, false, true)
 	if !ok {
 		return [][]byte{bytes.Clone(p)}, nil
 	}
@@ -6083,7 +6083,7 @@ func TestSplitJSONValuesKeepsDecoderOwnedPayload(t *testing.T) {
 		}
 	}
 	productionAllocs := testing.AllocsPerRun(50, func() {
-		values, _, ok, _ := splitJSONValues(input)
+		values, _, ok, _ := splitJSONValues(input, false, true)
 		if !ok || len(values) != 64 {
 			panic(fmt.Sprintf("splitJSONValues=(%d,%v)", len(values), ok))
 		}
