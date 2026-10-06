@@ -215,6 +215,10 @@ func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
 			if strings.HasPrefix(eventType, "response.") {
 				// dataStart == headerScan 记录 callback 间缺少的 LF；验证后才补写。
 				s.eventType, s.dataStart, s.headerComplete = eventType, s.headerScan, true
+				if strings.IndexFunc(eventType, unicode.IsSpace) >= 0 {
+					// opaque metadata 不是单个 type token；独立 data 单位单独验证。
+					s.eventType = ""
+				}
 			}
 		}
 	}
@@ -689,7 +693,7 @@ func (r *sseRewriter) findDelimiterlessResponsesEventEnd(eof bool) (int, bool) {
 			var typed struct {
 				Type string `json:"type"`
 			}
-			matched = json.Unmarshal(value, &typed) == nil && (s.dataStart > 0 && typed.Type == s.eventType || s.dataStart == 0 && strings.HasPrefix(typed.Type, "response."))
+			matched = json.Unmarshal(value, &typed) == nil && (s.eventType != "" && typed.Type == s.eventType || s.eventType == "" && strings.HasPrefix(typed.Type, "response."))
 		case "interactions":
 			if s.eventType == "done" {
 				matched = bytes.Equal(bytes.TrimSpace(value), []byte("[DONE]"))

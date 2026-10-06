@@ -570,6 +570,194 @@ func TestFunctionalNativeSSEFieldResponsesMetadataControl(t *testing.T) {
 	}
 }
 
+func gNativeMetadataCases() []struct {
+	name                   string
+	header, terminal, want []byte
+} {
+	parts, _, _ := gNativeFields(false, 2)
+	joined := bytes.Join(parts, nil)
+	resegmented := bytes.Join(parts[:3], nil)
+	return []struct {
+		name                   string
+		header, terminal, want []byte
+	}{
+		{"host-no-LF", joined, bytes.Clone(parts[3]), append(bytes.Clone(joined), []byte("\ndata: "+gNativeCompletedWant+"\n\n")...)},
+		{"resegmented", resegmented, append(bytes.Clone(parts[3]), '\n', '\n'), append(bytes.Clone(resegmented), []byte("\ndata: "+gNativeCompletedWant+"\n\n")...)},
+		{"delimited-control", append(bytes.Clone(joined), '\n', '\n'), append(bytes.Clone(parts[3]), '\n', '\n'), append(bytes.Clone(joined), []byte("\n\ndata: "+gNativeCompletedWant+"\n\n")...)},
+	}
+}
+
+func gRequireMetadataTerminal(t *testing.T, got, want []byte) {
+	t.Helper()
+	if !bytes.Equal(got, want) {
+		t.Fatalf("metadata/terminal output=%q want=%q", got, want)
+	}
+	// metadata 内嵌的 event/data/model 保持原文，仅检查真正的 data 行。
+	var data []byte
+	for rest := got; len(rest) > 0; {
+		line, _, next := splitSSELine(rest)
+		rest = next
+		if bytes.HasPrefix(line, []byte("data:")) {
+			if data != nil {
+				t.Fatal("unexpected extra data field")
+			}
+			data = append(bytes.Clone(line), '\n', '\n')
+		}
+	}
+	gRequireNativeFrames(t, data, []string{"response.completed"}, true)
+}
+
+func TestFunctionalNativeSSEFieldMetadataOutputUnits(t *testing.T) {
+	for _, tc := range gNativeMetadataCases() {
+		for _, finish := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/finish=%v", tc.name, finish), func(t *testing.T) {
+				r := newStreamChunkRewriter("grok-4.6")
+				r.format, r.frameRawJSONAsSSE = "openai-response", true
+				var out [][]byte
+				for _, input := range [][]byte{tc.header, tc.terminal} {
+					part := bytes.Clone(input)
+					chunks, err := r.Write(part)
+					if err != nil {
+						t.Fatal(err)
+					}
+					out = append(out, chunks...)
+					for i := range part {
+						part[i] = 'z'
+					}
+				}
+				var chunks [][]byte
+				var err error
+				if finish {
+					chunks, err = r.Finish()
+				} else {
+					chunks, err = r.Flush()
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				out = append(out, chunks...)
+				gRequireMetadataTerminal(t, bytes.Join(out, nil), tc.want)
+				if _, err := r.Write([]byte("data: {}\n\n")); err != nil {
+					t.Fatal(err)
+				}
+				gRequireMetadataTerminal(t, bytes.Join(out, nil), tc.want)
+			})
+		}
+	}
+}
+
+func TestFunctionalNativeSSEFieldMetadataForwarder(t *testing.T) {
+	for _, tc := range gNativeMetadataCases() {
+		for _, terminal := range []string{"natural", "done-payload", "in-band-error", "callback-error", "cleanup-errors", "emit-error"} {
+			t.Run(tc.name+"/"+terminal, func(t *testing.T) {
+				reads := []pluginapi.HostModelStreamReadResponse{{Payload: tc.header}, {Payload: tc.terminal}, {Done: true}}
+				if terminal == "done-payload" {
+					reads[1].Done = true
+				}
+				if terminal == "in-band-error" || terminal == "cleanup-errors" {
+					reads[1].Error, reads[1].Done = "controlled upstream read error", true
+				}
+				readErr := errors.New("controlled callback read error")
+				hostErr := errors.New("controlled host close error")
+				pluginErr := errors.New("controlled plugin close error")
+				emitErr := errors.New("controlled emit error")
+				var emitted []byte
+				var closeText string
+				var order []string
+				readCount, hostCloses, pluginCloses := 0, 0, 0
+				stream := &executorStream{pluginStreamID: "g-metadata", hostStreamID: "g-host", originalModel: "grok-4.6", format: "openai-response", frameRawJSONAsSSE: true}
+				stream.call = func(method string, payload any) (json.RawMessage, error) {
+					switch method {
+					case pluginabi.MethodHostModelStreamRead:
+						readCount++
+						if terminal == "callback-error" && readCount == 3 {
+							return nil, readErr
+						}
+						if len(reads) == 0 {
+							return nil, errors.New("unexpected extra host read")
+						}
+						read := reads[0]
+						reads = reads[1:]
+						return json.Marshal(read)
+					case pluginabi.MethodHostStreamEmit:
+						order = append(order, "emit")
+						raw, err := json.Marshal(payload)
+						if err != nil {
+							return nil, err
+						}
+						var emit struct{ Payload []byte }
+						if err := json.Unmarshal(raw, &emit); err != nil {
+							return nil, err
+						}
+						emitted = append(emitted, emit.Payload...)
+						if terminal == "emit-error" && hasSSEDataField(emit.Payload) {
+							return nil, emitErr
+						}
+					case pluginabi.MethodHostModelStreamClose:
+						hostCloses++
+						order = append(order, "host-close")
+						if terminal == "cleanup-errors" {
+							return nil, hostErr
+						}
+					case pluginabi.MethodHostStreamClose:
+						pluginCloses++
+						order = append(order, "plugin-close")
+						raw, err := json.Marshal(payload)
+						if err != nil {
+							return nil, err
+						}
+						var closed struct{ Error string }
+						if err := json.Unmarshal(raw, &closed); err != nil {
+							return nil, err
+						}
+						closeText = closed.Error
+						if terminal == "cleanup-errors" {
+							return nil, pluginErr
+						}
+					default:
+						return nil, fmt.Errorf("unexpected callback %s", method)
+					}
+					return json.RawMessage(`{}`), nil
+				}
+				err := runStreamForward(stream)
+				gRequireMetadataTerminal(t, emitted, tc.want)
+				wantOrder := "emit,host-close,plugin-close"
+				if tc.name == "delimited-control" {
+					wantOrder = "emit," + wantOrder
+				}
+				if terminal == "callback-error" {
+					wantOrder = strings.TrimSuffix(wantOrder, ",plugin-close")
+				}
+				if strings.Join(order, ",") != wantOrder || hostCloses != 1 {
+					t.Fatalf("order=%v host closes=%d want=%s", order, hostCloses, wantOrder)
+				}
+				switch terminal {
+				case "callback-error":
+					if !errors.Is(err, readErr) || pluginCloses != 0 || readCount != 3 {
+						t.Fatalf("error=%v plugin closes=%d reads=%d", err, pluginCloses, readCount)
+					}
+				case "cleanup-errors":
+					if !errors.Is(err, hostErr) || !errors.Is(err, pluginErr) || !strings.Contains(closeText, "controlled upstream read error") || !strings.Contains(closeText, hostErr.Error()) || pluginCloses != 1 || readCount != 2 {
+						t.Fatalf("error=%v close=%q plugin closes=%d reads=%d", err, closeText, pluginCloses, readCount)
+					}
+				default:
+					wantError, wantReads := "", 2
+					if terminal == "natural" {
+						wantReads = 3
+					} else if terminal == "in-band-error" {
+						wantError = "controlled upstream read error"
+					} else if terminal == "emit-error" {
+						wantError = "emit stream chunk: " + emitErr.Error()
+					}
+					if err != nil || closeText != wantError || pluginCloses != 1 || readCount != wantReads {
+						t.Fatalf("error=%v close=%q plugin closes=%d reads=%d", err, closeText, pluginCloses, readCount)
+					}
+				}
+			})
+		}
+	}
+}
+
 func gNativeLargeFixture(size int, dataOnly bool) ([][]byte, []byte) {
 	value := `{"type":"response.output_text.done","response":{"model":"grok-4.7"},"text":"` + strings.Repeat("x", size) + `","opaque":{"text":"grok-4.7 中文","n":1.00}}`
 	wantValue := `{"type":"response.output_text.done","response":{"model":"grok-4.6"},"text":"` + strings.Repeat("x", size) + `","opaque":{"text":"grok-4.7 中文","n":1.00}}`
