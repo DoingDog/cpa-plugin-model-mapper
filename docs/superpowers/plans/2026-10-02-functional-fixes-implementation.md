@@ -4,7 +4,7 @@
 
 **Goal:** 修复普通规则错误处理、JSON 内容保持、流协议和 shutdown 问题，并用永久 unit 与 actual CPA integration 证明基线失败、修复通过。
 
-**Architecture:** 保持单 package 和 `main.go` 现有产品结构。共享 JSON 改写器用标准库定位原始 value spans；共享 stream rewriter 保留完整单位、错误和现有协议边界；生命周期使用现有同步点选择 terminal 结果。A、B、D 独立 worktree 并行，C 的共享 fixture 编码依赖 B。C 最终已验证提交 -> G 有限接口核查、语义条件满足后的必要完整 TDD／审查／提交 -> E 全部永久 actual 验收 -> F 发布。G2 未满足时停止产品编码，E/F 不放行。
+**Architecture:** 保持单 package 和 `main.go` 现有产品结构。共享 JSON 改写器用标准库定位原始 value spans；共享 stream rewriter 保留完整单位、错误和现有协议边界；生命周期使用现有同步点选择 terminal 结果。A、B、D 独立 worktree 并行，C 的共享 fixture 编码依赖 B。固定 C 最终审查提交 -> 本输入层级规格修正独立审查通过 -> G 有限接口核查、必要完整 TDD／审查／提交 -> E 全部永久 actual 验收 -> F 发布。本输入层级规格修正须独立审查通过后启动 G；G/E 永久验收未完成时 E/F 不放行。
 
 **Tech Stack:** Go `1.26.0`，`encoding/json`，现有 cgo ABI，CPA `v7.2.152`，现有 Go tests、Makefile 和 GitHub Actions。
 
@@ -46,14 +46,14 @@
 | B | 修改 `main.go:2256-2728` 的 JSON 相关函数；创建 `json_rewrite_regression_test.go`；修改 `main_test.go` 中必须保序的旧 expected bytes。 | 负责全部 JSON 保序 fixture，不修改 SSE marker scanner、framing 或 emission 次数。独立达到 root GREEN 后提交。 |
 | C | 修改 `main.go:32-1214`，`emitRewritten`、`prepareExecutorStream`、`processPayload`、`flushAndEmit`；创建 `stream_protocol_regression_test.go`；修改 `main_test.go` 的协议职责 fixture、必要 `performance_regression_test.go`、`README.md:180-205`。 | 可提前分析和准备独立 RED；共享 fixture 编码从 B 已验证提交开始。不得改 D 的 struct/terminal 函数。 |
 | D | 修改 `executorStream` 生命周期字段、生命周期函数、`closeHost`、`closePlugin`、`startExecutorStream`、`finish`、`runStreamForward`；创建 `stream_lifecycle_regression_test.go`；必要时修改 `main_test.go` 的生命周期测试。 | 与 A、B 并行；不得改 C 的 payload/flush 函数。 |
-| G | 修改 C 最终 HEAD 上共享 `streamChunkRewriter.Write/Flush/Finish`、`sseRewriter.Write/drain`、delimiterless scanner/reset/classification 的 F15 必要部分；创建 `stream_native_fields_regression_test.go`；必要协议／性能 fixture。 | 等 C 连续完成独立审查、修正、复审与提交，固定该最终 SHA 为 reviewBASE；有限核查 G2 后才决定是否可编码。只消费 C 的 `batchSSEOutput`、framing/batching 和 chunks+error，不改 C executor helper 或 A/B/D。缺可靠区分信息时停止；满足后连续完成必要 TDD、全部测试／性能、审查、修正、复审和提交。 |
+| G | 修改 C 最终 HEAD 上共享 `streamChunkRewriter.Write/Flush/Finish`、`sseRewriter.Write/drain`、delimiterless scanner/reset/classification 的 F15 必要部分；创建 `stream_native_fields_regression_test.go`；必要协议／性能 fixture。 | 等 C 连续完成独立审查、修正、复审与提交，产品 reviewBASE 固定 `51b006438c1a0edd4263020297747f99a174c47c`；执行起点由协调者交付包含全部已整合修复的 HEAD，规格修正独立审查通过后有限核查 G2。只消费 C 的 `batchSSEOutput`、framing/batching 和 chunks+error，不改 C executor helper 或 A/B/D。同一实际入口出现可靠相反要求时停止；其余连续完成必要 TDD、全部测试／性能、审查、修正、复审和提交。 |
 | E | 修改 `.github/scripts/smoke-local_test.go`；创建唯一的 `.github/scripts/testdata/cpa-functional-regression_test.go`；仅在实际入口变化时改 `Makefile`、`.github/workflows/build.yml`。 | 依赖已合并 A/B/C/D/G，在单独 worktree 完成实际 CPA RED/GREEN、全部终验和独立覆盖审查。F15 baseline 固定 `6c7f060`，F01..F14 原 baseline 保持。 |
 
 B 的已知保序 fixture 包括 `TestRestoreResponseModelFastPathPreservesEscapedSemantics`、`TestStreamChunkRewriterFramesRawJSONBeforeSSEDoneInSameWrite`、`TestStreamChunkRewriterFramesRawJSONBeforeSSEDoneAcrossPartitions`、`BenchmarkSSEMarkerGuardRestore`、`BenchmarkSSEMarkerGuardCandidate`（`main_test.go:2332-2369`），以及全量 suite 显示仅因原 map 排序或 escaped key 归一化而过时的 exact-byte 测试。B 对这些 fixture 保持同样输入、同样 framing/opaque/ownership 断言，只更改新的精确字节表示。两个 benchmark 不随 root tests 运行，B 必须独立运行其 byte-exact preflight 并达到 GREEN 后交给 C/E。
 
 C 的职责 fixture 包括 `TestHandleExecutorExecuteStreamReturnsPreparedHostHeaders`、`TestRunStreamForwardTerminatesReframedOpenAIChat`、`TestRunStreamForwardProcessesTerminalPayload`、`TestRunStreamForwardBatchesOnlySSEOutput`。B 若必须修改这些测试中的 JSON 字节，先完成保序部分并提交，C 从该提交开始修改 framing/emit 部分。任何同一测试的双重修改都按此依赖执行；函数边界不代替 fixture 依赖。
 
-G 的共享函数修改必须从协调者主动交付的 C 最终完整审查提交开始，不读取或轮询 C 在修改 worktree。只有限核查交付 HEAD 的 Write 分发、scanner/reset、drain 候选提交、complete/incomplete 限额和 batching/chunks+error。G2 语义检查未满足时停止产品编码，不能以全部积存到 EOF 或启发式取得产品 GREEN。
+G 的共享函数修改从协调者主动交付的完整整合 HEAD 开始，确认它包含固定 C 最终审查提交 `51b006438c1a0edd4263020297747f99a174c47c` 及全部已整合修复；产品 reviewBASE 固定该 C SHA，最终 review 覆盖 C..G 最终 HEAD 全部累计范围并明确文档范围。不读取或轮询其他在修改 worktree。只有限核查交付 HEAD 的 Write 分发、scanner/reset、drain 候选提交、complete/incomplete 限额和 batching/chunks+error。G2 按现行 output-unit 消费语义核查实际入口；规格修正未独立审查通过，或同一实际入口出现可靠相反要求时停止产品编码。不能以全部积存到 EOF 或启发式取得产品 GREEN。
 
 ## Task A：运行期空结果交给 executor
 
@@ -865,15 +865,15 @@ func TestFunctionalShutdownLifecycleReset(t *testing.T) {
 
 ## Task G：native SSE field boundary，F15
 
-> For agentic workers：沿用既定 workflow 分工。产品任务在独立分配 worktree 连续完成测试、实现、审查、修正、复审和提交。补充草稿与回归已独立复审并整合，G2 产品语义条件尚未满足；本阶段仅允许 G1/G2 有限核查和回归，缺可靠区分信息时停止产品编码。
+> For agentic workers：沿用既定 workflow 分工。产品任务在独立分配 worktree 连续完成测试、实现、审查、修正、复审和提交。本输入层级规格修正须独立审查通过后启动 G。G1/G2 按固定 CPA 正常无 mapper 消费链核查 callback 单位、顺序和时机，再连续完成必要完整 TDD 与验收；同一实际入口出现可靠相反要求时停止产品编码。产品尚未修复。
 
 **Goal：**覆盖并修复 F15 的 field-pair 与多事件 data-only 共用边界问题，同时保留单 terminal data-only、普通 SSE 分片和完整内容。
 
-**Architecture：**使用共享 rewriter/scanner、现有增量状态、SSE helpers 与 encoding/json。候选记录和不可逆派发分开处理。G2 必须先通过同前缀/迟到 delimiter 的接口语义检查点；不满足时停止产品修改并交回具体冲突。
+**Architecture：**使用共享 rewriter/scanner、现有增量状态、SSE helpers 与 encoding/json。按既有 format 和调用入口保持 Responses output-unit 语义，generic 连续 wire 保持合法字节分片和标准 delimiter。完整值验证、候选记录与派发分别明确时点；G2 核对原 validator 及对应 HTTP/WS 消费者。同一实际入口出现可靠相反要求时停止并交回具体冲突。
 
 **使用的技术：**Go >=1.26.0，现有 encoding/json，固定 CPA v7.2.152 与 c-shared 插件。没有新产品依赖或配置。
 
-**Spec：**`docs/superpowers/specs/2026-10-02-functional-fixes-design.md` 中 G/F15 的绑定规格。完整草稿来源为 `C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/functional-fixes-20261002/.superpowers/sdd/2026-10-02-functional-fixes-implementation/task-G-native-fields-design-1.json`，SHA-256 `4cc5cdb512e520af2fcdc2486af640fa00e5c510acda28e5ac6e5b2fd2922b72`；独立复审为同目录 `task-G-native-fields-plan-review-1.json`（approved=true、findings=[]），批准范围仅为草稿。以下设计核验结果来自该草稿和复审，文档整合未重跑产品测试。
+**Spec：**`docs/superpowers/specs/2026-10-02-functional-fixes-design.md` 中 G/F15 的绑定规格。完整草稿来源为 `C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/functional-fixes-20261002/.superpowers/sdd/2026-10-02-functional-fixes-implementation/task-G-native-fields-design-1.json`，SHA-256 `4cc5cdb512e520af2fcdc2486af640fa00e5c510acda28e5ac6e5b2fd2922b72`；独立复审为同目录 `task-G-native-fields-plan-review-1.json`（approved=true、findings=[]），批准范围仅为草稿。当前输入层级与派发要求依据同一协调目录的 `task-G-consumer-semantic-verification.json`（verified=true）；原草稿和复审保留为历史依据，本次完整更正草稿与实际命令结果单独记录。
 
 ### Global Constraints
 
@@ -889,7 +889,7 @@ func TestFunctionalShutdownLifecycleReset(t *testing.T) {
 ### Review Focus
 
 1. field-pair 与 data-only 两/九事件必须同时通过；单 terminal data-only 正常不能代替多事件。G1 的 Sequence 和 DataOnlyTerminalControl 分别断言。
-2. 普通单 event field 可以包含两个 canonical field-pair 字符串，并分四次 Write 后才收到标准 delimiter。G1 的 LateDelimiter whole/全部 split/延迟 LF、CRLF 控制必须保留原文且 delimiter 前不 emit；LateDataDelimiter 保留普通 data 字符串。
+2. G1 GenericCanonicalControls 在 generic 连续 wire 入口检查 canonical 拼接 event/data field 的 whole、全部双分片、单字节及迟到 delimiter 原文。Responses LateDelimiter 按四 callback 累计 `0、1、1、2` 派发，LateDataDelimiter/Dispatch 检查下一独立 data 派发前值、Flush 派发末值；whole event-only metadata 后接真正 completed 的正常控制保留。
 3. header 候选已记录后不得重扫整个 JSON。Continuation/ContinuationAllocations 与 2 MiB、8 MiB、8 KiB benchmark 检查模型、opaque、输出长度、ownership 与扫描成本。
 4. 完整大单位和 overflow tail 分开检查；Limit 的每个 complete/incomplete subtest 独立运行，不因首个 RED 跳过控制。EOF、错误和 close 由 Forwarder 及 C/D 既有控制覆盖。
 5. 根 callback mock、真实 core/host producer、native DLL、实际 Responses HTTP framer 分层记录。G4 的完整 CPA 代码和 E 唯一入口验证两种 builtin、两种形状、全部 route 与非流，不用 callback mock 代替实际链路。
@@ -907,19 +907,21 @@ G 的源文件位置以其分配的绝对 worktree 根目录为准。当前固�
 
 ### G1：固定起点、完整 focused 回归与归属
 
-- [ ] 等待协调者主动交付 C 最终完整审查提交、SHA 和完成通知。由既定 workflow 分配 G 的独立 worktree，不读取其他在修改目录。检查 worktree clean、实际 HEAD 等于交付 SHA，将该完整 SHA 写入 review receipt。
+- [ ] 等待本输入层级规格修正独立审查通过及协调者主动交付完整整合 HEAD。由既定 workflow 分配 G 的独立 worktree，核查根目录、branch、clean 和实际 HEAD 等于交付 SHA，确认固定 C=`51b006438c1a0edd4263020297747f99a174c47c` 为 ancestor。产品 reviewBASE 固定该 C SHA，起点 SHA 另记，最终 review 使用固定 C..G 全部最终 HEAD，明确文档范围。不读取其他在修改目录。
 
-以下命令在 G 分配 worktree 执行，Git Bash 变量仅在同一调用有效；多次调用重新给 G/reviewBASE 赋相同值。
+以下命令在 G 分配 worktree 执行，Git Bash 变量仅在同一调用有效；多次调用重新给 G/reviewBASE/startHEAD 赋最初记录的相同值，startHEAD 不随产品修改更新。
 
 ```bash
 G=$(git rev-parse --show-toplevel)
-reviewBASE=$(git -C "$G" rev-parse HEAD)
+reviewBASE=51b006438c1a0edd4263020297747f99a174c47c
+startHEAD=$(git -C "$G" rev-parse HEAD)
+git -C "$G" merge-base --is-ancestor "$reviewBASE" "$startHEAD"
 git -C "$G" status --short
 git -C "$G" log -1 --format='%H %s'
 go -C "$G" version
 ```
 
-- [ ] 重新核对 C 最终 HEAD 的有限位置：Write 向 sse.Write 分发及格式设置；scanner header/data/typed-complete 状态及 reset；drain 的标准 delimiter/logical 候选选择与提交；complete/incomplete 限额；batchSSEOutput 和 processPayload/flushAndEmit 的 chunks+error 消费。固定设计源对应 main.go:32..1214、1656..1685、1982..2013。不复制未交付 C 的函数，不重新全仓审计。
+- [ ] 在完整整合起点重新核对 C 交付接口的有限位置：Write 向 sse.Write 分发及格式设置；scanner header/data/typed-complete 状态及 reset；drain 的标准 delimiter/logical 候选选择与提交；complete/incomplete 限额；batchSSEOutput 和 processPayload/flushAndEmit 的 chunks+error 消费。固定设计源对应 main.go:32..1214、1656..1685、1982..2013。不复制未交付 C 的函数，不重新全仓审计。
 - [ ] 加入下列完整、已编译的 root Go 回归文件。现有 requireValidResponsesSSE、splitSSELine、sseFieldValue、newStreamChunkRewriter、runStreamForward 均为固定源码真实符号，其他 gNative helpers 在本文件定义。C 如已有同输入、同断言的回归，复用并补足缺失矩阵，不重复定义。
 
 ```go
@@ -1102,7 +1104,7 @@ func TestFunctionalNativeSSEFieldWireControls(t *testing.T) {
 		input := []byte("event: response.completed" + eol + "data: " + gNativeCompleted + eol + "id: event-1" + eol + "retry: 100" + eol + "x-vendor-field: grok-4.7" + eol + ": opaque grok-4.7" + eol + eol)
 		want := []byte("event: response.completed" + eol + "data: " + gNativeCompletedWant + eol + "id: event-1" + eol + "retry: 100" + eol + "x-vendor-field: grok-4.7" + eol + ": opaque grok-4.7" + eol + eol)
 		for split := 0; split <= len(input); split++ {
-			got := gNativeParts(t, "openai-response", true, input[:split], input[split:])
+			got := gNativeParts(t, "claude", true, input[:split], input[split:])
 			if !bytes.Equal(got, want) {
 				t.Fatalf("eol=%q split=%d output=%q, want %q", eol, split, got, want)
 			}
@@ -1111,18 +1113,18 @@ func TestFunctionalNativeSSEFieldWireControls(t *testing.T) {
 		for i := range input {
 			parts[i] = input[i : i+1]
 		}
-		if got := gNativeParts(t, "openai-response", true, parts...); !bytes.Equal(got, want) {
+		if got := gNativeParts(t, "claude", true, parts...); !bytes.Equal(got, want) {
 			t.Fatalf("eol=%q bytewise output differs", eol)
 		}
 	}
 	literal := []byte("event: response.completeddata: " + gNativeCompleted + "\n\n")
 	for split := 0; split <= len(literal); split++ {
-		if got := gNativeParts(t, "openai-response", true, literal[:split], literal[split:]); !bytes.Equal(got, literal) {
+		if got := gNativeParts(t, "claude", true, literal[:split], literal[split:]); !bytes.Equal(got, literal) {
 			t.Fatalf("literal event value split=%d changed to %q", split, got)
 		}
 	}
 	r := newStreamChunkRewriter("grok-4.6")
-	r.format, r.frameRawJSONAsSSE = "openai-response", true
+	r.format, r.frameRawJSONAsSSE = "claude", true
 	if chunks, err := r.Write([]byte("event: response.completed\ndata: " + gNativeCompleted)); err != nil || len(chunks) != 0 {
 		t.Fatalf("ordinary pre-metadata output=%q error=%v", chunks, err)
 	}
@@ -1316,50 +1318,159 @@ func TestFunctionalNativeSSEFieldDataOnlyTerminalControl(t *testing.T) {
 	}
 }
 
-func TestFunctionalNativeSSEFieldLateDelimiter(t *testing.T) {
-	parts, _, _ := gNativeFields(false, 2)
-	for _, eol := range []string{"\n", "\r\n"} {
-		literal := append(bytes.Join(parts, nil), []byte(eol+eol)...)
-		if got := gNativeParts(t, "openai-response", true, literal); !bytes.Equal(got, literal) {
-			t.Fatalf("whole literal event field changed: %q", got)
-		}
-		for split := 0; split <= len(literal); split++ {
-			if got := gNativeParts(t, "openai-response", true, literal[:split], literal[split:]); !bytes.Equal(got, literal) {
-				t.Fatalf("eol=%q split=%d literal event field changed: %q", eol, split, got)
-			}
-		}
-		r := newStreamChunkRewriter("grok-4.6")
-		r.format, r.frameRawJSONAsSSE = "openai-response", true
-		for i, part := range parts {
-			if chunks, err := r.Write(part); err != nil || len(chunks) != 0 {
-				t.Fatalf("eol=%q write=%d dispatched before standard delimiter: chunks=%q error=%v", eol, i, chunks, err)
-			}
-		}
-		chunks, err := r.Write([]byte(eol + eol))
-		if err != nil || !bytes.Equal(bytes.Join(chunks, nil), literal) {
-			t.Fatalf("eol=%q delayed delimiter output=%q error=%v", eol, chunks, err)
-		}
-		flushed, err := r.Finish()
-		if err != nil || len(flushed) != 0 {
-			t.Fatalf("literal finish=(%q,%v)", flushed, err)
-		}
-		line, _, remaining := splitSSELine(literal)
-		if !bytes.HasPrefix(line, []byte("event:")) || hasSSEDataField(line) || hasSSEDataField(remaining) {
-			t.Fatal("control must be one event field with zero data fields")
+func TestFunctionalNativeSSEFieldGenericCanonicalControls(t *testing.T) {
+	for _, dataOnly := range []bool{false, true} {
+		parts, _, _ := gNativeFields(dataOnly, 2)
+		for _, eol := range []string{"\n", "\r\n", "\r"} {
+			t.Run(fmt.Sprintf("dataOnly=%v/eol=%q", dataOnly, eol), func(t *testing.T) {
+				literal := append(bytes.Join(parts, nil), []byte(eol+eol)...)
+				if got := gNativeParts(t, "claude", true, literal); !bytes.Equal(got, literal) {
+					t.Fatalf("whole generic field changed: %q", got)
+				}
+				for split := 0; split <= len(literal); split++ {
+					if got := gNativeParts(t, "claude", true, literal[:split], literal[split:]); !bytes.Equal(got, literal) {
+						t.Fatalf("split=%d generic field changed: %q", split, got)
+					}
+				}
+				bytewise := make([][]byte, len(literal))
+				for i := range literal {
+					bytewise[i] = literal[i : i+1]
+				}
+				if got := gNativeParts(t, "claude", true, bytewise...); !bytes.Equal(got, literal) {
+					t.Fatalf("bytewise generic field changed: %q", got)
+				}
+				r := newStreamChunkRewriter("grok-4.6")
+				r.format, r.frameRawJSONAsSSE = "claude", true
+				for i, part := range parts {
+					if chunks, err := r.Write(part); err != nil || len(chunks) != 0 {
+						t.Fatalf("generic write=%d chunks=%q error=%v", i, chunks, err)
+					}
+				}
+				chunks, err := r.Write([]byte(eol + eol))
+				if err != nil {
+					t.Fatal(err)
+				}
+				// 末尾 CR 仍可能组成 CRLF，Finish 确认该行结束符。
+				flushed, err := r.Finish()
+				got := bytes.Join(append(chunks, flushed...), nil)
+				if err != nil || !bytes.Equal(got, literal) {
+					t.Fatalf("generic delayed delimiter output=%q error=%v want=%q", got, err, literal)
+				}
+				if !dataOnly {
+					line, _, remaining := splitSSELine(literal)
+					if !bytes.HasPrefix(line, []byte("event:")) || hasSSEDataField(line) || hasSSEDataField(remaining) {
+						t.Fatal("generic control must be one event field with zero data fields")
+					}
+				}
+			})
 		}
 	}
 }
 
-func TestFunctionalNativeSSEFieldLateDataDelimiter(t *testing.T) {
-	parts, _, _ := gNativeFields(true, 2)
-	literal := append(bytes.Join(parts, nil), '\n', '\n')
-	for split := 0; split <= len(literal); split++ {
-		if got := gNativeParts(t, "openai-response", true, literal[:split], literal[split:]); !bytes.Equal(got, literal) {
-			t.Fatalf("single ordinary data field split=%d changed: %q", split, got)
+func TestFunctionalNativeSSEFieldDispatch(t *testing.T) {
+	for _, dataOnly := range []bool{false, true} {
+		for _, count := range []int{2, 9} {
+			t.Run(fmt.Sprintf("dataOnly=%v/count=%d", dataOnly, count), func(t *testing.T) {
+				parts, want, types := gNativeFields(dataOnly, count)
+				units := bytes.SplitAfter(want, []byte("\n\n"))[:count]
+				r := newStreamChunkRewriter("grok-4.6")
+				r.format, r.frameRawJSONAsSSE = "openai-response", true
+				var got []byte
+				for i, part := range parts {
+					chunks, err := r.Write(part)
+					if err != nil {
+						t.Fatal(err)
+					}
+					got = append(got, bytes.Join(chunks, nil)...)
+					frames := (i + 1) / 2
+					if dataOnly {
+						frames = i
+					}
+					if expected := bytes.Join(units[:frames], nil); !bytes.Equal(got, expected) {
+						t.Fatalf("write=%d want dataFrames=%d output=%q want=%q", i+1, frames, got, expected)
+					}
+				}
+				chunks, err := r.Flush()
+				got = append(got, bytes.Join(chunks, nil)...)
+				if err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("flush output=%q error=%v want=%q", got, err, want)
+				}
+				gRequireNativeFrames(t, got, types, dataOnly)
+			})
 		}
 	}
-	if got := gNativeParts(t, "openai-response", true, parts[0], parts[1], []byte("\n\n")); !bytes.Equal(got, literal) {
-		t.Fatalf("late ordinary data delimiter changed: %q", got)
+}
+
+func TestFunctionalNativeSSEFieldLateDelimiter(t *testing.T) {
+	parts, want, types := gNativeFields(false, 2)
+	units := bytes.SplitAfter(want, []byte("\n\n"))[:2]
+	for _, eol := range []string{"\n", "\r\n"} {
+		t.Run(fmt.Sprintf("eol=%q", eol), func(t *testing.T) {
+			r := newStreamChunkRewriter("grok-4.6")
+			r.format, r.frameRawJSONAsSSE = "openai-response", true
+			var got []byte
+			for i, part := range parts {
+				chunks, err := r.Write(part)
+				got = append(got, bytes.Join(chunks, nil)...)
+				if expected := bytes.Join(units[:(i+1)/2], nil); err != nil || !bytes.Equal(got, expected) {
+					t.Fatalf("callback=%d cumulative dataFrames=%d output=%q error=%v want=%q", i+1, (i+1)/2, got, err, expected)
+				}
+			}
+			chunks, err := r.Write([]byte(eol + eol))
+			if err != nil || len(bytes.TrimSpace(bytes.Join(chunks, nil))) != 0 {
+				t.Fatalf("late delimiter added output: chunks=%q error=%v", chunks, err)
+			}
+			flushed, err := r.Finish()
+			if err != nil || len(bytes.TrimSpace(bytes.Join(flushed, nil))) != 0 || !bytes.Equal(got, want) {
+				t.Fatalf("late delimiter finish=(%q,%v) data=%q", flushed, err, got)
+			}
+			gRequireNativeFrames(t, got, types, false)
+		})
+	}
+}
+
+func TestFunctionalNativeSSEFieldLateDataDelimiter(t *testing.T) {
+	parts, want, types := gNativeFields(true, 2)
+	first := bytes.SplitAfter(want, []byte("\n\n"))[0]
+	for _, eol := range []string{"\n", "\r\n"} {
+		t.Run(fmt.Sprintf("eol=%q", eol), func(t *testing.T) {
+			r := newStreamChunkRewriter("grok-4.6")
+			r.format, r.frameRawJSONAsSSE = "openai-response", true
+			chunks, err := r.Write(parts[0])
+			if err != nil || len(chunks) != 0 {
+				t.Fatalf("first data=(%q,%v)", chunks, err)
+			}
+			chunks, err = r.Write(parts[1])
+			got := bytes.Join(chunks, nil)
+			if err != nil || !bytes.Equal(got, first) {
+				t.Fatalf("next data dispatched=%q error=%v want=%q", got, err, first)
+			}
+			chunks, err = r.Write([]byte(eol + eol))
+			got = append(got, bytes.Join(chunks, nil)...)
+			flushed, flushErr := r.Flush()
+			got = append(got, bytes.Join(flushed, nil)...)
+			// delimiter 的行结束符可以保留；每个 data 单位及模型必须完整。
+			normalized := bytes.ReplaceAll(got, []byte("\r\n"), []byte("\n"))
+			if err != nil || flushErr != nil || !bytes.Equal(normalized, want) {
+				t.Fatalf("late data delimiter output=%q write=%v flush=%v want=%q", got, err, flushErr, want)
+			}
+			gRequireNativeFrames(t, normalized, types, true)
+		})
+	}
+}
+
+func TestFunctionalNativeSSEFieldResponsesMetadataControl(t *testing.T) {
+	parts, _, _ := gNativeFields(false, 2)
+	for _, eol := range []string{"\n", "\r\n"} {
+		literal := append(bytes.Join(parts, nil), []byte(eol+eol)...)
+		if got := gNativeParts(t, "openai-response", true, literal); !bytes.Equal(got, literal) {
+			t.Fatalf("whole event-only metadata changed: %q", got)
+		}
+		data := []byte("data: " + gNativeCompleted + eol + eol)
+		want := append(bytes.Clone(literal), []byte("data: "+gNativeCompletedWant+eol+eol)...)
+		if got := gNativeParts(t, "openai-response", true, literal, data); !bytes.Equal(got, want) {
+			t.Fatalf("metadata then real terminal output=%q want=%q", got, want)
+		}
 	}
 }
 
@@ -1528,20 +1639,20 @@ func TestFunctionalNativeSSEFieldInputOwnership(t *testing.T) {
 go -C "$G" test -mod=readonly -count=1 -v . -run '^TestFunctionalNativeSSEField'
 ```
 
-当前 6c7f060 的 Boundary、Sequence 两类两个/九个事件、Forwarder、Discriminator 正例、field-pair Continuation 与 InputOwnership 为目标 RED。Limit 的两类完整单位误触发 `stream pending data exceeds 16777216 bytes`，两类 incomplete 控制正常。单 terminal data-only、WireControls、FormatIsolation、LateDelimiter/LateDataDelimiter 为 GREEN。native benchmark 的 field-pair byte-exact preflight 失败，不能计时错误输出后宣称性能通过。
+历史 6c7f060 的 Boundary、Sequence 两类两个/九个事件、Forwarder、Discriminator 正例、field-pair Continuation 与 InputOwnership 为目标 RED；完整单位限额及控制结果保留在原草稿报告。本次更正后的 Dispatch、LateDelimiter/LateDataDelimiter 按正常消费者时机断言，GenericCanonicalControls 使用 generic 连续 wire 入口。实际编译、目标 RED、正常控制、仅编译 native DLL mapped 草稿和未运行项目分别记录在本次 JSON；不将旧零提前输出断言的 GREEN 作为新目标结果。native benchmark 必须先通过 byte-exact preflight，错误输出不能用于计时。
 
-只有两类目标、单 terminal 控制、全部 wire/迟到 delimiter、格式/opaque/ownership、限额与错误控制均通过，才可判定 C 已覆盖新函数层验收。已 GREEN 时不撤销 C 取得 RED、不重复改产品，记录 C 修复 commit，仍补缺失永久 producer/native/HTTP 回归并完成 G2 的语义审查、G3..G5。
+只有两类目标、单 terminal 控制、generic wire 及 Responses callback/迟到 delimiter 的各自控制、格式/opaque/ownership、限额与错误控制均通过，才可判定 C 已覆盖新函数层验收。已 GREEN 时不撤销 C 取得 RED、不重复改产品，记录 C 修复 commit，仍补缺失永久 producer/native/HTTP 回归并完成 G2 的语义审查、G3..G5。
 
-### G2：候选提交时点和最小共用修复检查点
+### G2：输入层级、派发时点和最小共用修复检查点
 
-- [ ] 对相同的四次输入逐次记录返回 chunks。Native 两事件 field-pair 和普通单 event field 使用 G1 的同一 parts 数组；普通情况随后才送 LF/CRLF blank delimiter。G1 的 LateDelimiter 已要求每次此前 Write 返回零 chunks，最后原文完整，只有一个普通 event field、零个 data field。
-- [ ] 核对 `HostModelStreamReadResponse` 的真实字段和 C 最终 Write 的输入来源。固定 CPA 只有 Payload/Error/Done；format=openai-response、匹配 type、后续 event/data 前缀都在两种解释中相同，不是派发证明。不得把旧候选状态注入当作最终 C 的实际实现；旧状态实验只在固定 6c7f060 测试实例做过，其第3次 Write 已输出125 bytes及空行。
-- [ ] 把候选发现、完整 JSON 验证、候选记录和不可逆 emit 分成明确时点。后续 field 只新增可逆边界；发现真实标准 delimiter 时，F15 新候选走 ordinary frame 分支并保留原始 bytes。没有 delimiter 时，EOF/读错误提供本次流结束的提交点。现有 C 的内部已有 LF 的 logical-event 支持继续按其规格处理，不用 F15 普遍覆盖它。
-- [ ] 若 C 最终能提供经过真实 fixture 证明的额外 logical/wire 判定语境，记录其准确位置、值来源和保护普通分片的理由，然后只在共用 Write/scanner/drain 修改 F15。复用其增量 header/JSON/complete-end 状态；field-pair 记录 header/data 的原始边界，data-only 记录连续单位边界。资格校验使用 encoding/json 的 type，普通和闲置字段保持 opaque，派发阶段才生成必要 LF/blank delimiter并调用原 rewriteEvent。reset、错误返回和完整前缀保持，既有接口/调用者不变。
-- [ ] 若仍只有上述同前缀 bytes 信息，停止产品编码，交回同前缀数组、迟到 delimiter 控制和需要提前交付/保存候选的具体冲突。当前固定接口已确认缺少区分信息，本轮草稿没有给出声称满足全部时机条件的产品实现片段。有限 EOF 结果可以延迟恢复，但不能未经规格确认把持续 native stream 的全部 complete units 积存到 EOF。必须先修订公共规格的输入语义/交付时机，再启动实现；这一步不能用广泛启发式、超时或新增配置省略。
-- [ ] 可继续实现时，header 路径先检查 format、是否仍需候选及当前 payload 的 field 前缀，再执行必要 helper。复用 C 的增量 header游标；记录后不再对增长的 JSON buffer 调用从0开始的 splitSSELine。data-only 不依赖 event header。完整值验证/响应恢复按现有标准库和 B helper 各自职责完成；不把每个 Write 当 delimiter、不手写 parser、不创建 provider 专用分支。
-- [ ] 保持16 MiB规则：本次调用已补成的完整单位可超限；以前未完成 prefix已超限则保持原 error/清空；完整前缀与尾部错误可共存；C 的 chunks+error 调用者先发送有效 prefix再合并错误。不得提高常量、删除错误或通过 benchmark 特定分支取巧。
-- [ ] 重跑完整 F15 与既有控制，返回成功才进入 G3；仍有语义冲突则保持阻塞状态，不进入产品提交。
+- [ ] 确认本输入层级规格修正已经独立审查通过。有限读取综合报告的结论、requiredSpecCorrection、实际证据与限制；以固定 CPA 的正常无 mapper 消费链定义 Responses output-unit 语义，不把本报告作为产品 GREEN 或发布放行。
+- [ ] 核对实际入口：ResponseFormat、StreamChunk/output-unit、translator、validator、host bridge 和现有 format/Write 分发。HostModelStreamReadResponse 仍只有 Payload/Error/Done，接口不增加区分标志。HTTP 网络 Write/Flush 先经过真实 XAI/Codex Scanner，再用捕获的 host Payload 验收；不能把网络四次 Write 直接作为四 callback fixture。
+- [ ] 使用 G1 同一 canonical 四 callback，逐次比较独立预期的完整模型恢复 bytes 与 data 事件，累计为 `0、1、1、2`。第 2 次 created、第 4 次 completed；迟到 LF/CRLF 不改变这两个事件。data-only 的两/九事件在下一独立 data chunk 到达时派发前值，Flush 派发末值。不能以 emit 次数代替 data 事件，也不能全流积存到 EOF。
+- [ ] GenericCanonicalControls/WireControls 在 generic 连续 wire 入口保留 whole、全部双分片、单字节、LF/CR/CRLF/BOM 和标准 delimiter 前零派发。ResponsesMetadataControl 保留 whole event-only metadata 后接真正 completed data 的正常输入。单个拼接 data field 保留 generic 原文及 Responses validator 的 `invalid SSE data JSON` 错误；孤立 event-only 流的无 mapper 失败不认定为 mapper 缺陷。F14 等合法 callback 分片按原 validator 和对应 HTTP/WS 消费者核验，分别记录其支持和限制，不删除 unknown/id/retry/comment metadata。
+- [ ] 在共享 Write/scanner/drain 保持现有 format 与调用入口，复用增量 header/JSON/complete-end 状态、SSE helpers、rewriteEvent 和 B 的恢复器。完整值验证、候选记录与不可逆派发分别说明时点；generic wire 等待标准 delimiter，Responses 按原消费者语义生成必要 LF/blank delimiter。type 验证使用 encoding/json，闲置字段和 opaque 原文保持，data-only 不要求 event header。内部已有 LF 的 logical-event 支持、reset、完整前缀及原错误保持。不新增 mode/config/ABI/依赖/parser/provider 推断、timeout、lookahead 个数或 substring 决策。
+- [ ] header 路径先检查 format、是否仍需记录 header 和相关 field 前缀，复用 C 的增量游标。记录后不从 0 重扫增长的 header/JSON；两类 2 MiB/8 MiB、8 KiB continuation 保持 byte-exact、模型/opaque/ownership 和增量成本验证。
+- [ ] 保持 16 MiB 规则：本次调用补成的完整单位可超限；此前超限 incomplete prefix 保持原 error/清空。完整前缀与尾部错误可共存，C 的 chunks+error 调用者先发送有效 prefix 再合并错误，不提高常量或删除错误。
+- [ ] 若后续发现同一实际入口确实必须同时保证两种相反解释的可靠证据，停止产品编码，返回准确入口、输入数组、消费者和相反时机的具体冲突。重跑完整 F15 和全部既有控制，成功后进入 G3；未达到要求不提交产品修复。
 
 ```bash
 go -C "$G" test -mod=readonly -count=1 -v . -run '^TestFunctionalNativeSSEField'
@@ -1567,13 +1678,13 @@ go -C "$G" test -mod=readonly -race -count=3 . -run '^TestFunctionalNativeSSEFie
 go -C "$G" test -mod=readonly -count=1 -v . -run '^(TestRestoreResponseWithoutModelUsesCloneOnly|TestStreamChunkRewriter(FastPathsCompleteSSEBatchWithoutModelMarker|FastPathsEscapedSSEBatchWithoutModelMarker|ScansFragmentedDelimiterlessResponsesEventLinearly|LargeFragmentedRawJSONAllocations|RawJSONUsesOneRestorePass)|TestSSERewriter(SingleDataFastPathAllocations|MultiEventBatchAvoidsPerEventChunkSliceAllocation)|TestFunctionalNativeSSEFieldContinuationAllocations)$'
 ```
 
-- [ ] 在同一机器、同 Go、同参数下顺序测 reviewBASE 与 G。reviewBASE 源码通过自己的 Git object 导出到 OS temp，禁止 checkout/reset 当前分支。G 的必要产品变化只在 main.go，旧测试/性能变化只在 main_test.go、performance_regression_test.go，三个文件的 BASE overlay 足以固定这些差异；其他源码须经 diff 确认与 BASE相同。
+- [ ] 在同一机器、同 Go、同参数下顺序测完整整合起点 startHEAD 与 G，产品 reviewBASE 始终保持固定 C。通过自身 Git objects 把 startHEAD 导出到 OS temp，禁止 checkout/reset 当前分支。G 的必要产品变化只在 main.go，旧测试/性能变化只在 main_test.go、performance_regression_test.go，三个文件的起点 overlay 须经 diff 确认覆盖 G 的全部源码差异；不能用固定 C 的旧树替换已整合 A/B/D 修复。
 
 准备 BASE overlay 的可执行步骤如下，普通 Git 操作分开执行。临时 Python 文件是另一工具的输入，任务结束删除；不提交。
 
 ```bash
 BASE_TEMP=$(mktemp -d)
-git -C "$G" archive --format=tar --output="$BASE_TEMP/base.tar" "$reviewBASE" main.go main_test.go performance_regression_test.go
+git -C "$G" archive --format=tar --output="$BASE_TEMP/base.tar" "$startHEAD" main.go main_test.go performance_regression_test.go
 tar -xf "$BASE_TEMP/base.tar" -C "$BASE_TEMP"
 ```
 
@@ -1603,7 +1714,7 @@ go -C "$G" test -mod=readonly -overlay "$BASE_OVERLAY" -run '^$' -bench '^Benchm
 go -C "$G" test -mod=readonly -run '^$' -bench '^Benchmark(RewriteTopLevelModel|RestoreResponseModel|RestoreResponseWithoutModel|ResponseModelMarkerScan|SSEMarkerGuard(Restore|Candidate)|StreamChunkRewriter(FragmentedRawJSON|SingleJSON|CompleteSSEBatch|EscapedSSEBatch|UnicodeEscapedSSEBatch)|EmitRewrittenBatch)$' -benchmem -count=5 .
 ```
 
-- [ ] 新 native benchmark 同时覆盖 field-pair/data-only、2 MiB/8 KiB 和8 MiB/8 KiB。保留 byte-exact preflight、模型、opaque 1.00/Unicode、全部长度和 ownership。只在 preflight通过时记录耗时；BASE错误输入不作为正确输出的性能基准，正常 data-only 控制可以单独比较。
+- [ ] 新 native benchmark 同时覆盖 field-pair/data-only、2 MiB/8 KiB 和8 MiB/8 KiB。保留 byte-exact preflight、模型、opaque 1.00/Unicode、全部长度和 ownership。只在 preflight通过时记录耗时；起点的错误输出不作为正确输出的性能基准，正常 data-only 控制可以单独比较。
 
 ```bash
 go -C "$G" test -mod=readonly -run '^$' -bench '^BenchmarkStreamChunkRewriterNativeFieldContinuation$' -benchtime=1x -count=1 -benchmem .
@@ -2192,15 +2303,15 @@ RED只认可真实mapped结果和内容失败；编译、启动、DLL加载或Te
 
 ### G5：自审、独立审查、修正复审与任务提交
 
-- [ ] 自审逐项对应 F15 绑定规格：两类输入和单terminal控制、迟到delimiter/no-early-emit、C依赖与固定BASE、16MiB、JSON/opaque/metadata/ownership、错误与batching、真实层级、性能扫描与allocation、署名和发布边界。语义检查点未解决时，状态保持阻塞，只有草稿交付，不提交产品fix。
+- [ ] 自审逐项对应 F15 绑定规格：两类输入和单terminal控制、generic wire 标准 delimiter 和 Responses callback/迟到 delimiter 的各自时机、固定 C reviewBASE 与完整整合起点、16MiB、JSON/opaque/metadata/ownership、错误与batching、真实层级、性能扫描与allocation、署名和发布边界。本规格修正未独立审查通过，或同一实际入口出现可靠相反要求时，按 G2 停止，不提交产品 fix。
 - [ ] 检查diff仅涉及G-owned范围，没有新增parser/provider/config/dependency，没有改A/B/D或CPA/module cache；确认测试expected独立于产品输出。
 
 ```bash
 git -C "$G" diff --check
-git -C "$G" diff "$reviewBASE" -- main.go main_test.go stream_native_fields_regression_test.go performance_regression_test.go
+git -C "$G" diff "$startHEAD" -- main.go main_test.go stream_native_fields_regression_test.go performance_regression_test.go
 ```
 
-- [ ] 向独立reviewer交付相对reviewBASE的完整diff、完整spec/plan及真实命令结果。reviewer必须核对所有共享Write/Flush/Finish调用者、field-pair与data-only、候选/提交时点、实际wire优先可执行性、增量游标/reset、C的batch flag与chunks+error、真实E层级及署名。按既定workflow要求选择可用[1m]型号，完成后主动回报；草稿设计／文档整合阶段不派 agent；产品 G 的独立审查仍由既定 workflow 分配。
+- [ ] 向独立reviewer交付固定 reviewBASE=`51b006438c1a0edd4263020297747f99a174c47c`..全部最终 HEAD 的累计完整 diff、完整 spec/plan、单独标明的文档范围及真实命令结果；修正后仍覆盖同一 BASE..全部 HEAD。reviewer必须核对所有共享Write/Flush/Finish调用者、field-pair与data-only、候选/派发时点、generic wire 与 Responses output-unit 的实际入口及消费者语义、增量游标/reset、C的batch flag与chunks+error、真实E层级及署名。按既定workflow要求选择可用[1m]型号，完成后主动回报；草稿设计／文档整合阶段不派 agent；产品 G 的独立审查仍由既定 workflow 分配。
 - [ ] 每项确认finding由G在同一worktree修正，重跑受影响focused/control，再跑root/vet/race；性能相关修正重跑allocation与bench。独立复审通过后才能提交。若审查发现信息冲突，回到G2停止条件，不通过降规格或省略控制取得GREEN。
 - [ ] 产品仍RED且语义已解决时，最小共用修复与必要回归一起提交；C已覆盖时只提交缺失test，记录C的产品fix归属。下列subject按实际分支二选一，不产生未修改文件变更。
 
@@ -2221,15 +2332,17 @@ git -C "$G" status --short
 - [ ] G主动回报commit、reviewBASE、复审结果、所有测试/性能结果与E接收内容；E在自己的worktree提交唯一入口/fixture及完成永久baseline RED/fixed GREEN。只提交本任务相关文件，不push、不评论、不Release、不提前关闭issue。实际Release成功与资产核验后由协调者填最终comment/版本。
 - [ ] 删除本任务创建且不需保留的OS临时输入/模块副本，保留需要复查的JSON和diff在已忽略的专用目录，不删除已有文件。
 
-### 本次设计核验结果与限制
+### 历史草稿核验与本次检查范围
 
-固定源码通过Git archive导出，产品和永久tests只读。最终root草稿编译exit0，完整F15命令exit1，失败为真实field拼接/模型恢复/完整单位限额断言；控制分别GREEN。原有root suite在base-only overlay下exit0；最终草稿vet exit0；新普通控制和单data terminal的race exit0。没有声称全部F15 race GREEN。
+原补充草稿通过 Git archive 固定源码，产品和永久 tests 只读；原编译、真实 RED、root/vet 和正常控制 race 记录保留在原报告。
+
+本次文档任务在固定 `6c88bcf4a92854a999d1d878d47f1b0ab16dcb5c` 的未修改产品上编译完整更正 root/CPA 草稿。新 generic wire、whole metadata 后 completed、单 terminal data-only、格式控制及其 race 通过，原 root suite 和新草稿 vet 通过。完整 F15 仍为真实内容和派发时机 RED，包含两类两/九事件、field-pair 边界、模型恢复和 complete 限额；field-pair native benchmark 的 byte-exact preflight 失败，data-only 单大单位仅为正常性能控制。实际命令、exitCode、原消费者对照、hash 和临时副本清理记录位于文档任务自有 ignored 目录的 JSON。
 
 真实CPA草稿编译exit0。两种builtin的core/host producer控制和无mapper的HTTP handler/framer控制实际运行exit0；确认两类1/9事件、六种transport、完整payload/output及模型。映射native DLL/HTTP新草稿本轮没有运行；已保存producer trace/归档HTTP与framer证据提供原实际RED，新永久baseline/fixed由E执行。
 
 旧候选实验仅在固定源码测试实例设置现有scanner状态，没有改产品；第3次Write提前输出125 bytes。旧全buffer header helper扫描probe，2MiB约90ms、8MiB约1.44s且零allocation。新增native续写benchmark的field-pair preflight为目标RED，data-only正常单单位计时约9.05ms/37.97ms，B/op与allocs/op已保留为控制，未将其称为多事件修复。
 
-C最终HEAD未交付，G2仍需有限接口语义核验；本草稿不包含未经证明的产品实现。原Linux/Docker现场唯一根因未确认。补充草稿已独立复审并整合至两份 tracked 文档；G 只能按 C 最终提交依赖执行有限核查，G2 条件未满足时停止产品编码。
+固定 C 最终审查提交为 `51b006438c1a0edd4263020297747f99a174c47c`；本草稿不含产品实现，原 Linux/Docker 现场唯一根因未确认。现行输入层级以综合消费者核验为依据，本次文档修正须独立审查通过；G 从含全部已整合修复的交付 HEAD 执行有限核查与必要完整 TDD，最终 review 覆盖固定 C..G 全部 HEAD。
 
 ## Task E：永久 actual CPA integration 和完整终验
 
@@ -2618,12 +2731,12 @@ gh pr comment 7 --repo DoingDog/cpa-plugin-model-mapper --body-file "$PR7_COMMEN
 gh pr view 7 --repo DoingDog/cpa-plugin-model-mapper --json state,comments
 ```
 
-- [ ] `ISSUE8_COMMENT_FILE` 同样位于 F 自有 ignored workspace，发布后的正文依据正式补充核验及 E 最终 Responses/native/HTTP 实际结果。当前请求体独立核验和 E2 的正式 native 交叉核验已确认本地 mapped 502 及 `6c7f060` 的无 LF 字段边界缺陷，`originalIssueReproduced=true`、`commentAllowed=false`，无法复现时的评论阶段已跳过；C 后续最终修复 HEAD／首个 Release 尚未确定，不沿用早期未复现结论，不填写猜测。只有已证实与报告相关的修复才填写对应 commit/首个 Release；历史 `8b7bd9a0d135251878792b3740bc06a7da7ede00`／`v0.5.2` terminal 修复早于提问，不归因于原 issue。本地复现与报告者 Linux/Docker 的唯一部署根因分开说明；未复现或未证实已发布版本解决报告时，正文说明核查范围及仍缺的部署版本、原始 SSE/host read、CPA revision，保持 open。前述现场信息请求按独立时点执行。执行 `gh issue comment 8 --repo DoingDog/cpa-plugin-model-mapper --body-file "$ISSUE8_COMMENT_FILE"`，再用 `gh issue view 8 --repo DoingDog/cpa-plugin-model-mapper --json state,comments` 核对实际评论 URL／正文与状态。后续已发布版本确实解决报告且获真实用户授权时，按同样的 ancestry、首个 Release 和 assets 检查填写已证实 commit/版本，涉及 PR7 的贡献按 C1 署名，评论后执行 `gh issue close 8 --repo DoingDog/cpa-plugin-model-mapper --reason completed`，再次核对 state/comments；未满足这些条件不得关闭。
+- [ ] `ISSUE8_COMMENT_FILE` 同样位于 F 自有 ignored workspace，发布后的正文依据正式补充核验及 E 最终 Responses/native/HTTP 实际结果。当前请求体独立核验和 E2 的正式 native 交叉核验已确认本地 mapped 502 及 `6c7f060` 的无 LF 字段边界缺陷，`originalIssueReproduced=true`、`commentAllowed=false`，无法复现时的评论阶段已跳过；C 后续最终修复 HEAD／首个 Release 尚未确定，不沿用早期未复现结论，不填写猜测。只有已证实与报告相关的修复才填写对应 commit/首个 Release；历史 `8b7bd9a0d135251878792b3740bc06a7da7ede00`／`v0.5.2` terminal 修复早于提问，不归因于原 issue。修复发版并完成资产核验后，评论注明已尝试修复及实际 commit/版本，要求提问者更新并在自己的环境测试；本地通过不表示报告者环境已解决。本地复现与报告者 Linux/Docker 的唯一部署根因分开说明；未复现或未证实已发布版本解决报告时，正文说明核查范围及仍缺的部署版本、原始 SSE/host read、CPA revision，保持 open。前述现场信息请求按独立时点执行。执行 `gh issue comment 8 --repo DoingDog/cpa-plugin-model-mapper --body-file "$ISSUE8_COMMENT_FILE"`，再用 `gh issue view 8 --repo DoingDog/cpa-plugin-model-mapper --json state,comments` 核对实际评论 URL／正文与状态。后续已发布版本确实解决报告且获真实用户授权时，按同样的 ancestry、首个 Release 和 assets 检查填写已证实 commit/版本，涉及 PR7 的贡献按 C1 署名，评论后执行 `gh issue close 8 --repo DoingDog/cpa-plugin-model-mapper --reason completed`，再次核对 state/comments；未满足这些条件不得关闭。
 
 ## 计划自审与交接完成条件
 
 - [ ] 规格逐项映射：F01->A，F02/F03->B，F04/F07/F08/F09/F10/F11/F12->C，F05/F06->D，F13->C 共用 delimiterless 回归，F14->C 分类回归，F15->G 共享 native field boundary 回归及必要修复；actual integration 和全部控制->E，发布->F。
 - [ ] 公共报告映射：PR7->C/F04 统一 TDD、E 实际 HTTP/core/header/native 控制；issue8->C 既有 terminal 控制及最终已验证 HEAD 上的两个无 LF 输入、18 字段九事件、单 terminal data-only 一帧／九个独立 data-only payload 九帧回归，共享 rewriter 已分派后续任务顺序完成必要修正，E 唯一入口的真实 XAI/Codex／三组请求体／producer/native/framer/HTTP 对照；现场信息请求->既有补充复现负责人独立核验后的条件评论，不等待 E 终验或 Release；发布后的实际 commit/版本说明及条件性关闭->F。核对 `hello`/`onetwo`、四类 headers、完整 delta/output/opaque、组合 ABI flags 与正常 producer read 的层级、既有全部分片及唯一永久 fixture。核对请求体独立核验和两种 native 方法的正式交叉核验均已完成、`6c7f060` 字段边界缺陷已确认、`originalIssueReproduced=true`／`commentAllowed=false`，保留 Windows 独立重跑、Windows/WSL2 发布结果来源及资产已清理／Linux 未重跑限制；不把 framer 结果充当未经运行的 HTTP 结果。报告者部署唯一根因与最终修复 HEAD/Release 仍未确定，未证实发布修复时保持 open；后续相关提交／Release／最终 PR 评论保留 #7／@leolmq 署名，不重复实施 A/B/D 或另派共享 scanner 的并行实现。
 - [ ] 核对 Go 测试块能够在现有类型/helper 上编译；RED 必须为目标行为失败，不能是缺失符号、fixture 启动或依赖错误。
-- [ ] 占位、自相矛盾、未经测量性能承诺、额外配置/功能和共享函数冲突检查完成。C 依赖 B fixture，G 依赖 C 最终完整审查提交，E 依赖 A/B/C/D/G 全部修复；独立任务仍并行。F15 草稿已独立复审，G2 产品语义条件尚未满足，文档整合不表示产品已修复；缺可靠 logical/wire 判定信息时停止产品编码。完整核对同前缀四次 Write、迟到 LF/CRLF delimiter 前零输出、可逆候选与不可逆 emit、逐单位交付、opaque、任意合法 wire 分片、16 MiB，以及两个完整 Go 草稿与已编译复审输入一致。
+- [ ] 占位、自相矛盾、未经测量性能承诺、额外配置/功能和共享函数冲突检查完成。C 依赖 B fixture，G 依赖 C 最终完整审查提交，E 依赖 A/B/C/D/G 全部修复；独立任务仍并行。F15 草稿已独立复审，G2 按已核验的 Responses output-unit 消费语义执行，产品尚未修复，文档整合不表示产品已修复；同一实际入口出现可靠相反派发要求时停止产品编码并报告。完整核对 Responses 四 callback 累计 `0、1、1、2`、迟到 LF/CRLF 不改变两个事件、data-only 下一独立 data 派发前值及 Flush 派发末值、generic 连续 wire 的全部分片与原文、whole event-only metadata 后真正 terminal、原 validator 错误、合法 callback 的对应消费者限制、opaque、16 MiB，以及两份完整更正 Go 草稿与本次编译输入一致。
 - [ ] 当前文档提交只暂存两份文档，运行 `git diff --check`，不修改或暂存产品代码、旧 `.claude`、build artifact 或中间结果。

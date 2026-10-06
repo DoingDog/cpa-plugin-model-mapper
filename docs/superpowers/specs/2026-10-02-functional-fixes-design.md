@@ -35,7 +35,7 @@
 | F12 | 无 `agent` 的 Interactions 映射到 OpenAI-compatible upstream，delimiterless logical events 合并成无效 SSE，`interaction.model` 未恢复。 | 两份独立实际 CPA HTTP 复现；proper SSE 和非空 `agent` 的原生流、非流对照正常。 | C，将现有 delimiterless 机制用于实际 `event_type` 和 event 名称。 |
 | F13 | markerless 混合 delimiter 的 Responses helper 输入依赖分片；complete-SSE 快路径跳过 logical-event 恢复。 | 仅 helper 复现。当前 Responses validator 在插件读取前拒绝单 chunk 的 `}event:` 组合；内建 translator 单独返回每个 event，host read 不自动合并。实际 mapped 九事件 lifecycle 有效。 | 不列独立生产缺陷或任务。并入 F12 共用机制的 markerless、分片回归。 |
 | F14 | 合法 `x-vendor-field\nd` 和后续 `ata: {"model":"upstream"}\n\n` 分片被提前透传，最终 `model` 未恢复。 | 五格式 helper、四格式 forwarder 独立复现，真实 AddChunk 原样放行两个合法片段。内建 OpenAICompatible producer 读取完整 frame 并丢弃 unknown field，不能把网络读取分片等同于插件 ABI 分片。 | 并入 C 的 F10/F11 分类回归，保持现有合法 ABI 支持。 |
-| F15 | 真实 XAI/Codex 的独立无 LF event/data fields 或多个 data-only Payload 被合并，丢失单位边界；field-pair 的 mapped `/v1/responses` 返回原文 502，模型未恢复。单 terminal data-only 正常。 | 固定 `6c7f060` 的真实 core/host/native/HTTP 和发布库 native/framer 证据；新 root/CPA 草稿已编译，真实 producer/无 mapper HTTP 控制通过，新 native DLL mapped/disabled 矩阵尚未运行。 | G，在 C 最终已验证提交上有限核查 G2 语义条件；满足后完成必要 TDD、修正、审查和提交。E 负责唯一永久 actual matrix；语义冲突未解决时停止产品编码，不放行发布。 |
+| F15 | 真实 XAI/Codex 的独立无 LF event/data fields 或多个 data-only Payload 被合并，丢失单位边界；field-pair 的 mapped `/v1/responses` 返回原文 502，模型未恢复。单 terminal data-only 正常。 | 固定 `6c7f060` 的真实 core/host/native/HTTP 和发布库 native/framer 证据；新 root/CPA 草稿已编译，真实 producer/无 mapper HTTP 控制通过，新 native DLL mapped/disabled 矩阵尚未运行。 | G，在固定 C 最终审查提交之后的完整整合起点有限核查 G2 的 output-unit 语义，规格修正独立审查通过后完成必要 TDD、修正、审查和提交。E 负责唯一永久 actual matrix；语义冲突未解决时停止产品编码，不放行发布。 |
 
 普通 C ABI 的正式复核已完成：注册、dispatch、五格式非流、clean stream、reconfigure/unload/reload/reinit 控制正常；F05/F06 的 native 卸载问题与最小调用顺序实验重复确认。Interactions 的正式实际 HTTP 复核确认 mapped 和空 agent 基线只有一帧且无效，共用机制的假设实验得到七条有效帧，其他控制不变。假设实验不等于已提交修复。
 
@@ -101,7 +101,7 @@ EOF 或读错误到达时，前一完整 logical event 必须恢复模型并具�
 
 合法 SSE 语境中的 colonless unknown fields 保持原字节，不能被新增为数据事件。纯 raw scalar、raw object/value sequence、raw+SSE suffix、BOM、空白和 Gemini array/raw passthrough 保持现有支持。多个完整 raw JSON 值分别恢复和按需要 framing，然后继续处理真正 SSE suffix。
 
-对每次先前 `Write` 留下的未完成 pending 都不超过 `16 << 20` 字节的合法 ABI 输入，最终输出与分片方式无关；本次 `Write` 可以补完超过 16 MiB 的大完整单位，完整 unit 或 batch 不受 incomplete 限额约束。已越界、报错并清空的未完成前缀，后续补完不能恢复。所有小合法协议输入都覆盖全部 split 和单字节输入，包括 unknown extension 后 `d`/`ata:` 的边界、字段前缀每个字节位置和行结束符内部边界。普通 SSE 后续 `id:`/metadata 仍等待标准 delimiter，host read 边界不作为 event 边界。不得为已在 CPA 前置 validator 被拒绝的输入新增协议功能。
+对 generic 连续 wire 入口中每次先前 `Write` 留下的未完成 pending 都不超过 `16 << 20` 字节的合法 ABI 输入，最终输出与合法字节分片方式无关；本次 `Write` 可以补完超过 16 MiB 的大完整单位，完整 unit 或 batch 不受 incomplete 限额约束。已越界、报错并清空的未完成前缀，后续补完不能恢复。generic 小合法协议输入覆盖全部 split 和单字节输入，包括 unknown extension 后 `d`/`ata:` 的边界、字段前缀每个字节位置和行结束符内部边界。generic SSE 后续 `id:`/metadata 仍等待标准 delimiter，host read 边界不作为 event 边界。Responses 保持正常 output-unit 数组及原消费者的顺序和时机；F14 等合法 callback 分片按原 validator 和对应 HTTP/WS 消费者核验，HTTP 网络分段先经真实 builtin Scanner。不得为已在 CPA 前置 validator 被拒绝的输入新增协议功能。
 
 ### D，shutdown 与 terminal 结果
 
@@ -115,7 +115,7 @@ channel 控制的回归同时覆盖满队列、读期间中断、两次读取之
 
 ### G，native SSE field boundary，F15
 
-本节依据已独立复审的补充草稿（SHA-256 `4cc5cdb512e520af2fcdc2486af640fa00e5c510acda28e5ac6e5b2fd2922b72`）整合。批准覆盖草稿与回归，G2 产品语义条件尚未满足。下列设计核验结果来自该草稿和独立复审，本次文档整合未重新运行产品测试。
+本节采用固定 CPA v7.2.152 的 Responses output-unit 消费语义。输入层级依据协调目录的 `task-G-consumer-semantic-verification.json`（verified=true），实际 producer、validator、host callback、原 framer、HTTP/WS 对照和用户消息来源已经核验。原补充草稿及独立复审保留为历史依据；更正后的草稿和本次实际检查在独立文档任务报告中记录。规格修正须独立审查通过后启动 G；产品尚未修复。
 
 #### 绑定目标
 
@@ -147,7 +147,7 @@ F15 同时拥有两种已确认生产输入：
 
 #### 函数所有权与任务依赖
 
-G 必须等待 C 在自己的 worktree 连续完成测试、独立审查、修正、复审和提交，并由协调者主动交付最终 commit。G 的 reviewBASE 固定为该 C 最终 HEAD。禁止读取或轮询 C 的在修改 worktree，禁止推断其最新实现。
+C 最终审查提交已固定为 `51b006438c1a0edd4263020297747f99a174c47c`，G 产品 reviewBASE 始终使用该完整 SHA。G 的执行起点由协调者主动交付含 A/B/C/D 及本规格修正的完整整合 HEAD，须确认固定 C 为其 ancestor，禁止只从 C 的旧树启动而遗漏其他已整合修复。最终产品 review 覆盖固定 C..G 全部最终 HEAD 的累计范围，并明确其中的文档范围。禁止读取或轮询其他在修改 worktree。
 
 G 只拥有自己分配 worktree 内共享 stream rewriter/scanner 的 F15 必要修改：`streamChunkRewriter.Write/Flush/Finish`、`sseRewriter.Write/drain`、共用 delimiterless scanner 的相关状态、reset 与分类，以及 `stream_native_fields_regression_test.go` 和必要 protocol/performance fixture。当前设计源的绝对路径为 `C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/functional-fixes-20261002/main.go`、`main_test.go`、`performance_regression_test.go`。
 
@@ -166,7 +166,7 @@ G 消费 C 的 framing/batching、`batchSSEOutput` 与 chunks+error 处理，不
 
 E 依赖 C/G 最终审查提交，保留唯一 `C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/functional-fixes-20261002/.github/scripts/smoke-local_test.go` 中的 `TestCPAPluginIntegration` smoke 入口及唯一 `.github/scripts/testdata/cpa-functional-regression_test.go` CPA fixture。G 的真实 producer/native/HTTP 草稿交 E 合并到该 fixture；不创建第二份 CPA fixture 或第二个 smoke 入口。
 
-两份 tracked 文档由本次 F15 文档整合 workflow 编辑：`C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/functional-fixes-20261002/docs/superpowers/specs/2026-10-02-functional-fixes-design.md` 与 `C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/functional-fixes-20261002/docs/superpowers/plans/2026-10-02-functional-fixes-implementation.md`。补充草稿与回归已独立复审并由文档 workflow 整合；后续 G 仅可先执行 G1/G2 的有限核查和回归，G2 未满足不得启动产品编码。
+两份 tracked 文档由本次 F15 文档整合 workflow 编辑：`C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/functional-fixes-20261002/docs/superpowers/specs/2026-10-02-functional-fixes-design.md` 与 `C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/functional-fixes-20261002/docs/superpowers/plans/2026-10-02-functional-fixes-implementation.md`。补充草稿与回归已独立复审并由文档 workflow 整合；后续 G 在本规格修正独立审查通过后执行 G1/G2 的有限核查和必要完整 TDD；若发现同一实际入口的可靠相反要求，按 G2 停止。
 
 #### 共用根因与判定边界
 
@@ -174,21 +174,23 @@ E 依赖 C/G 最终审查提交，保留唯一 `C:/Users/user/Downloads/cpa-plug
 
 JSON 结构与 discriminator 验证复用 `encoding/json`。Responses 只读取 string `type`；闲置 `event_type=17/false` 保持 opaque。event field 与 type 必须相符；data-only 使用实际 type 确认完整单位，不要求不存在的 event header。复用 C 最终的增量 scanner、completeEnd、SSE helpers、`rewriteEvent` 和 B 的响应恢复器。不新增手写 JSON/SSE parser、产品依赖、配置或 ABI 字段。
 
-##### 候选记录与不可逆提交
+##### 输入单位与派发时点
 
-Write 的边界可以记录为候选位置。候选确认完整 JSON 和类型，只说明本地 bytes 可解释为已知 native 单位；后续 `event:` 或 `data:` 形状仍不证明当前输入是 native logical fields。候选阶段不改原始 bytes、不删除 metadata、不输出合成空行。
+`openai-response` executor 接收固定 CPA 按 response format 交付的 output chunks。`HostModelStreamReadResponse` 的 `Payload []byte`、`Error string`、`Done bool` 和现有 `Write([]byte)` 接口保持；output-unit 边界、顺序及派发时点以同输入的正常无 mapper Responses 消费链为依据。复用现有 format 和调用入口，不新增 logical/wire 标志、mode、config 或 ABI 字段。
 
-F15 新候选若之后收到真实普通标准 delimiter，完整普通 frame 必须优先处理。尤其以下普通 frame 只有一个 event field、零个 data field，必须 whole、全部双分片和四个 field-shaped Write 后才送 delimiter 都保持全部原文：
+G1 的四项 canonical callback 为 created event、created data、completed event、completed data。原 validator 接受这些单位，原 `responsesSSEFramer` 在四次输入后累计 dataFrames 为 `0、1、1、2`，对应第 2 次派发 created、第 4 次派发 completed。迟到 LF/CRLF delimiter 不改变两个已成立事件，也不增加 data 事件。data-only 在下一独立 data chunk 到达时派发前一个完整值，Flush 派发末值；单 terminal、两个和九个事件均保持完整内容、顺序及这一时机，禁止把全部完整单位积存到 EOF。
+
+以下 canonical 字符串拼接组成单个普通 event field。在 generic 连续 SSE wire 入口，whole、全部双分片、单字节分片及四次续写后才送 LF/CRLF delimiter 均保持原文，标准 delimiter 前不派发：
 
 ```plaintext
 event: response.createddata: {"type":"response.created","response":{"model":"grok-4.7","status":"in_progress","output":[]}}event: response.completeddata: {"type":"response.completed","response":{"id":"resp-issue8","object":"response","status":"completed","model":"grok-4.7","output":[{"id":"msg-issue8","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ordinary grok-4.7 opaque 中文 output","annotations":[]}]}]}}\n\n
 ```
 
-Task G 的完整 Go 回归使用上述相同 canonical JSON，检查四次 Write 后、delimiter 前没有输出。单个普通 data field 中相同 JSON/data 字符串拼接的控制也保持原文。仅比较当前 buf 中 standardEnd/logicalEnd，不能修复已经提前 emit 的前一候选。
+Responses 的 whole event-only metadata 后接真正 completed data 是正常控制，保留普通 event field 原文并恢复后续数据的模型。相同 event-only 字节通过 HTTP 网络四次 Write/Flush 后 delimiter，须先经过真实 XAI/Codex Scanner；实际 host 只交付一个 463-byte event field，孤立流在无 mapper HTTP/WS 消费链失败，不能作为 mapper 破坏正常请求的证据。相同四个 callback 则按前述两事件语义验收，不重新解释为这一网络控制。
 
-无标准 delimiter 的限定 canonical native 输入在 EOF/读错误时可按真实 producer 语义恢复；在此之前若要逐单位派发，必须有能区分 logical fields 与普通 wire fragments 的可靠接口信息。固定 `HostModelStreamReadResponse` 只有 `Payload []byte`、`Error string`、`Done bool`；`Write` 只有 `[]byte`。这两种解释的前四次 Write 完全相同，当前接口没有额外标志。
+单个普通 data field 内拼接两个 JSON/data 字符串的 generic 原文控制保持。该 field 的 JSON 无效，Responses 原 validator 的 `invalid SSE data JSON` 错误保持，不列为正常 Responses 成功输入。F14 等合法 callback 分片仍按原 validator 加对应 HTTP/WS 消费者核验；validator 接受与每个消费者支持分开记录。LF/CR/CRLF、BOM、unknown/id/retry/comment metadata、完整内容及任意合法字节分片继续在各自入口验收。
 
-因此 G2 设为强制语义检查点：C 最终 HEAD 若未提供经过真实 fixture 核验且与上述 wire 控制相容的判定信息，停止产品编码，交回同前缀、迟到 delimiter、派发时机及需保存完整候选的具体冲突。不能未经规格确认，把所有 native 完整单位积存到 EOF 后一次输出作为正常 streaming 的替代实现；也不能用超时、lookahead 个数、provider 名称、内容 substring 或忽略错误选择解释。此处没有宣称有限 EOF fixture 无法实现，停止条件针对逐单位派发与普通 delimiter 优先的并存要求。
+完整 JSON 的定位、验证、候选记录与不可逆派发分别明确时点。generic wire 候选保存原始 bytes，等待标准 delimiter；Responses output units 按已核验的消费语义生成必要 LF/blank delimiter并调用现有恢复器。共享增量 scanner/reset、既有内部含 LF 的 logical events 和错误处理保持。G2 有限核对实际入口、validator、HTTP/WS 消费者及上述时机后实施；本规格修正须独立审查通过。若后续有可靠证据证明同一实际入口必须同时满足两种相反派发要求，停止产品编码并报告具体冲突。禁止 provider/substring 推断、timeout、lookahead 个数或忽略错误选择解释。
 
 ##### 增量扫描与性能
 
@@ -200,7 +202,7 @@ Task G 的完整 Go 回归使用上述相同 canonical JSON，检查四次 Write
 
 #### 不变条件
 
-- 普通真实 SSE 的 LF、CR、CRLF、BOM、任意合法网络/ABI 分片、多个 event、id/retry/comment/unknown fields 保持原有字节和单位；完整普通 frame 不因 Write 边界增加事件。
+- generic 连续 SSE wire 的 LF、CR、CRLF、BOM、任意合法网络/ABI 字节分片、多个 event、id/retry/comment/unknown fields 保持既有字节和单位。Responses 在原 validator 及对应 HTTP/WS 消费者支持的 callback 分片上保持数据、metadata 与 output-unit 语义；网络 Write/Flush 不直接等同于 callback 边界。
 - OpenAI/Gemini raw core、Responses/Interactions 的格式隔离、raw JSON 单值/序列/array、framing/batching 和既有 logical-event 机制保持。只恢复现有六项白名单，不递归改写 opaque/tool 文本。
 - `maxPendingStreamBytes = 16 << 20` 不变。完整单个或多个单位及完整累计流量不计入 incomplete 上限；此前 pending 未超限才可继续补完。超限 incomplete 单位清空并报错，Flush 不输出它；C 的完整前缀与并存 error 传递保持。
 - 自然 EOF、terminal Payload+Done、in-band/callback 读错误、cleanup error、host close 一次及已有关闭失败补救保持。正常 Responses 不添加 DONE。
@@ -220,7 +222,7 @@ CPA fixture 复用已安装 `gin-contrib/sse.Decode` 和 `encoding/json`；该 d
 
 #### 完成条件与发布边界
 
-C 最终 HEAD 同时通过两类新回归和全部控制时，G 不重复改产品，记录 C 修复归属，仍增加缺失的永久 producer 回归。仍 RED 且 G2 语义检查点已解决时，G 在同一 worktree 完成最小共用修复、GREEN/control、root/vet/race、allocation/benchmark、自审、独立审查、修正、复审和任务提交。存在语义冲突时按 G2 停止，不能提交为已完成产品修复。
+完整整合起点同时通过两类新回归和全部控制时，G 不重复改产品，记录实际修复归属，仍增加缺失的永久 producer 回归。仍 RED 且本规格修正已经独立审查通过、G2 的实际入口核查完成时，G 在同一 worktree 完成最小共用修复、GREEN/control、root/vet/race、allocation/benchmark、自审、独立审查、修正、复审和任务提交。同一实际入口出现可靠相反要求时按 G2 停止，不能提交为已完成产品修复。
 
 E 完成唯一入口/fixture 的 baseline RED 与 fixed GREEN。F15 baseline 固定 6c7f060 的 DLL，单独记录来源，不改写 F01..F14 的原 baseline。新 native/HTTP GREEN、最终 C/G commit 及真实 Release 均尚未完成。
 
@@ -234,16 +236,16 @@ PR7 相关新提交 body 注明 `Related-PR: #7`、`PR-Author: @leolmq`；issue8
 | B | `rewriteTopLevelModelCanonical`、响应 `rewriteResponseModel*`、`rewriteNestedRawStringFields`、`rewriteRawStringField` 及必要相邻 JSON span helper。不改 marker scanner 的能力。 | `json_rewrite_regression_test.go`；`main_test.go` 中所有仅因 JSON 保序而过时的 expected bytes。 | 可与 A、D 并行。必须独立修完全部保序 fixture 并达到 root suite GREEN，不把失败留给 C。 |
 | C | `main.go:32-1214` 的 rewriter/scanner/classification，`emitRewritten`、`prepareExecutorStream`、`processPayload`、`flushAndEmit`。 | `stream_protocol_regression_test.go`；framing/emission/batching 的旧测试；必要 `performance_regression_test.go` 检查；`README.md:180-205` 的相关说明。 | 可提前分析和编写独立 RED。涉及共享 fixture 的编码从 B 已验证提交开始。只修改 C 的生产函数，不修改 `executorStream` 生命周期 struct 或 D 的函数。 |
 | D | `executorStream` 的生命周期字段，生命周期函数、`closeHost`/`closePlugin`、`startExecutorStream`、`finish`、`runStreamForward`。 | `stream_lifecycle_regression_test.go`；必要的 lifecycle 旧测试。 | 可与 A、B 并行。不得修改 C 的 payload/flush 函数；独立全量测试和审查完成后提交。 |
-| G | C 最终已验证 HEAD 上，共享 `streamChunkRewriter.Write/Flush/Finish`、`sseRewriter.Write/drain`、delimiterless scanner/reset/classification 的 F15 必要修改。只消费 C 的 framing/batching 和 chunks+error，不改 A/B/D 或 C 的 executor helper。 | `stream_native_fields_regression_test.go`；必要协议／性能 fixture。完整 producer/native/HTTP 草稿交 E 合入唯一 CPA fixture。 | 固定 reviewBASE 为协调者主动交付的 C 最终审查提交；G2 缺可靠 logical/wire 判定信息时停止产品编码。满足后在同一独立 worktree 连续完成必要 TDD、全量测试、性能、自审、独立审查、修正、复审和提交；C 已覆盖时只补缺失回归并记录归属。 |
+| G | C 最终已验证 HEAD 上，共享 `streamChunkRewriter.Write/Flush/Finish`、`sseRewriter.Write/drain`、delimiterless scanner/reset/classification 的 F15 必要修改。只消费 C 的 framing/batching 和 chunks+error，不改 A/B/D 或 C 的 executor helper。 | `stream_native_fields_regression_test.go`；必要协议／性能 fixture。完整 producer/native/HTTP 草稿交 E 合入唯一 CPA fixture。 | 产品 reviewBASE 固定 `51b006438c1a0edd4263020297747f99a174c47c`，执行起点为协调者主动交付的完整整合 HEAD；规格修正独立审查通过后按 G2 核查入口和时机。同一实际入口出现可靠相反要求时停止产品编码。满足后在同一独立 worktree 连续完成必要 TDD、全量测试、性能、自审、独立审查、修正、复审和提交；C 已覆盖时只补缺失回归并记录归属。 |
 | E | 永久 actual CPA integration 与完整终验。 | `.github/scripts/smoke-local_test.go` 和唯一永久 fixture `.github/scripts/testdata/cpa-functional-regression_test.go`；只有测试入口确需改变才修改 `Makefile`、`.github/workflows/build.yml`。 | 等 A/B/C/D/G 完成并合并后，在新的独立 worktree 完成。新增 integration 对 baseline DLL 证明 RED，对已修 DLL 证明 GREEN；F15 baseline 固定 `6c7f060`，F01..F14 原 baseline 保持。 |
 
-`main.go` 的函数边界不消除 `main_test.go` fixture 依赖。B 负责保序 fixture，C 负责协议职责和 emit 次数；同一测试同时受两类行为影响时 B 先完成并提交，C 从该提交启动后续修改。C 最终已验证提交 -> G 有限接口核查、语义条件满足后的必要完整 TDD／审查／提交 -> E 全部永久 actual 验收 -> F 发布。G 与 C 不并行修改共享 rewriter/scanner；G2 停止条件未解决时 E/F 不放行。集成者只合并已完成且检查过修改范围的提交，不代写未完成产品代码。
+`main.go` 的函数边界不消除 `main_test.go` fixture 依赖。B 负责保序 fixture，C 负责协议职责和 emit 次数；同一测试同时受两类行为影响时 B 先完成并提交，C 从该提交启动后续修改。固定 C 最终审查提交 -> 本输入层级规格修正独立审查通过 -> G 有限接口核查、必要完整 TDD／审查／提交 -> E 全部永久 actual 验收 -> F 发布。G 与 C 不并行修改共享 rewriter/scanner；G2 停止条件未解决时 E/F 不放行。集成者只合并已完成且检查过修改范围的提交，不代写未完成产品代码。
 
 每个 coding workflow 内包括 focused TDD、全量测试、规格审查、代码质量审查、修正、复审和提交。独立审查发现新共享位置时，更新文件和函数所有权后继续，不能让两个工作流修改同一函数或同一测试。
 
 ## 永久验证和性能条件
 
-1. A/B/C/D/G 的 focused tests 必须在各自固定基线证明目标失败，在修复提交通过；每个完成的编码工作区 `go test ./...` 必须 GREEN。G 的产品 reviewBASE 固定为 C 最终 HEAD，F15 原始 RED／E baseline 固定 `6c7f060`；G2 尚未满足时只交回冲突，不提交产品修复。全局配置和生命周期测试不使用 `t.Parallel`。
+1. A/B/C/D/G 的 focused tests 必须在各自固定基线证明目标失败，在修复提交通过；每个完成的编码工作区 `go test ./...` 必须 GREEN。G 的产品 reviewBASE 固定为 C 最终 HEAD，F15 原始 RED／E baseline 固定 `6c7f060`；规格修正尚未独立审查通过，或同一实际入口出现可靠相反要求时停止产品编码并交回证据，不提交产品修复。全局配置和生命周期测试不使用 `t.Parallel`。
 2. E 的 actual CPA matrix 覆盖 mapped/unmapped 非流和流的 Chat、Completions、Responses HTTP/WS、Claude、Gemini、Interactions；非空 `agent` 继续原生。F01/F02/F03/F04/F08/F09/F10/F12 使用已证明的实际 HTTP 形状，F05/F06 使用 actual host/DLL unload，F07/F11/F14 保留 focused unit 和实际 host/validator 层核验。F15 使用 G4 的真正 XAI/Codex producer、native loader/ABI/host/validator、Responses HTTP framer 和 binary smoke，两类 1/9 事件、六种 transport、mapped/direct-unmatched/disabled 同名 `.6/.7` 及全部非流均精确验收。各层级据实报告。
 3. WebSocket 和 native host fixture 使用 CPA 固定模块已有 `gorilla/websocket`、`package pluginhost` 接口、loader 和测试 helper。先把核对为 `v7.2.152` 的源文件复制到本次 `t.TempDir()` 的可写副本，再把 Go overlay target 指向该副本的 `internal/pluginhost/model_mapper_functional_test.go`；Go 1.26.5 禁止 `GOMODCACHE` 内的 replacement，包括新增虚拟文件。副本仅供集成测试，测试完成后清理；不向根模块引入产品依赖，不手写 WebSocket parser，不改原 CPA 源码或 module cache。
 4. `go test ./...`、`go vet ./...`、`go test -race ./...`、register/schema 回归，以及 packager、compatibility、smoke 三个显式 script test 命令全部通过。不得运行 `go test ./.github/scripts`。
@@ -253,7 +255,7 @@ PR7 相关新提交 body 注明 `Related-PR: #7`、`PR-Author: @leolmq`；issue8
 
 ## 公共报告验收补充
 
-F15 的具名后续所有者为 G，按 C 最终已验证提交 -> G2 有限接口核查／必要完整 TDD 与审查提交 -> E 全部永久 actual 验收 -> F 发布执行。以下既有公共报告的证据、控制和命令保持；新增 F15 矩阵按 G 绑定规格及 G4 执行，两个 baseline 独立记录。此前 disabled same-input alias 是原有控制／历史证据，G4 新矩阵另注册两个实际 model，disabled `.6/.7` 按其实际 model 验收，不用 alias 替换新矩阵的 upstream model。
+F15 的具名后续所有者为 G，按固定 C 最终审查提交 -> 本规格修正独立审查通过 -> 完整整合起点上的 G2 有限接口核查／必要完整 TDD 与审查提交 -> E 全部永久 actual 验收 -> F 发布执行。以下既有公共报告的证据、控制和命令保持；新增 F15 矩阵按 G 绑定规格及 G4 执行，两个 baseline 独立记录。此前 disabled same-input alias 是原有控制／历史证据，G4 新矩阵另注册两个实际 model，disabled `.6/.7` 按其实际 model 验收，不用 alias 替换新矩阵的 upstream model。
 
 以下验收补充现有 Global Constraints，沿用 C/E/F 的所有权，F01..F14、既有边界和全部验证条件保持不变。后续 PR7 相关产品修复、复审修正、永久回归和文档修正提交均注明 #7 与经原始 PR JSON 核实的作者 @leolmq，commit body 使用 `Related-PR: #7`、`PR-Author: @leolmq`；C/E 和最终审查核对实际 commit message，Release 与最终 PR 评论注明该作者贡献。不编造姓名、email 或 `Co-authored-by`，不改写已完成提交历史。
 
@@ -261,10 +263,10 @@ F15 的具名后续所有者为 G，按 C 最终已验证提交 -> G2 有限接�
 2. [issue8](https://github.com/DoingDog/cpa-plugin-model-mapper/issues/8) 使用原规则 `grok-4.6=>grok-4.7`、`Format/SourceFormat=openai-response` 和完整 `response.completed` terminal fixture。启用 plugin 的 mapped/unmapped 上游请求 `Model`、顶层 JSON `model` 均为 `grok-4.7`；mapped 下游 `response.model=grok-4.6`，unmapped 对照为 `grok-4.7`；完整 `response.output` 和 opaque output 文本中的 `grok-4.7` 保持。C 的既有 terminal 控制覆盖 `Payload+Done`、split terminal、`Payload+Error+Done`，保留原错误与 emit -> host-close -> plugin-close 顺序；E 的正常 native producer 使用 payload 后独立 Done 的真实 bridge 对照。真实 `/v1/responses` mapped/unmapped 和禁用 plugin 的正常请求均须为 200，含有效可派发 data/terminal，完整 output 不丢；错误用例在其实际 error/terminal 通道保留原错误。
 3. 正式报告 `C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/functional-fixes-20261002/.superpowers/sdd/2026-10-02-functional-fixes-implementation/issue8-alternative-verification.json` 已完成两种 native 方法交叉核验，`originalIssueReproduced=true`、`commentAllowed=false`。独立重建并重跑 `6c7f060` Windows DLL／固定 CPA，确认真实 XAI/Codex producer 的无 LF 字段边界缺陷：两个独立 host payload `event: response.completed` 和 `data: ` 后接完整 terminal JSON 被错误合并，零有效 data frame 导致 mapped `/v1/responses` 返回原文 502。官方 `v0.5.8`／`v0.5.11` Windows DLL 与 Debian WSL2 Linux `.so` 的相同结果依据保留的结构化证据、transcript 和原始输出核对；原发布资产和原始 HTTP JSON 已清理，交叉核验未重跑 Linux matrix，`.so` 的 dirty build metadata 不证明其源码字节等同于 clean tag。C 在最终已验证 HEAD 原样检查两字段输入、18 个无 LF 字段的九事件 lifecycle、单 terminal data-only 和九个独立无 LF data-only payload；仍为目标 RED 时由同一共享 rewriter 的已分派后续任务顺序完成 TDD、修正、完整验证、独立复审及提交，已有 GREEN 时保留回归和实际结果。E 在唯一 fixture 保留真实 `NewXAIExecutor`／`NewCodexExecutor` 的 mapped/unmapped/禁用 plugin native/HTTP 对照及 XAI core 空 chunk；单 terminal data-only 保持一帧、模型恢复和完整 opaque output，九个 data-only payload 保持九个有序有效帧、完整 delta/output 和 `response.completed`。真实 producer、native bridge、Responses framer 和 HTTP 分层记录，不将 framer 结果当作未运行的 HTTP 结果。完整 SSE、合法字节分片和原错误控制不变；本地复现与报告者 Linux/Docker 的唯一根因分别判定。
 4. 请求体调查复用已有补充调查和 E 的唯一入口：在 OS 临时目录启动固定 CPA/native DLL 与 mock upstream，每组使用独立 CPA 进程及相同请求序列，对照禁用 plugin 请求 `grok-4.6`、启用原规则请求 `grok-4.6`、相同配置直接请求 unmatched `grok-4.7`，同时保留正常非流／流对照。记录实际捕获的完整 raw/parsed body、非 `model` member 的顺序与字节表示、opaque 内容、相关 request/response headers、HTTP 状态／错误及其对应请求。禁用组不执行映射，模型预期独立记录。请求体独立核验已完成，正式报告 `C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/functional-fixes-20261002/.superpowers/sdd/2026-10-02-functional-fixes-implementation/issue8-request-body-independent.json` 记录 `originalIssueReproduced=true`。真实 Windows DLL／固定 CPA／HTTP 的 xAI mapped 流返回 HTTP 502 `upstream stream closed before first payload`，direct／disabled 流及非流对照正常；正常 minimal-message 的 mapped/direct-unmatched 上游 raw body 和正常响应逐字节相同，捕获 headers/URI 一致，未确认额外请求体改写缺陷。两种 native 方法的整体交叉核验已由前述正式报告确认无 LF 字段边界缺陷；报告者 Linux/Docker 的唯一根因尚未匹配，最终相关修复 commit／首个 Release 尚未确定。当前不发送无法复现评论；各组结果据实记录，请求体差异本身不认定为缺陷或原 502 根因，不重新分派重复调查或产品任务。
-5. 独立 PR7 探测运行真实 CPA HTTP handler，upstream/RPC 为 mock；早期独立 issue8 terminal 探测使用真实插件 Go 函数和 fake callbacks。E 分别报告 mock、native loader/ABI/host bridge、完整 HTTP 的结果与限制，组合 terminal flags 的 ABI 接受对照不替代正常 producer 的实际 read 序列，也不作为报告者 Linux/Docker 现场复现。新增永久 integration 全部进入 E 的唯一 `TestCPAPluginIntegration` 和唯一 `.github/scripts/testdata/cpa-functional-regression_test.go`，复用现有 smoke helper、CPA parser 和 `encoding/json`；不增加第二入口，不修改 CPA，不新增 parser 或猜测性 workaround，任意 host read 边界仍不作为 event delimiter。
+5. 独立 PR7 探测运行真实 CPA HTTP handler，upstream/RPC 为 mock；早期独立 issue8 terminal 探测使用真实插件 Go 函数和 fake callbacks。E 分别报告 mock、native loader/ABI/host bridge、完整 HTTP 的结果与限制，组合 terminal flags 的 ABI 接受对照不替代正常 producer 的实际 read 序列，也不作为报告者 Linux/Docker 现场复现。新增永久 integration 全部进入 E 的唯一 `TestCPAPluginIntegration` 和唯一 `.github/scripts/testdata/cpa-functional-regression_test.go`，复用现有 smoke helper、CPA parser 和 `encoding/json`；不增加第二入口，不修改 CPA，不新增 parser 或猜测性 workaround，generic 连续 wire 的任意 host read 边界仍不作为 event delimiter；Responses output chunks 的边界按 G2 的原消费者语义验收。
 6. issue8 现场信息请求独立于发布后的修复说明。正式交叉核验已记录 `originalIssueReproduced=true`、`commentAllowed=false`，无法复现时的信息请求评论阶段已跳过，按已确认缺陷继续 C/E 验证。其他有效复现方法完成并经独立核验仍未复现时，按真实用户授权立即评论请求 CPA 失败请求日志、准确插件版本与 CPA revision、部署／endpoint、相关配置、原始 SSE 和 host read 信息，并核验评论正文、URL 及 issue 仍为 open；该条件评论无需等待 E 全部终验或 Release。
-7. 固定核查 HEAD `6c7f060f4da5bb33e7b2ecd74c44499c9676a93c` 仍复现 PR7；`9fe917c031f0a7ed8b43897220a1eea237acc88b` 是候选，真实 `v0.5.7` 仍有问题。F 在成功发布并核验后，按真实用户授权评论 C 的实际修复 commit、首个包含它的 Release 版本及 #7／@leolmq 的贡献。issue8 的历史 terminal 修复 `8b7bd9a0d135251878792b3740bc06a7da7ede00`／`v0.5.2` 早于提问，不能归因于原 issue；请求体独立核验及正式 native 交叉核验已确认本地 mapped 502 和无 LF 字段边界缺陷，实际修复 HEAD 和首个 Release 尚未确定。F 根据最终 E 实际结果评论，仅对已证实相关修复填写 commit/版本；未复现或未证实已发布版本解决报告时说明核查范围及仍缺的部署版本、原始 SSE/host read、CPA revision，保持 open。后续已发布版本确实解决报告且获得用户授权后，评论已证实相关 commit/版本并关闭。
+7. 固定核查 HEAD `6c7f060f4da5bb33e7b2ecd74c44499c9676a93c` 仍复现 PR7；`9fe917c031f0a7ed8b43897220a1eea237acc88b` 是候选，真实 `v0.5.7` 仍有问题。F 在成功发布并核验后，按真实用户授权评论 C 的实际修复 commit、首个包含它的 Release 版本及 #7／@leolmq 的贡献。issue8 的历史 terminal 修复 `8b7bd9a0d135251878792b3740bc06a7da7ede00`／`v0.5.2` 早于提问，不能归因于原 issue；请求体独立核验及正式 native 交叉核验已确认本地 mapped 502 和无 LF 字段边界缺陷，实际修复 HEAD 和首个 Release 尚未确定。F 根据最终 E 实际结果评论，仅对已证实相关修复填写 commit/版本；未复现或未证实已发布版本解决报告时说明核查范围及仍缺的部署版本、原始 SSE/host read、CPA revision，保持 open。修复发版并完成资产核验后，issue8 评论注明已尝试修复及实际 commit/版本，要求提问者更新并在自己的环境测试；本地通过不表示报告者环境已解决。后续已发布版本确实解决报告且获得用户授权后，评论已证实相关 commit/版本并关闭。
 
 ## 文档完成条件
 
-两份文档覆盖 F01..F15 和全部控制条件，明确证据层级、函数/fixture 依赖、RED/GREEN 命令和终验。F15 补充草稿已独立复审，G2 产品语义条件尚未满足；整合文档不表示产品已修复或允许绕过停止条件编码。自审检查无占位、无新增功能、无未经测量的优化承诺；完整 Go 草稿与已编译的复审输入逐字核对，`git diff --check` 通过。文档提交只包含本规格和对应实施计划，不包括产品源码、中间结果或其他工作区的内容。
+两份文档覆盖 F01..F15 和全部控制条件，明确证据层级、函数/fixture 依赖、RED/GREEN 命令和终验。原 F15 补充草稿的复审保留为历史记录。本次完整更正草稿已经编译并运行正常控制，F15 目标仍真实 RED；本规格修正须独立审查通过后启动 G，产品尚未修复。自审核对输入单位、派发时点、generic 分片控制、全部原验收和停止条件；无占位、无新增功能、无未经测量的优化承诺。更正后的完整 Go 草稿与本次编译输入逐字核对，`git diff --check` 通过。文档提交只包含本规格和对应实施计划，不包括产品源码、中间结果或其他工作区的内容。
