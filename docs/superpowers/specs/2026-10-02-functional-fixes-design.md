@@ -192,6 +192,28 @@ Responses 的 whole event-only metadata 后接真正 completed data 是正常控
 
 完整 JSON 的定位、验证、候选记录与不可逆派发分别明确时点。generic wire 候选保存原始 bytes，等待标准 delimiter；Responses output units 按已核验的消费语义生成必要 LF/blank delimiter并调用现有恢复器。共享增量 scanner/reset、既有内部含 LF 的 logical events 和错误处理保持。G2 有限核对实际入口、validator、HTTP/WS 消费者及上述时机后实施；本规格修正须独立审查通过。若后续有可靠证据证明同一实际入口必须同时满足两种相反派发要求，停止产品编码并报告具体冲突。禁止 provider/substring 推断、timeout、lookahead 个数或忽略错误选择解释。
 
+##### 普通 metadata output units
+
+Responses output units 同时包括独立、无 LF/CR 的 `id: event-1`、`retry: 100` 和 `: heartbeat`。正常 upstream SSE 的每条 metadata 行先经 XAI/Codex builtin Scanner、translator 和 validator，再作为独立 host Payload 交付；网络 Write/Flush 的分段保持由 Scanner 处理。以单 completed 为例，源 wire 和 host units 为：
+
+```plaintext
+id: event-1\nevent: response.completed\ndata: <完整 gCPACompleted>\n\n
+```
+
+```go
+[]string{"id: event-1", "event: response.completed", "data: " + gCPACompleted}
+```
+
+共享 Responses output-unit 机制必须保留 metadata 原文字节、顺序及其与真正 event/data 之间的字段边界。对应 mapped native 输出为 `id: event-1\nevent: response.completed\ndata: <完整 gCPACompletedWant>\n\n`；`retry: 100` 和 `: heartbeat` 使用相同规则。只恢复真正 data JSON 的现有白名单模型字段为 `grok-4.6`，完整 `response.output`、delta、opaque 中的 `grok-4.7` 保持。metadata 文本中出现 `event:`、`data:` 或 `{"model":"grok-4.7"}` 时保持 opaque，不创建数据事件、不改写其中的模型。
+
+单个和连续 metadata、field-pair/data-only、单 completed/九事件均属必需验收。正常支持的位置包括 event 前、event 与 data 之间，以及前一事件之后、下一事件之前；每个位置的 units 必须用真实 producer/validator/HTTP/WS 无 mapper 控制核验。对于 data-only，event 与 data 之间的位置对应 data 前。连续控制固定为 `id: event-1`、`retry: 100`、`: opaque event: response.created data: {"model":"grok-4.7"} 中文`。不由这些已核验 metadata 推导未知字段的新 callback 支持；unknown fields 的既有 generic wire 和实际 consumer 控制继续保留。
+
+metadata 不改变已成立的数据单位或原派发时机：field-pair 四项 callback 的累计 dataFrames 仍为 `0、1、1、2`；data-only 仍在下一独立 data 到达时派发前值、Flush 派发末值。前置或连续 metadata 本身不增加数据帧，迟到 LF/CRLF delimiter 不重复派发。已完整 metadata 前缀、完整 JSON 和下一 incomplete tail 分开处理，保持 16 MiB incomplete 限额、所有完整 chunks+error、输入/输出 ownership、自然 EOF 与全部错误/关闭策略。
+
+修正只在 G 拥有的共享 rewriter/scanner 中完成。保留当前 format、接口、增量游标/reset、B 的白名单恢复器、C 的 batching/error 消费和 D 的生命周期；不修改 CPA，不在 HTTP/WS 各加处理，不增加 provider 推断、ABI 标志、配置、parser 或 fallback。generic 连续 wire 含真实 LF/CR/CRLF 时继续保留 whole、全部 split、bytewise、BOM、metadata 原字节并等待标准 delimiter，不把任意网络/read 分片补成独立字段。
+
+真实 mapped `/v1/responses` HTTP 必须为 200，包含全部可解码且可派发的数据事件；WS 必须依次交付完整 JSON，包含完整 completed output 和恢复后的 client model。相同原 direct 保持 `grok-4.7`，disabled 的实际 `.6/.7` 请求分别保持其模型；无 metadata、原 event-only opaque metadata、全部旧 F15 和 F01..F14 控制保留。该 metadata 要求的永久 baseline 使用 `3dce8db7373d2da6cfd792a30e2c323e0525bdc5` 的未修复 DLL，原 F01..F14 与 F15 两个 baseline 不改变。
+
 ##### 增量扫描与性能
 
 进入 header helper 前先检查 format、是否仍需记录 header、下一 Payload 是否具有相关 field 前缀。优先复用 C 已有 header 游标；候选已记录后不重新从位置 0 扫描 JSON bytes。data-only 同样使用已记录的完整值/单位位置。
@@ -219,6 +241,12 @@ HTTP matrix 保持同规则 enabled mapped grok-4.6、enabled direct/unmatched g
 精确检查 data 事件数量、顺序、type/event 名、全部 JSON payload、完整 delta、全部 completed output、opaque 文本、response.model 与 HTTP 200。data-only 的 SSE decoder 默认 event 名为 message，按 JSON type 识别生命周期；没有人为补 event header 的要求。native 单 terminal data-only 的无最终 blank delimiter不能单独算失败，真实 HTTP framer 必须正常派发一条。多个 emit 可含多个有效事件，emit 次数不代替 data 事件数。
 
 CPA fixture 复用已安装 `gin-contrib/sse.Decode` 和 `encoding/json`；该 decoder 只识别 LF，测试只对 parser 输入统一已知 CRLF，原始 captured bytes继续保留，不自行编写 SSE parser。正常 mapped/unmapped/disabled、非流、两类九事件均须通过，才可确认 C/G 完整覆盖 F15。
+
+唯一 actual binary matrix 完整覆盖 `2 providers × 2 input shapes × 2 event counts × 6 transports × 4 route/model controls × 2 stream modes × 4 metadata values = 1536` 个组合。metadata 轴固定为 `none`、`id: event-1`、`retry: 100`、`: heartbeat`，每个有 metadata 的组合在每条正常 event/data 之前生成该 metadata 行；none 保留原完整 384 个组合。fixture/capture identity 包含 metadata 维度，精确核对笛卡尔积、重复和遗漏。连续 metadata 与 event 中/事件之间的位置另由同一永久 fixture 的真实 consumer/native/HTTP/WS 控制覆盖，不减少 binary 矩阵。复用当前进程分组、producer、loader 和 helpers，保存全部 upstream bytes、headers、URI、calls/status 与 client payload。必须运行固定 `cpa.exe`，package 层成功不能代替 binary 验收。
+
+G 完成共享 metadata 修正、根回归、性能和累计独立审查；E 在唯一永久 fixture/入口完成新 metadata baseline RED 与最终 G/E DLL 的相同命令 GREEN。E 可在 G 修正期间并行准备自己的独立完整测试草稿和 baseline 证据，其最终验收与提交依赖 G 已验证产品。扩大 matrix 时增加外层及子进程 deadline，保留完整规模和 race/checkptr；根 race、普通 native DLL 和其他平台实际加载分别报告。共享源码改变后重跑受影响性能 preflight、allocation 与计时，旧报告只作历史对照；正式性能成本、C 原始 RED 日志缺失、Go VCS stamp 与报告者部署限制继续保留。
+
+metadata 文档审查通过后，G/E 各自记录完整固定 BASE、执行起点和全部最终 HEAD，并在自己的新 native worktree 连续完成测试、自审、修正、提交及累计独立复审，不使用 `HEAD~1`。G 原产品 reviewBASE=`51b006438c1a0edd4263020297747f99a174c47c` 仍保留；metadata 审查另外覆盖各自固定 BASE..全部最终 HEAD。修正后完成受影响全分支复审和全部范围核对，才可进入 F；原发布授权、七平台 CI/Release、下载资产/runtime 来源及 issue8/PR7 评论要求保持。
 
 #### 完成条件与发布边界
 

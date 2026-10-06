@@ -2680,6 +2680,811 @@ make package VERSION=0.5.12 GOOS=linux GOARCH=amd64 BUILD_CC="zig cc -target x86
 - [ ] 独立 reviewer 逐项检查规格表 F01..F15 的归属和控制条件，确认 F13 无独立生产任务、F14 无生产网络分片误述、F15 已满足 G2 语义条件且两类 native 永久矩阵完整、每个 layer 的实际结果据实记录。完整核对 G4 的两类 1/9 事件、六种 transport、全部 route／非流、两个 baseline 来源，以及编译、core/host／无 mapper HTTP 控制和新 native DLL GREEN 的区别。覆盖不足由 E 在自己的 worktree 补查和复审，不交给主会话代写。
 - [ ] `git diff --check` 后仅提交 E 实际修改的 integration/CI 文件，永久 fixture 必须随同入口提交：`git add .github/scripts/smoke-local_test.go .github/scripts/testdata/cpa-functional-regression_test.go && git commit -m "test: cover model mapper functional paths in CPA"`。Makefile/CI 只有实际必要修改才加入。
 
+## G/E 后续任务：普通 metadata output units
+
+本节落实 spec 的普通 metadata output units 要求，补充 G/E 的完整验收。原 A..G、E1..E3 和 F 的要求继续适用；当前 `stream_native_fields_regression_test.go`、唯一 CPA fixture 和 smoke 入口已经存在，按本节精确追加或修改，不重复创建。编码须等待本次两文档的累计独立审查通过。文档任务仅验证草稿与未修复 START，不修改产品、tracked tests 或永久 fixture。
+
+### 固定输入、所有权与执行顺序
+
+- metadata baseline 固定为 `3dce8db7373d2da6cfd792a30e2c323e0525bdc5`。F01..F14 baseline=`7855e55904f9a208ef915aa7878b77db8577a294`、原 F15 baseline=`6c7f060f4da5bb33e7b2ecd74c44499c9676a93c` 继续保留。G 原累计产品 reviewBASE=`51b006438c1a0edd4263020297747f99a174c47c` 不变。
+- G-M 只拥有 `main.go` 的共享 Responses rewriter/scanner 必要修改、`stream_native_fields_regression_test.go` 和确实受影响的协议／性能 fixture。不改 A/B 的路由／JSON helper、C 的 executor emit/flush helper、D 的 lifecycle/close 或 CPA。
+- E-M 只拥有 `.github/scripts/testdata/cpa-functional-regression_test.go` 与 `.github/scripts/smoke-local_test.go`。复用当前 producer、helpers、loader、capture generator 和唯一 `TestCPAPluginIntegration`，不增加第二入口、fixture、parser 或依赖。Makefile/CI 的原显式文件命令无需因扩大同一 matrix 改变。
+- G-M 与 E-M 各在新的 native 允许 worktree 执行。E-M 可并行准备独立完整草稿及 START DLL 的 baseline RED；最终 GREEN、独立审查和任务提交依赖 G-M 的已验证产品及全部原整合修复。协调者只接收完成且范围无冲突的提交，不代写剩余步骤。产品任务的独立 reviewer 由既定 workflow 安排，使用可用 `[1m]` 型号并主动回报完成。
+- 各自开始时记录完整固定 `taskBASE` 和执行起点 SHA，之后保持不变。G-M 的额外 metadata review 至少覆盖固定 START..全部最终 HEAD，并保留固定 C..全部最终 HEAD 的原产品审查；E-M 的 taskBASE 为协调者实际交付的、包含已完成 G-M 的完整整合起点。独立草稿移入该起点后完整重跑。禁止用 `HEAD~1` 或最后一个修正提交代替累计范围。
+
+### G-M1：根目标 RED 与原正常控制
+
+- [ ] 核查分配目录、clean、branch、完整交付 SHA 和固定 START/C ancestry，读取 spec 与本节。使用自身 Git objects 的固定 START archive 在 OS 临时目录构建 baseline；使用成熟 archive parser，不执行 Git 回退，不修改其他 worktree 或 module cache。稳定证据保存自己已忽略的 `dist/` 专用目录。
+- [ ] 在现有 `stream_native_fields_regression_test.go` 追加下列完整 Go 内容。草稿的 package/import 声明用于独立编译；合入时合并已有 imports，只追加函数。复用 `gNativeFields`、`gNativeParts`、`gRequireNativeFrames`、`gNativeLargeFixture`、`gNativeContinue`，不再复制这些 helper。它们检查精确字段边界、全部 payload、单个／连续 metadata、三个位置、两种形状、1/9 事件、Flush/Finish、ownership、真实 forwarder 错误／close 及 continuation。只有单 terminal data-only 容许已有的最后 blank delimiter 差别，其余精确比较完整输出。
+
+```go
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+
+	pluginabi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
+	pluginapi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+)
+
+func TestFunctionalNativeSSEFieldOrdinaryMetadataOutputUnits(t *testing.T) {
+	for _, metadata := range [][]string{nil, {"id: event-1"}, {"retry: 100"}, {": heartbeat"}, {"id: event-1", "retry: 100", `: opaque event: response.created data: {"model":"grok-4.7"} 中文`}} {
+		for _, dataOnly := range []bool{false, true} {
+			for _, count := range []int{1, 9} {
+				for _, finish := range []bool{false, true} {
+					t.Run(fmt.Sprintf("metadata=%q/dataOnly=%v/count=%d/finish=%v", metadata, dataOnly, count, finish), func(t *testing.T) {
+						parts, want, types := gNativeFields(dataOnly, count)
+						var prefix []byte
+						var inputs [][]byte
+						for _, field := range metadata {
+							inputs = append(inputs, []byte(field))
+							prefix = append(prefix, []byte(field+"\n")...)
+						}
+						inputs = append(inputs, parts...)
+						want = append(prefix, want...)
+						r := newStreamChunkRewriter("grok-4.6")
+						r.format, r.frameRawJSONAsSSE = "openai-response", true
+						var chunks [][]byte
+						for _, field := range inputs {
+							out, err := r.Write(field)
+							if err != nil {
+								t.Fatal(err)
+							}
+							chunks = append(chunks, out...)
+							for i := range field {
+								field[i] = 'z'
+							}
+						}
+						var out [][]byte
+						var err error
+						if finish {
+							out, err = r.Finish()
+						} else {
+							out, err = r.Flush()
+						}
+						if err != nil {
+							t.Fatal(err)
+						}
+						chunks = append(chunks, out...)
+						got := bytes.Join(chunks, nil)
+						comparable := got
+						if dataOnly && count == 1 {
+							comparable, want = bytes.TrimSuffix(got, []byte("\n\n")), bytes.TrimSuffix(want, []byte("\n\n"))
+						}
+						if !bytes.Equal(comparable, want) {
+							t.Fatalf("metadata output=%q want=%q", got, want)
+						}
+						gRequireNativeFrames(t, got, types, dataOnly)
+						frozen := bytes.Clone(got)
+						if _, err := r.Write([]byte("data: {}\n\n")); err != nil {
+							t.Fatal(err)
+						}
+						if !bytes.Equal(bytes.Join(chunks, nil), frozen) {
+							t.Fatal("previous metadata output changed after future Write")
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestFunctionalNativeSSEFieldOrdinaryMetadataPositions(t *testing.T) {
+	for _, metadata := range [][]string{{"id: event-1"}, {"retry: 100"}, {": heartbeat"}, {"id: event-1", "retry: 100", `: opaque event: response.created data: {"model":"grok-4.7"} 中文`}} {
+		for _, dataOnly := range []bool{false, true} {
+			for _, count := range []int{1, 9} {
+				for _, position := range []string{"before-event", "in-event", "between-events"} {
+					t.Run(fmt.Sprintf("metadata=%q/dataOnly=%v/count=%d/%s", metadata, dataOnly, count, position), func(t *testing.T) {
+						parts, wire, types := gNativeFields(dataOnly, count)
+						units := bytes.SplitAfter(wire, []byte("\n\n"))[:count]
+						var input [][]byte
+						var want []byte
+						stride := 2
+						if dataOnly {
+							stride = 1
+						}
+						for i, unit := range units {
+							prefix := []byte(strings.Join(metadata, "\n") + "\n")
+							if position == "between-events" && i == 0 {
+								prefix = nil
+							}
+							fields := parts[i*stride : (i+1)*stride]
+							if position == "in-event" && !dataOnly {
+								input = append(input, fields[0])
+								for _, field := range metadata {
+									input = append(input, []byte(field))
+								}
+								input = append(input, fields[1])
+								line, rest, ok := bytes.Cut(unit, []byte("\n"))
+								if !ok {
+									t.Fatal("fixture has no event line")
+								}
+								want = append(want, line...)
+								want = append(want, '\n')
+								want = append(want, prefix...)
+								want = append(want, rest...)
+							} else {
+								if len(prefix) > 0 {
+									for _, field := range metadata {
+										input = append(input, []byte(field))
+									}
+								}
+								input = append(input, fields...)
+								want = append(want, prefix...)
+								want = append(want, unit...)
+							}
+						}
+						got := gNativeParts(t, "openai-response", true, input...)
+						comparable := got
+						if dataOnly && count == 1 {
+							comparable, want = bytes.TrimSuffix(got, []byte("\n\n")), bytes.TrimSuffix(want, []byte("\n\n"))
+						}
+						if !bytes.Equal(comparable, want) {
+							t.Fatalf("position output=%q want=%q", got, want)
+						}
+						gRequireNativeFrames(t, got, types, dataOnly)
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestFunctionalNativeSSEFieldOrdinaryMetadataWire(t *testing.T) {
+	for _, eol := range []string{"\n", "\r\n"} {
+		wire := []byte("id: event-1" + eol + "retry: 100" + eol + `: opaque event: response.created data: {"model":"grok-4.7"} 中文` + eol + "event: response.completed" + eol + "data: " + gNativeCompleted + eol + eol)
+		want := bytes.Replace(wire, []byte("data: "+gNativeCompleted), []byte("data: "+gNativeCompletedWant), 1)
+		for split := 0; split <= len(wire); split++ {
+			if got := gNativeParts(t, "claude", true, wire[:split], wire[split:]); !bytes.Equal(got, want) {
+				t.Fatalf("eol=%q split=%d got=%q want=%q", eol, split, got, want)
+			}
+		}
+		parts := make([][]byte, len(wire))
+		for i := range wire {
+			parts[i] = wire[i : i+1]
+		}
+		if got := gNativeParts(t, "claude", true, parts...); !bytes.Equal(got, want) {
+			t.Fatalf("eol=%q bytewise output=%q want=%q", eol, got, want)
+		}
+	}
+}
+
+func TestFunctionalNativeSSEFieldOrdinaryMetadataForwarder(t *testing.T) {
+	for _, metadata := range []string{"id: event-1", "retry: 100", ": heartbeat"} {
+		for _, terminal := range []string{"natural", "done-payload", "in-band-error", "callback-error", "cleanup-errors", "emit-error"} {
+			t.Run(metadata+"/"+terminal, func(t *testing.T) {
+				reads := []pluginapi.HostModelStreamReadResponse{{Payload: []byte(metadata)}, {Payload: []byte("event: response.completed")}, {Payload: []byte("data: " + gNativeCompleted)}, {Done: true}}
+				if terminal == "done-payload" {
+					reads[2].Done = true
+				}
+				if terminal == "in-band-error" || terminal == "cleanup-errors" {
+					reads[2].Error, reads[2].Done = "controlled upstream read error", true
+				}
+				readErr, hostErr, pluginErr, emitErr := errors.New("controlled callback read error"), errors.New("controlled host close error"), errors.New("controlled plugin close error"), errors.New("controlled emit error")
+				var output []byte
+				var order []string
+				var closeText string
+				readCount, hostCloses, pluginCloses := 0, 0, 0
+				stream := &executorStream{pluginStreamID: "metadata-draft", hostStreamID: "metadata-host", originalModel: "grok-4.6", format: "openai-response", frameRawJSONAsSSE: true}
+				stream.call = func(method string, payload any) (json.RawMessage, error) {
+					switch method {
+					case pluginabi.MethodHostModelStreamRead:
+						readCount++
+						if terminal == "callback-error" && readCount == 4 {
+							return nil, readErr
+						}
+						if len(reads) == 0 {
+							return nil, errors.New("unexpected extra read")
+						}
+						next := reads[0]
+						reads = reads[1:]
+						return json.Marshal(next)
+					case pluginabi.MethodHostStreamEmit:
+						order = append(order, "emit")
+						raw, err := json.Marshal(payload)
+						if err != nil {
+							return nil, err
+						}
+						var emit struct{ Payload []byte }
+						if err := json.Unmarshal(raw, &emit); err != nil {
+							return nil, err
+						}
+						output = append(output, emit.Payload...)
+						if terminal == "emit-error" && hasSSEDataField(emit.Payload) {
+							return nil, emitErr
+						}
+					case pluginabi.MethodHostModelStreamClose:
+						hostCloses++
+						order = append(order, "host-close")
+						if terminal == "cleanup-errors" {
+							return nil, hostErr
+						}
+					case pluginabi.MethodHostStreamClose:
+						pluginCloses++
+						order = append(order, "plugin-close")
+						raw, err := json.Marshal(payload)
+						if err != nil {
+							return nil, err
+						}
+						var closed struct{ Error string }
+						if err := json.Unmarshal(raw, &closed); err != nil {
+							return nil, err
+						}
+						closeText = closed.Error
+						if terminal == "cleanup-errors" {
+							return nil, pluginErr
+						}
+					default:
+						return nil, fmt.Errorf("unexpected method %s", method)
+					}
+					return json.RawMessage(`{}`), nil
+				}
+				err := runStreamForward(stream)
+				want := []byte(metadata + "\nevent: response.completed\ndata: " + gNativeCompletedWant + "\n\n")
+				if !bytes.Equal(output, want) {
+					t.Errorf("metadata forwarder=%q want=%q", output, want)
+				}
+				if hostCloses != 1 || len(order) == 0 {
+					t.Fatalf("order=%v host closes=%d", order, hostCloses)
+				}
+				wantCloses := "host-close,plugin-close"
+				if terminal == "callback-error" {
+					wantCloses = "host-close"
+				}
+				var closes []string
+				for _, action := range order {
+					if action != "emit" {
+						closes = append(closes, action)
+					}
+				}
+				if strings.Join(closes, ",") != wantCloses || order[0] != "emit" {
+					t.Errorf("order=%v want emit before %s", order, wantCloses)
+				}
+				switch terminal {
+				case "callback-error":
+					if !errors.Is(err, readErr) || pluginCloses != 0 || readCount != 4 {
+						t.Errorf("error=%v plugin closes=%d reads=%d", err, pluginCloses, readCount)
+					}
+				case "cleanup-errors":
+					if !errors.Is(err, hostErr) || !errors.Is(err, pluginErr) || !strings.Contains(closeText, "controlled upstream read error") || !strings.Contains(closeText, hostErr.Error()) || pluginCloses != 1 || readCount != 3 {
+						t.Errorf("error=%v close=%q plugin closes=%d reads=%d", err, closeText, pluginCloses, readCount)
+					}
+				default:
+					wantError, wantReads := "", 3
+					if terminal == "natural" {
+						wantReads = 4
+					} else if terminal == "in-band-error" {
+						wantError = "controlled upstream read error"
+					} else if terminal == "emit-error" {
+						wantError = "emit stream chunk: " + emitErr.Error()
+					}
+					if err != nil || closeText != wantError || pluginCloses != 1 || readCount != wantReads {
+						t.Errorf("error=%v close=%q plugin closes=%d reads=%d", err, closeText, pluginCloses, readCount)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestFunctionalNativeSSEFieldOrdinaryMetadataDispatch(t *testing.T) {
+	for _, metadata := range [][]string{{"id: event-1"}, {"retry: 100"}, {": heartbeat"}, {"id: event-1", "retry: 100", `: opaque event: response.created data: {"model":"grok-4.7"} 中文`}} {
+		for _, dataOnly := range []bool{false, true} {
+			for _, eol := range []string{"\n", "\r\n"} {
+				t.Run(fmt.Sprintf("metadata=%q/dataOnly=%v/eol=%q", metadata, dataOnly, eol), func(t *testing.T) {
+					r := newStreamChunkRewriter("grok-4.6")
+					r.format, r.frameRawJSONAsSSE = "openai-response", true
+					parts, want, types := gNativeFields(dataOnly, 2)
+					want = append([]byte(strings.Join(metadata, "\n")+"\n"), want...)
+					var got []byte
+					for _, field := range metadata {
+						out, err := r.Write([]byte(field))
+						got = append(got, bytes.Join(out, nil)...)
+						if err != nil || bytes.Contains(got, []byte("\ndata:")) {
+							t.Fatalf("metadata dispatched data=%q error=%v", got, err)
+						}
+					}
+					for i, part := range parts {
+						out, err := r.Write(part)
+						got = append(got, bytes.Join(out, nil)...)
+						frames := (i + 1) / 2
+						if dataOnly {
+							frames = i
+						}
+						if err != nil || bytes.Count(got, []byte("\ndata: ")) != frames {
+							t.Fatalf("callback=%d dataFrames=%d want=%d output=%q error=%v", i+1, bytes.Count(got, []byte("\ndata: ")), frames, got, err)
+						}
+					}
+					out, err := r.Write([]byte(eol + eol))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if dataOnly {
+						got = append(got, bytes.Join(out, nil)...)
+					} else if len(bytes.TrimSpace(bytes.Join(out, nil))) != 0 {
+						t.Fatalf("late delimiter added event=%q", out)
+					}
+					out, err = r.Finish()
+					if dataOnly {
+						got = append(got, bytes.Join(out, nil)...)
+					} else if len(bytes.TrimSpace(bytes.Join(out, nil))) != 0 {
+						t.Fatalf("Finish added event=%q", out)
+					}
+					if err != nil || !bytes.Equal(bytes.ReplaceAll(got, []byte("\r\n"), []byte("\n")), want) {
+						t.Fatalf("late delimiter output=%q error=%v want=%q", got, err, want)
+					}
+					gRequireNativeFrames(t, bytes.ReplaceAll(got, []byte("\r\n"), []byte("\n")), types, dataOnly)
+				})
+			}
+		}
+	}
+}
+
+func gNativeOrdinaryMetadataLargeFixture(size int, dataOnly bool) ([][]byte, []byte) {
+	parts, want := gNativeLargeFixture(size, dataOnly)
+	metadata := [][]byte{[]byte("id: event-1"), []byte("retry: 100"), []byte(`: opaque event: response.created data: {"model":"grok-4.7"} 中文`)}
+	prefix := append(bytes.Join(metadata, []byte("\n")), '\n')
+	return append(metadata, parts...), append(prefix, want...)
+}
+
+func TestFunctionalNativeSSEFieldOrdinaryMetadataContinuation(t *testing.T) {
+	for _, dataOnly := range []bool{false, true} {
+		for _, size := range []int{2 << 20, 8 << 20} {
+			t.Run(fmt.Sprintf("dataOnly=%v/bytes=%d", dataOnly, size), func(t *testing.T) {
+				parts, want := gNativeOrdinaryMetadataLargeFixture(size, dataOnly)
+				chunks, err := gNativeContinue(parts)
+				if err != nil || !bytes.Equal(bytes.TrimSuffix(bytes.Join(chunks, nil), []byte("\n\n")), bytes.TrimSuffix(want, []byte("\n\n"))) {
+					t.Fatalf("continuation error=%v", err)
+				}
+				if size == 2<<20 {
+					allocs := testing.AllocsPerRun(1, func() {
+						out, err := gNativeContinue(parts)
+						if err != nil || !bytes.Equal(bytes.TrimSuffix(bytes.Join(out, nil), []byte("\n\n")), bytes.TrimSuffix(want, []byte("\n\n"))) {
+							panic(fmt.Sprintf("allocation preflight error=%v", err))
+						}
+					})
+					if allocs > 200 {
+						t.Fatalf("allocations=%v want<=200", allocs)
+					}
+				}
+				for _, part := range parts {
+					for i := range part {
+						part[i] = 'z'
+					}
+				}
+				if !bytes.Equal(bytes.TrimSuffix(bytes.Join(chunks, nil), []byte("\n\n")), bytes.TrimSuffix(want, []byte("\n\n"))) {
+					t.Fatal("metadata continuation aliases input")
+				}
+			})
+		}
+	}
+}
+
+func BenchmarkStreamChunkRewriterOrdinaryMetadataContinuation(b *testing.B) {
+	for _, dataOnly := range []bool{false, true} {
+		for _, size := range []int{2 << 20, 8 << 20} {
+			b.Run(fmt.Sprintf("dataOnly=%v/bytes=%d/fragment=8192", dataOnly, size), func(b *testing.B) {
+				parts, want := gNativeOrdinaryMetadataLargeFixture(size, dataOnly)
+				chunks, err := gNativeContinue(parts)
+				if err != nil || !bytes.Equal(bytes.TrimSuffix(bytes.Join(chunks, nil), []byte("\n\n")), bytes.TrimSuffix(want, []byte("\n\n"))) {
+					b.Fatalf("byte-exact metadata preflight error=%v", err)
+				}
+				b.ReportAllocs()
+				b.SetBytes(int64(len(want)))
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					chunks, err = gNativeContinue(parts)
+					if err != nil || len(chunks) == 0 {
+						b.Fatalf("continuation=(%d,%v)", len(chunks), err)
+					}
+				}
+			})
+		}
+	}
+}
+```
+
+- [ ] 在任何产品 Edit 之前先 gofmt 和编译，再运行相同 focused 命令。当前 START 的目标输出是 metadata/event/data 被拼成一行、真实 dataFrames 为零且 JSON model 未恢复；Forwarder 的有效输出缺失会同时使 emit-error 控制未触发。记录具体内容差异，不把编译、启动、缺环境或不适用的旧序列化期望计为 RED。none、Wire 和原正常控制分别记录。
+
+```bash
+G=$(git rev-parse --show-toplevel)
+metadataBASE=3dce8db7373d2da6cfd792a30e2c323e0525bdc5
+startHEAD=$(git -C "$G" rev-parse HEAD)
+git -C "$G" merge-base --is-ancestor "$metadataBASE" "$startHEAD"
+gofmt -w "$G/stream_native_fields_regression_test.go"
+go -C "$G" test -mod=readonly . -run '^$'
+go -C "$G" test -mod=readonly -count=2 -v . -run '^TestFunctionalNativeSSEFieldOrdinaryMetadata' -timeout 240s
+go -C "$G" test -mod=readonly -count=1 -v . -run '^TestFunctionalNativeSSEField(Boundary|Sequence|DataOnlyTerminalControl|Dispatch|LateDelimiter|LateDataDelimiter|WireControls|GenericCanonicalControls|ResponsesMetadataControl|MetadataOutputUnits|MetadataForwarder|FormatIsolation|Discriminator|DataOnlyTypeControl|Limit|Continuation|ContinuationAllocations|InputOwnership)$' -timeout 300s
+```
+
+### G-M2：共享修正、GREEN、性能与累计审查
+
+- [ ] 有限核查 `(*streamChunkRewriter).Write/Flush/Finish`、`(*sseRewriter).Write/drain`、`findDelimiterlessResponsesEventEnd`、scanner/reset，以及实际调用者 `processPayload`、`flushAndEmit`、`runStreamForward`。当前 `sseRewriter.Write` 仅在新 `data:` 与已记录 response header/data 候选之间恢复边界，metadata 起首使 scanner disabled，后续字段直接 append。在同一共享 output-unit 状态中保留独立 metadata 的原 bytes 和真实字段末尾，使真正 event/data 继续走已有 discriminator、增量定位及 `rewriteEvent`。完整值定位、验证、候选保存与派发分别保持明确时点；已记录候选不从零重复扫描整个 JSON。
+- [ ] 修正必须同时通过 metadata 起首、event 中、事件之间和连续 metadata；metadata 本身不成为 event/type/JSON discriminator。保留原 field-pair `0、1、1、2` 时机、data-only 下一 data/Flush 时机、迟到 delimiter、canonical mismatch、whole event-only opaque metadata、generic wire 的全部 split/bytewise/LF/CR/CRLF/BOM 和标准 delimiter 等待。不要对 generic 任意 read/网络片段补 LF；不添加 provider/substring 推断、ABI flag、配置、parser、timeout、fallback 或 HTTP/WS 各自处理。真实消费者的相反条件仍按 G2 停止并交回具体证据，不降低要求。
+- [ ] 保持六项模型白名单、16 MiB incomplete 限额、完整 prefix/chunks+error、当前 batching、输入／输出 ownership、自然 EOF、Payload+Done、in-band/callback/emit/cleanup errors、host close 一次及原 plugin close 策略。root callback mock 只隔离 host 调用，不代替 E-M 的真实链路。
+- [ ] 产品修正后重新运行 G-M1 的原样 focused/control 命令，全部 GREEN；然后运行完整根测试、vet、race 和既有注册／schema。root race 使用真实检查参数，普通 native DLL 的集成另外运行，不关闭 checkptr/race。
+
+```bash
+go -C "$G" test -mod=readonly -count=1 ./...
+go -C "$G" vet -mod=readonly ./...
+go -C "$G" test -mod=readonly -race -count=1 ./... -timeout 600s
+go -C "$G" test -mod=readonly -count=1 . -run 'TestPluginRegistrationMetadataAndConfigFields|TestPluginRegisterKeepsSchemaOneForNewerHost|TestHandleMethodDispatchesRegisterReconfigureAndUnknown'
+go -C "$G" test -mod=readonly . -run '^$' -bench '^Benchmark(StreamChunkRewriter(NativeFieldContinuation|OrdinaryMetadataContinuation)|SSEMarkerGuard(Restore|Candidate))$' -benchtime=1x -count=1 -benchmem
+go -C "$G" test -mod=readonly . -run '^$' -bench '^Benchmark(StreamChunkRewriter(NativeFieldContinuation|OrdinaryMetadataContinuation)|RewriteTopLevelModel|RestoreResponseModel|RestoreResponseWithoutModel|ResponseModelMarkerScan|SSEMarkerGuard(Restore|Candidate)|StreamChunkRewriter(FragmentedRawJSON|SingleJSON|CompleteSSEBatch|EscapedSSEBatch|UnicodeEscapedSSEBatch)|EmitRewrittenBatch)$' -count=5 -benchmem
+```
+
+- [ ] 受影响 benchmark 先通过 byte-exact preflight，再在同机器、Go、构建参数下计时。metadata 与 none 的两类 2 MiB/8 KiB allocation <=200，2 MiB 与 8 MiB continuation 检查实际 ns/op、B/op、allocs/op 和增量游标。全部既有 allocation 门槛保持。START 的 metadata preflight 已失败，不计时错误输出、不把旧性能报告写成新 HEAD 数据；保留正式性能成本并据实际新增扫描／复制定位稳定回归，再修正复测。
+- [ ] 自审逐项对应 spec、G-M1 全部测试和原 G3/G5，确认只修改 G-owned 内容。完成独立规格／质量累计审查、确认 finding 的修正和同 BASE..全部最终 HEAD 复审；每次产品修正重跑受影响 focused/control、root/vet/race，性能相关修正重跑 preflight 与计时。
+- [ ] 提交实际 G-owned 修改，body 保留归属；提交后核对完整 message、scope、clean 和最终 HEAD，向 E-M/协调者主动交付实际修复 SHA、固定 BASE、测试／性能日志、累计 diff 和限制。没有产品 diff 时记录真实归属，只提交缺失回归。
+
+```bash
+git -C "$G" diff --check
+git -C "$G" add -- main.go stream_native_fields_regression_test.go
+git -C "$G" commit -m 'fix: preserve ordinary Responses metadata output units' -m 'Refs: #8
+Related-PR: #7
+PR-Author: @leolmq'
+git -C "$G" log -1 --format='%H%n%B'
+git -C "$G" diff --binary "$metadataBASE"..HEAD
+git -C "$G" diff --binary 51b006438c1a0edd4263020297747f99a174c47c..HEAD
+```
+
+必要协议／性能 fixture 有实际修改时仅把对应文件加入同次提交；不 stage 无关内容，不改写旧提交署名。
+
+### E-M1：唯一 fixture、真实消费者与 metadata 矩阵
+
+- [ ] 先在自己的独立草稿和 OS 临时可写 CPA v7.2.152 副本准备测试，保留原模块只读。固定 module Sum、integration revision、真实 `.6/.7` model 注册、source/copy/shadow hash、有效 enabled/disabled 状态沿用当前 loader/process helper。准备阶段可对 START DLL 运行 RED；接收 G-M 已验证产品后，从交付完整起点记录固定 E-M taskBASE，并在自己的 worktree 完成全部 GREEN、自审、修正、独立复审和提交。
+- [ ] 在唯一 CPA fixture 用下面完整内容替换 `gCPAFieldsFixture`、`gCPAFieldsFixtures`、`gCPAFields`；其余现有 helper/测试保留。共有 96 个 fixture，每个 metadata 行在对应 event/data 前生成。固定 six transports 不变，none 保留原完整组合。循环的 labels 同 binary generator 保持逐字一致。
+
+```go
+type gCPAFieldsFixture struct {
+	name, eol, contentType, metadata string
+	step                             int
+	dataOnly                         bool
+	count                            int
+}
+
+func gCPAFieldsFixtures() []gCPAFieldsFixture {
+	var out []gCPAFieldsFixture
+	for _, dataOnly := range []bool{false, true} {
+		for _, count := range []int{1, 9} {
+			for _, transport := range []gCPAFieldsFixture{
+				{name: "LF-whole", eol: "\n", contentType: "text/event-stream"},
+				{name: "CRLF-whole", eol: "\r\n", contentType: "text/event-stream"},
+				{name: "LF-7bytes", eol: "\n", contentType: "text/event-stream", step: 7},
+				{name: "CRLF-bytewise", eol: "\r\n", contentType: "text/event-stream", step: 1},
+				{name: "LF-charset", eol: "\n", contentType: "text/event-stream; charset=utf-8", step: 11},
+				{name: "CRLF-charset", eol: "\r\n", contentType: "text/event-stream; charset=utf-8", step: 7},
+			} {
+				for _, metadata := range []string{"", "id: event-1", "retry: 100", ": heartbeat"} {
+					f := transport
+					f.dataOnly, f.count, f.metadata = dataOnly, count, metadata
+					label := metadata
+					if label == "" {
+						label = "none"
+					}
+					f.name = fmt.Sprintf("dataOnly=%v/count=%d/%s/metadata=%s", dataOnly, count, f.name, label)
+					out = append(out, f)
+				}
+			}
+		}
+	}
+	return out
+}
+
+func gCPAFields(f gCPAFieldsFixture, model string) ([]string, []byte) {
+	var fields []string
+	var wire bytes.Buffer
+	for _, payload := range gCPAPayloads(model, f.count) {
+		var event struct{ Type string }
+		if err := json.Unmarshal([]byte(payload), &event); err != nil {
+			panic(err)
+		}
+		if f.metadata != "" {
+			fields = append(fields, f.metadata)
+			fmt.Fprintf(&wire, "%s%s", f.metadata, f.eol)
+		}
+		if !f.dataOnly {
+			fields = append(fields, "event: "+event.Type)
+			fmt.Fprintf(&wire, "event: %s%s", event.Type, f.eol)
+		}
+		fields = append(fields, "data: "+payload)
+		fmt.Fprintf(&wire, "data: %s%s%s", payload, f.eol, f.eol)
+	}
+	return fields, wire.Bytes()
+}
+```
+
+- [ ] 在 `gCPARequireEvents` 的 `t.Helper()` 后加入下面检查，之后完整保留 `sse.Decode`、event/type、全部 JSON、output/model/opaque 和 DONE 检查。只对成熟 decoder 输入统一已知 CRLF；原始 bytes 另存。
+
+```go
+if f.metadata != "" {
+    normalized := bytes.ReplaceAll(raw, []byte("\r\n"), []byte("\n"))
+    if got := bytes.Count(append([]byte("\n"), normalized...), []byte("\n"+f.metadata+"\n")); got != f.count {
+        t.Fatalf("metadata count=%d want=%d bytes=%q", got, f.count, raw)
+    }
+}
+```
+
+- [ ] 在唯一 CPA fixture 追加下列完整测试，合并草稿 package/import 声明所列的已有项，只追加函数，不创建第二文件。真实 core/host、native、direct HTTP/WS 与 mapped HTTP/WS 分为独立 subtest，目标 native 失败不会跳过 HTTP/WS。disabled WS 对两个实际模型独立检查，原 `NativeFieldsHTTP` 继续覆盖 disabled/mapped/direct 非流和流。metadata 位置控制运行真实未加载 mapper 消费链，固定 before-event/in-event/between-events；连续 opaque comment 不解析。G-M 完成后，还须把同位置的 mapped native/HTTP/WS 纳入相同测试，复用已给出的 producer、loader、HTTP/WS helpers 和精确预期，不删 direct 控制。新增 unknown 字段的 callback 支持只有原消费者实际支持证据成立时才增加，不以 generic wire 控制推断。
+
+```go
+package pluginhost
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestModelMapperFunctionalOrdinaryMetadata(t *testing.T) {
+	for _, provider := range []string{"xai", "codex"} {
+		for _, f := range gCPAFieldsFixtures() {
+			t.Run(provider+"/"+f.name, func(t *testing.T) {
+				p := gCPANewLocalProducer(t, provider)
+				p.setFixture(f)
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				defer cancel()
+				gCPARequireFields(t, gCPACoreFields(t, p, ctx), f, "grok-4.7")
+				gCPARequireFields(t, gCPAHostFields(t, p, ctx), f, "grok-4.7")
+				server := eResponsesServer(t, p.base)
+				t.Run("direct", func(t *testing.T) {
+					status, _, raw := eHTTP(t, server, "/v1/responses", gCPARequest("grok-4.7", true))
+					if status != 200 {
+						t.Fatalf("direct HTTP=%d body=%q", status, raw)
+					}
+					gCPARequireEvents(t, raw, f, "grok-4.7")
+					ws, err := eWS(t, server, "grok-4.7")
+					if err != nil || !reflect.DeepEqual(ws, gCPAPayloads("grok-4.7", f.count)) {
+						t.Fatalf("direct WS=%q error=%v", ws, err)
+					}
+				})
+				host := gCPALoadNative(t, p, true)
+				canonical := f
+				canonical.eol = "\n"
+				_, want := gCPAFields(canonical, "grok-4.6")
+				t.Run("mapped-native", func(t *testing.T) {
+					result, err := host.activeRecords()[0].plugin.Capabilities.Executor.ExecuteStream(ctx, eNativeRequest("grok-4.6", "openai-response", true))
+					if err != nil {
+						t.Fatal(err)
+					}
+					raw, errs := eNativeDrain(t, result.Chunks)
+					t.Logf("native=%q errors=%q", raw, errs)
+					comparable, expected := raw, want
+					if f.dataOnly && f.count == 1 {
+						comparable, expected = bytes.TrimSuffix(raw, []byte("\n\n")), bytes.TrimSuffix(want, []byte("\n\n"))
+					}
+					if len(errs) != 0 || !bytes.Equal(comparable, expected) {
+						t.Errorf("mapped native bytes=%q errors=%q want=%q", raw, errs, expected)
+					}
+					gCPARequireEvents(t, raw, f, "grok-4.6")
+				})
+				p.base.SetPluginHost(host)
+				p.base.SetModelRouterHost(host)
+				t.Run("mapped-http", func(t *testing.T) {
+					status, _, raw := eHTTP(t, server, "/v1/responses", gCPARequest("grok-4.6", true))
+					t.Logf("mapped HTTP=%d body=%q", status, raw)
+					if status != 200 {
+						t.Fatalf("mapped HTTP=%d want=200", status)
+					}
+					gCPARequireEvents(t, raw, f, "grok-4.6")
+					if !bytes.Equal(raw, append(bytes.Clone(want), '\n')) {
+						t.Fatalf("mapped HTTP bytes=%q want=%q", raw, append(bytes.Clone(want), '\n'))
+					}
+				})
+				t.Run("mapped-ws", func(t *testing.T) {
+					ws, err := eWS(t, server, "grok-4.6")
+					t.Logf("mapped WS=%q error=%v", ws, err)
+					if err != nil || !reflect.DeepEqual(ws, gCPAPayloads("grok-4.6", f.count)) {
+						t.Fatalf("mapped WS=%q error=%v", ws, err)
+					}
+				})
+			})
+		}
+	}
+}
+
+func TestModelMapperFunctionalOrdinaryMetadataDisabledWS(t *testing.T) {
+	for _, provider := range []string{"xai", "codex"} {
+		p := gCPANewLocalProducer(t, provider)
+		host := gCPALoadNative(t, p, false)
+		p.base.SetPluginHost(host)
+		p.base.SetModelRouterHost(host)
+		server := eResponsesServer(t, p.base)
+		for _, f := range gCPAFieldsFixtures() {
+			for _, model := range []string{"grok-4.6", "grok-4.7"} {
+				t.Run(provider+"/"+f.name+"/"+model, func(t *testing.T) {
+					p.setFixture(f)
+					ws, err := eWS(t, server, model)
+					if err != nil || !reflect.DeepEqual(ws, gCPAPayloads(model, f.count)) {
+						t.Fatalf("disabled WS=%q error=%v", ws, err)
+					}
+					p.mu.Lock()
+					calls := append([]gCPAUpstreamRecord(nil), p.records...)
+					p.mu.Unlock()
+					if len(calls) != 1 || calls[0].model != model {
+						t.Fatalf("disabled calls=%+v", calls)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestModelMapperFunctionalOrdinaryMetadataConsumerControls(t *testing.T) {
+	for _, provider := range []string{"xai", "codex"} {
+		for _, dataOnly := range []bool{false, true} {
+			for _, count := range []int{1, 9} {
+				for _, metadata := range [][]string{{"id: event-1"}, {"retry: 100"}, {": heartbeat"}, {"id: event-1", "retry: 100", `: opaque event: response.created data: {"model":"grok-4.7"} 中文`}} {
+					for _, position := range []string{"before-event", "in-event", "between-events"} {
+						t.Run(fmt.Sprintf("%s/dataOnly=%v/count=%d/metadata=%q/%s", provider, dataOnly, count, metadata, position), func(t *testing.T) {
+							p := gCPANewLocalProducer(t, provider)
+							f := gCPAFieldsFixture{count: count, dataOnly: dataOnly, contentType: "text/event-stream", eol: "\n"}
+							p.fixture = f
+							var fields []string
+							var wire strings.Builder
+							original, _ := gCPAFields(gCPAFieldsFixture{count: count, dataOnly: false, eol: "\n"}, "grok-4.7")
+							for i, payload := range gCPAPayloads("grok-4.7", count) {
+								name := original[i*2]
+								add := func(value string) { fields = append(fields, value); wire.WriteString(value + "\n") }
+								if position == "before-event" || position == "between-events" && i > 0 {
+									for _, field := range metadata {
+										add(field)
+									}
+								}
+								if !dataOnly {
+									add(name)
+								}
+								if position == "in-event" {
+									for _, field := range metadata {
+										add(field)
+									}
+								}
+								add("data: " + payload)
+								wire.WriteByte('\n')
+							}
+							p.wire = []byte(wire.String())
+							ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+							defer cancel()
+							if got := gCPACoreFields(t, p, ctx); !reflect.DeepEqual(got, fields) {
+								t.Fatalf("core=%q want=%q", got, fields)
+							}
+							if got := gCPAHostFields(t, p, ctx); !reflect.DeepEqual(got, fields) {
+								t.Fatalf("host=%q want=%q", got, fields)
+							}
+							server := eResponsesServer(t, p.base)
+							status, _, raw := eHTTP(t, server, "/v1/responses", gCPARequest("grok-4.7", true))
+							if status != 200 {
+								t.Fatalf("direct HTTP=%d body=%q", status, raw)
+							}
+							gCPARequireEvents(t, raw, f, "grok-4.7")
+							for _, field := range metadata {
+								expected := count
+								if position == "between-events" {
+									expected = count - 1
+								}
+								if bytes.Count(raw, []byte(field+"\n")) != expected {
+									t.Fatalf("metadata field=%q count=%d want=%d bytes=%q", field, bytes.Count(raw, []byte(field+"\n")), expected, raw)
+								}
+							}
+							ws, err := eWS(t, server, "grok-4.7")
+							if err != nil || !reflect.DeepEqual(ws, gCPAPayloads("grok-4.7", count)) {
+								t.Fatalf("direct WS=%q error=%v", ws, err)
+							}
+							t.Logf("original consumer position=%s HTTP=%q WS=%q", position, raw, ws)
+						})
+					}
+				}
+			}
+		}
+	}
+}
+```
+
+- [ ] mapped 位置检查在现有位置控制测试里完成：direct 子测试完成后加载 `gCPALoadNative(t, p, true)`、设置两个 host、调用真实 native/HTTP/WS，预期使用 `gCPAPayloads("grok-4.6", count)`；metadata 的每行出现次数与原控制相同。以下是追加在同一 position subtest 中的完整代码，所需符号来自唯一 fixture。
+
+```go
+host := gCPALoadNative(t, p, true)
+requireMetadata := func(t *testing.T, raw []byte) {
+    t.Helper()
+    for _, field := range metadata {
+        expected := count
+        if position == "between-events" { expected = count-1 }
+        if got := bytes.Count(raw, []byte(field+"\n")); got != expected { t.Fatalf("metadata %q count=%d want=%d bytes=%q", field, got, expected, raw) }
+    }
+}
+t.Run("mapped-native", func(t *testing.T) {
+    result, err := host.activeRecords()[0].plugin.Capabilities.Executor.ExecuteStream(ctx, eNativeRequest("grok-4.6", "openai-response", true))
+    if err != nil { t.Fatal(err) }
+    native, errs := eNativeDrain(t, result.Chunks)
+    if len(errs) != 0 { t.Fatalf("native errors=%q", errs) }
+    eRequireData(t, native, gCPAPayloads("grok-4.6", count))
+    requireMetadata(t, native)
+})
+p.base.SetPluginHost(host)
+p.base.SetModelRouterHost(host)
+t.Run("mapped-http", func(t *testing.T) {
+    status, _, mapped := eHTTP(t, server, "/v1/responses", gCPARequest("grok-4.6", true))
+    if status != 200 { t.Fatalf("mapped position HTTP=%d body=%q", status, mapped) }
+    gCPARequireEvents(t, mapped, f, "grok-4.6")
+    requireMetadata(t, mapped)
+})
+t.Run("mapped-ws", func(t *testing.T) {
+    wsMapped, err := eWS(t, server, "grok-4.6")
+    if err != nil || !reflect.DeepEqual(wsMapped, gCPAPayloads("grok-4.6", count)) { t.Fatalf("mapped position WS=%q error=%v", wsMapped, err) }
+})
+```
+
+### E-M2：1536 个 actual binary 组合与精确 capture 消费
+
+- [ ] 在现有 `functionalNativeBinaryCaptures` 的局部 `fixture` 加 `metadata string`，局部 `capture` 加 `Metadata string`。仅替换 six transports 循环内原三行 fixture 追加代码为下列内容，不改变 provider、enabled、stream、model 循环和进程分组。每个 metadata label 与 CPA fixture 完全相同。
+
+```go
+for _, metadata := range []string{"", "id: event-1", "retry: 100", ": heartbeat"} {
+    variant := f
+    variant.dataOnly, variant.count, variant.metadata = dataOnly, count, metadata
+    label := metadata
+    if label == "" { label = "none" }
+    variant.name = fmt.Sprintf("dataOnly=%v/count=%d/%s/metadata=%s", dataOnly, count, f.name, label)
+    fixtures = append(fixtures, variant)
+}
+```
+
+- [ ] 在同一 upstream wire 生成循环、现有 `if !f.dataOnly` 前加入 `if f.metadata != "" { fmt.Fprintf(&wire, "%s%s", f.metadata, f.eol) }`。保存 capture 时在现有 `record.Name, record.Fixture, record.ClientModel = ...` 后加入 `record.Metadata = f.metadata`。保留 raw/parsed body、非 model member bytes/order、request/response headers、URI、upstream response、calls/status 及 mapped/direct 比较；disabled `.6` 的现有非 model 比较只归一化模型，真实 upstream 仍 `.6`。
+- [ ] 唯一 CPA fixture 的 `TestModelMapperFunctionalBinaryCaptures` 局部 capture 同步加 `Metadata string`。长度断言改为下面数值；原 expected map 的完整笛卡尔积、逐项 delete、重复／未知 key 和最后遗漏检查保留。identity 的原条件前增加 `capture.Metadata != f.metadata ||`。不能只检查总数，不能删任何原 payload/header/URI/upstream bytes 断言。
+
+```go
+if len(captures) != 1536 {
+    t.Fatalf("binary captures=%d want=1536", len(captures))
+}
+```
+
+- [ ] 1536 的维度逐项核对：XAI/Codex；field-pair/data-only；1/9；原六种 transport；enabled mapped `.6`、enabled direct `.7`、disabled `.6/.7`；流/非流；none/id/retry/comment。none 对应原完整 384 条。附加连续／位置／WS 用例由 E-M1 的同一永久 fixture 管理，不用 package 层结果代替 actual binary。
+- [ ] 修改现有 `runFunctionalCPAOverlay` 的子进程 context 为 `660*time.Second`、Go `-timeout` 为 `600s`；唯一入口外层永久命令为 `-timeout 1800s`。只增加期限，不减少组合、不关闭 race/checkptr、不添加顺序 sleep。真实 HTTP/WS 单次 request 的现有 deadline 保持，必要时按实际耗时增加；deadline 只检测完成。
+
+### E-M3：固定 baseline RED、最终 GREEN、终验与提交
+
+- [ ] 从 E-M 自身 Git objects 导出三个固定 baseline 的 OS 临时源码，用成熟 archive parser 提取。新 metadata DLL 保存自己的 `dist/functional-baseline-metadata/model-mapper.dll`；默认开发版本不注入正式版本。baseline 使用 `-buildvcs=false`，逐个保存 source commit、source/archive SHA256、Go、构建参数、DLL SHA256 与实际 shadow SHA256。`go version -m` 的外层 stamp 不代替源码 bytes。最终 DLL 来自自己已整合 G-M 的实际 HEAD，分别核对 source/copy/shadow 和 registration/effective enabled。禁止修改原 CPA 或 module cache。
+- [ ] 在已编译的同一永久 fixture 上对 START DLL 运行下面 RED，对最终 DLL 运行原样 GREEN。`CPA_MODULE_COPY` 和 `OVERLAY_JSON` 使用现有 `prepareFunctionalCPAOverlay` 创建的真实可写副本与 overlay 路径；源 fixture 是 E-M 的唯一 tracked 文件。保存完整日志，具体断言 native model/boundary、HTTP 502 和 WS 缺完整 completed；none/direct/disabled 正常结果保留。
+
+```bash
+E=$(git rev-parse --show-toplevel)
+CPA_SMOKE_PLUGIN="$E/dist/functional-baseline-metadata/model-mapper.dll" go -C "$CPA_MODULE_COPY" test -mod=readonly -overlay "$OVERLAY_JSON" -count=2 -v ./internal/pluginhost -run '^TestModelMapperFunctional(OrdinaryMetadata|Native)' -timeout 600s
+CPA_SMOKE_PLUGIN="$E/dist/functional-fixed/model-mapper.dll" go -C "$CPA_MODULE_COPY" test -mod=readonly -overlay "$OVERLAY_JSON" -count=2 -v ./internal/pluginhost -run '^TestModelMapperFunctional(OrdinaryMetadata|Native)' -timeout 600s
+```
+
+- [ ] 编码完成后的实际 binary 永久 RED/GREEN 分别执行下列相同入口和完整矩阵。完整原 F01..F14 与原 F15 baseline 命令也保留，以同一扩大后的入口、1800 秒期限执行并分层记录各自预期目标与正常控制。新 metadata 的目标 RED 绑定 START DLL，编译／启动／缺环境失败不计为产品 RED。
+
+```bash
+E=$(git rev-parse --show-toplevel)
+CPA_SMOKE_INTEGRATION=1 CPA_SMOKE_CPA_BIN='C:/Users/user/Downloads/cpa-plugin/dist/integration/cpa.exe' CPA_SMOKE_PLUGIN="$E/dist/functional-baseline-metadata/model-mapper.dll" go -C "$E" test -mod=readonly -count=1 -v "$E/.github/scripts/smoke-local.go" "$E/.github/scripts/smoke-local_test.go" -run '^TestCPAPluginIntegration$' -timeout 1800s
+CPA_SMOKE_INTEGRATION=1 CPA_SMOKE_CPA_BIN='C:/Users/user/Downloads/cpa-plugin/dist/integration/cpa.exe' CPA_SMOKE_PLUGIN="$E/dist/functional-fixed/model-mapper.dll" go -C "$E" test -mod=readonly -count=1 -v "$E/.github/scripts/smoke-local.go" "$E/.github/scripts/smoke-local_test.go" -run '^TestCPAPluginIntegration$' -timeout 1800s
+```
+
+- [ ] GREEN 要求整个唯一入口成功，1536 条 capture 精确匹配完整预期且无重复／遗漏；所有事件、type、完整 output/delta、metadata/opaque、client model、upstream calls/model、HTTP 状态和错误、headers/URI/bytes 全部满足。保留原所有格式流/非流、agent/count_tokens、首次 native unload、17 项 bridge/drain/errors、register/schema/reconfigure/reload 和内容反证。fixed binary、模块真实 producer/host/native/HTTP/WS 分层记录；没有实际运行的平台不填写为通过。
+- [ ] 重跑 E3 的全部 root/vet/race、register/schema、三个显式 script tests、受影响完整性能 preflight/bench 和 Windows/Linux 构建打包／compatibility。不要执行 `go test ./.github/scripts`。共享源码或 fixture 修正后重跑受影响命令与累计复审，旧测量仅作历史对照。保留正式性能成本、C 原始 RED 日志缺失、Go VCS stamp 和报告者 Linux/Docker 部署限制，本地 GREEN 不表示其环境已解决。
+- [ ] 自审核对 spec 每条 metadata 要求、G/E 所有权、1536 维度、原全部控制、三个 baseline 身份、源码／library／shadow 来源、不同层级结果、deadline 和发布边界。提交仅 E-M 实际两文件修改，完整 body 保留归属。
+
+```bash
+git -C "$E" diff --check
+git -C "$E" add -- .github/scripts/smoke-local_test.go .github/scripts/testdata/cpa-functional-regression_test.go
+git -C "$E" commit -m 'test: cover ordinary Responses metadata in CPA' -m 'Refs: #8
+Related-PR: #7
+PR-Author: @leolmq'
+git -C "$E" log -1 --format='%H%n%B'
+```
+
+- [ ] 将开始时记录的固定 E-M taskBASE..全部最终 HEAD 的完整 diff、spec/plan、原始日志和 layer/性能／构建结果交独立 reviewer；所有确认问题由 E-M 在同一 worktree 修正，重跑受影响控制和完整终验，再对相同累计范围复审。完成后主动回报真实 commit/BASE/HEAD/worktree、报告与限制。保留稳定 ignored 证据，清理自己 OS 临时副本和进程，不删除用户已有内容。
+- [ ] G-M/E-M 修改经累计独立审查后，根据共享 scanner 与永久 integration 的实际影响重跑全分支必要复审并逐项核对全部范围，确认无覆盖遗漏且规格／质量审查通过后才进入 F。原真实用户发布授权、七平台 CI/Release、下载资产／runtime 来源核验和 issue8/PR7 评论要求保持；本节不执行 push/tag/Release/公开评论，不预填修复版本，不关闭 issue。
+
 ## Task F：合并、授权核对和 patch 发布
 
 **Files:** 不新增产品文件。仅合并已完成提交；版本通过现有 build flags 注入。
