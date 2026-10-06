@@ -200,8 +200,31 @@ func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
 	if len(p) > 0 {
 		r.started = true
 	}
+	var out [][]byte
+	if r.logicalEventFormat == "openai-response" && bytes.HasPrefix(p, []byte("data:")) {
+		s := &r.delimiterless
+		if !s.disabled && s.completeEnd > 0 && s.completeEnd == len(r.buf) && s.dataStart == 0 {
+			// 下一独立 data 单位到达时，派发此前已验证的完整值。
+			var err error
+			out, err = r.drain(true)
+			if err != nil {
+				return out, err
+			}
+		} else if !s.disabled && s.headerPrefixChecked && !s.headerComplete && s.headerScan == len(r.buf) {
+			eventType := strings.TrimSpace(string(r.buf[len("event:"):s.headerScan]))
+			if strings.HasPrefix(eventType, "response.") {
+				// dataStart == headerScan 记录 callback 间缺少的 LF；验证后才补写。
+				s.eventType, s.dataStart, s.headerComplete = eventType, s.headerScan, true
+			}
+		}
+	}
 	r.buf = append(r.buf, p...)
-	out, err := r.drain(false)
+	chunks, err := r.drain(false)
+	if len(out) == 0 {
+		out = chunks
+	} else {
+		out = append(out, chunks...)
+	}
 	if err != nil {
 		return out, err
 	}
@@ -241,10 +264,10 @@ func (r *sseRewriter) drain(eof bool) ([][]byte, error) {
 			event := r.buf[:logicalEnd]
 			r.buf = r.buf[logicalEnd:]
 			r.scanFrom = 0
-			r.resetDelimiterlessResponsesEventScanner()
 			consumed = true
 			var err error
-			out, err = r.rewriteEvent(out, event)
+			out, err = r.rewritePendingEvent(out, event)
+			r.resetDelimiterlessResponsesEventScanner()
 			if err != nil {
 				return out, err
 			}
@@ -265,10 +288,10 @@ func (r *sseRewriter) drain(eof bool) ([][]byte, error) {
 		}
 		r.buf = r.buf[standardEnd+n:]
 		r.scanFrom = 0
-		r.resetDelimiterlessResponsesEventScanner()
 		consumed = true
 		var err error
-		out, err = r.rewriteEvent(out, event)
+		out, err = r.rewritePendingEvent(out, event)
+		r.resetDelimiterlessResponsesEventScanner()
 		if err != nil {
 			return out, err
 		}
@@ -278,9 +301,9 @@ func (r *sseRewriter) drain(eof bool) ([][]byte, error) {
 		event := r.buf
 		r.buf = nil
 		r.scanFrom = 0
-		r.resetDelimiterlessResponsesEventScanner()
 		var err error
-		out, err = r.rewriteEvent(out, event)
+		out, err = r.rewritePendingEvent(out, event)
+		r.resetDelimiterlessResponsesEventScanner()
 		if err != nil {
 			return out, err
 		}
@@ -291,6 +314,24 @@ func (r *sseRewriter) drain(eof bool) ([][]byte, error) {
 		r.resetDelimiterlessResponsesEventScanner()
 	} else if bufferCap > maxPendingStreamBytes && len(r.buf) <= maxPendingStreamBytes || (consumed && bufferCap > 2*len(r.buf)) {
 		r.buf = bytes.Clone(r.buf)
+	}
+	return out, nil
+}
+
+func (r *sseRewriter) rewritePendingEvent(out [][]byte, event []byte) ([][]byte, error) {
+	s := &r.delimiterless
+	if s.completeEnd == 0 || s.dataStart == 0 || s.dataStart != s.headerScan {
+		return r.rewriteEvent(out, event)
+	}
+	// 完整值已验证，仅补写 header 的 LF，不复制整个 JSON。
+	originalOutLen := len(out)
+	header := make([]byte, s.dataStart+1)
+	copy(header, event[:s.dataStart])
+	header[s.dataStart] = '\n'
+	out = append(out, header)
+	out, err := r.rewriteEvent(out, event[s.dataStart:])
+	if err != nil {
+		return out[:originalOutLen], err
 	}
 	return out, nil
 }
@@ -515,19 +556,23 @@ func (r *sseRewriter) findDelimiterlessResponsesEventEnd(eof bool) (int, bool) {
 		return 0, false
 	}
 	if !s.headerPrefixChecked {
-		const eventField = "event:"
-		if len(buf) < len(eventField) {
-			if !bytes.Equal(buf, []byte(eventField[:len(buf)])) {
+		field := "event:"
+		if r.logicalEventFormat == "openai-response" && len(buf) > 0 && buf[0] == 'd' {
+			field = "data:"
+		}
+		if len(buf) < len(field) {
+			if !bytes.Equal(buf, []byte(field[:len(buf)])) {
 				s.disabled = true
 			}
 			return 0, false
 		}
-		if !bytes.HasPrefix(buf, []byte(eventField)) {
+		if !bytes.HasPrefix(buf, []byte(field)) {
 			s.disabled = true
 			return 0, false
 		}
 		s.headerPrefixChecked = true
-		s.headerScan = len(eventField)
+		s.headerScan = len(field)
+		s.headerComplete = field == "data:"
 	}
 	if !s.headerComplete {
 		for s.headerScan < len(buf) {
@@ -644,7 +689,7 @@ func (r *sseRewriter) findDelimiterlessResponsesEventEnd(eof bool) (int, bool) {
 			var typed struct {
 				Type string `json:"type"`
 			}
-			matched = json.Unmarshal(value, &typed) == nil && typed.Type == s.eventType
+			matched = json.Unmarshal(value, &typed) == nil && (s.dataStart > 0 && typed.Type == s.eventType || s.dataStart == 0 && strings.HasPrefix(typed.Type, "response."))
 		case "interactions":
 			if s.eventType == "done" {
 				matched = bytes.Equal(bytes.TrimSpace(value), []byte("[DONE]"))
@@ -663,7 +708,7 @@ func (r *sseRewriter) findDelimiterlessResponsesEventEnd(eof bool) (int, bool) {
 	}
 	suffix := buf[s.completeEnd:]
 	if len(suffix) == 0 {
-		return s.completeEnd, eof
+		return s.completeEnd, eof || s.dataStart > 0 && s.dataStart == s.headerScan
 	}
 	if bytes.HasPrefix(suffix, []byte("event:")) {
 		return s.completeEnd, true
