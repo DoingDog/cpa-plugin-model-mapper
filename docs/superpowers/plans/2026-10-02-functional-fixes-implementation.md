@@ -3138,7 +3138,7 @@ git -C "$G" diff --binary 51b006438c1a0edd4263020297747f99a174c47c..HEAD
 ### E-M1：唯一 fixture、真实消费者与 metadata 矩阵
 
 - [ ] 先在自己的独立草稿和 OS 临时可写 CPA v7.2.152 副本准备测试，保留原模块只读。固定 module Sum、integration revision、真实 `.6/.7` model 注册、source/copy/shadow hash、有效 enabled/disabled 状态沿用当前 loader/process helper。准备阶段可对 START DLL 运行 RED；接收 G-M 已验证产品后，从交付完整起点记录固定 E-M taskBASE，并在自己的 worktree 完成全部 GREEN、自审、修正、独立复审和提交。
-- [ ] 在唯一 CPA fixture 用下面完整内容替换 `gCPAFieldsFixture`、`gCPAFieldsFixtures`、`gCPAFields`；其余现有 helper/测试保留。共有 96 个 fixture，每个 metadata 行在对应 event/data 前生成。固定 six transports 不变，none 保留原完整组合。循环的 labels 同 binary generator 保持逐字一致。
+- [ ] 在唯一 CPA fixture 用下面完整内容替换 `gCPAFieldsFixture`、`gCPAFieldsFixtures`、`gCPAFields`；现有 helper/测试及全部断言保留，`TestModelMapperFunctionalNativeSSEFields` 的单 terminal data-only 分支按本节精确修改。共有 96 个 fixture，每个 metadata 行在对应 event/data 前生成。固定 six transports 不变，none 保留原完整组合。循环的 labels 同 binary generator 保持逐字一致。
 
 ```go
 type gCPAFieldsFixture struct {
@@ -3209,6 +3209,30 @@ if f.metadata != "" {
     }
 }
 ```
+
+- [ ] 在 `TestModelMapperFunctionalNativeSSEFields` 中，用下列完整代码替换日志之后的原 `if f.dataOnly && f.count == 1` 分支。直接 JSON 断言只处理无 metadata 的单 terminal；有 metadata 时复用已补充原文字节检查的 `gCPARequireEvents` 和现有 `sse.Decode`，核对 metadata 字段边界、真正 data、event/type、client model、全部 completed output 与 opaque。不筛除任何 provider/transport/metadata 组合，不修改正确产品输出迁就测试。none 的无最终 blank delimiter 控制保持；既有 decoder 支持 EOF 派发。
+
+```go
+if f.dataOnly && f.count == 1 && f.metadata == "" {
+	// 无 metadata 的单 terminal output unit 保留无最终 blank delimiter 控制。
+	var event struct {
+		Type     string
+		Response json.RawMessage
+	}
+	payload := bytes.TrimSpace(bytes.TrimPrefix(raw.Bytes(), []byte("data: ")))
+	if err := json.Unmarshal(payload, &event); err != nil {
+		t.Fatal(err)
+	}
+	if event.Type != "response.completed" {
+		t.Fatalf("terminal type=%q", event.Type)
+	}
+	gCPARequireResponse(t, event.Response, "grok-4.6")
+} else {
+	gCPARequireEvents(t, raw.Bytes(), f, "grok-4.6")
+}
+```
+
+- [ ] 同步 ignored 完整 CPA 草稿并编译。文档任务在 OS 临时副本中，从该完整草稿逐字提取上面的断言分支作为验证测试的函数体，复用 `gCPAFieldsFixtures`／`gCPAFields` 生成正确 client-model 输出；核查两个 provider 标签、全部 96 fixtures、保留与移除单 terminal data-only 最终 blank delimiter 的两组输入，以及含 `event:`／`data:`／model 字样的 opaque comment。该检查只证明测试断言接受正确预期输出，单独保存命令和完整日志，不计为产品或集成 GREEN，不新增永久入口／fixture。随后移除临时验证测试，以同一 E-M3 的 Native/OrdinaryMetadata 永久命令对 START DLL 记录真实产品 RED；G-M/E-M 修正后原样执行 GREEN。metadata 拼接、模型未恢复、完整 output／opaque 不符仍须触发原断言；none、direct、disabled 控制继续保留。
 
 - [ ] 在唯一 CPA fixture 追加下列完整测试，合并草稿 package/import 声明所列的已有项，只追加函数，不创建第二文件。真实 core/host、native、direct HTTP/WS 与 mapped HTTP/WS 分为独立 subtest，目标 native 失败不会跳过 HTTP/WS。disabled WS 对两个实际模型独立检查，原 `NativeFieldsHTTP` 继续覆盖 disabled/mapped/direct 非流和流。metadata 位置控制运行真实未加载 mapper 消费链，固定 before-event/in-event/between-events；连续 opaque comment 不解析。G-M 完成后，还须把同位置的 mapped native/HTTP/WS 纳入相同测试，复用已给出的 producer、loader、HTTP/WS helpers 和精确预期，不删 direct 控制。新增 unknown 字段的 callback 支持只有原消费者实际支持证据成立时才增加，不以 generic wire 控制推断。
 

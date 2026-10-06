@@ -242,6 +242,8 @@ HTTP matrix 保持同规则 enabled mapped grok-4.6、enabled direct/unmatched g
 
 CPA fixture 复用已安装 `gin-contrib/sse.Decode` 和 `encoding/json`；该 decoder 只识别 LF，测试只对 parser 输入统一已知 CRLF，原始 captured bytes继续保留，不自行编写 SSE parser。正常 mapped/unmapped/disabled、非流、两类九事件均须通过，才可确认 C/G 完整覆盖 F15。
 
+native 单 terminal data-only 的直接 JSON 断言仅用于 `none`；有 metadata 时调用同一 SSE decoder，精确检查 metadata 原文及字段边界、真正 data、type、client model、全部 completed output 和 opaque。`none` 的无最终 blank delimiter 控制保留；上述 decoder 也支持 EOF 派发。
+
 唯一 actual binary matrix 完整覆盖 `2 providers × 2 input shapes × 2 event counts × 6 transports × 4 route/model controls × 2 stream modes × 4 metadata values = 1536` 个组合。metadata 轴固定为 `none`、`id: event-1`、`retry: 100`、`: heartbeat`，每个有 metadata 的组合在每条正常 event/data 之前生成该 metadata 行；none 保留原完整 384 个组合。fixture/capture identity 包含 metadata 维度，精确核对笛卡尔积、重复和遗漏。连续 metadata 与 event 中/事件之间的位置另由同一永久 fixture 的真实 consumer/native/HTTP/WS 控制覆盖，不减少 binary 矩阵。复用当前进程分组、producer、loader 和 helpers，保存全部 upstream bytes、headers、URI、calls/status 与 client payload。必须运行固定 `cpa.exe`，package 层成功不能代替 binary 验收。
 
 G 完成共享 metadata 修正、根回归、性能和累计独立审查；E 在唯一永久 fixture/入口完成新 metadata baseline RED 与最终 G/E DLL 的相同命令 GREEN。E 可在 G 修正期间并行准备自己的独立完整测试草稿和 baseline 证据，其最终验收与提交依赖 G 已验证产品。扩大 matrix 时增加外层及子进程 deadline，保留完整规模和 race/checkptr；根 race、普通 native DLL 和其他平台实际加载分别报告。共享源码改变后重跑受影响性能 preflight、allocation 与计时，旧报告只作历史对照；正式性能成本、C 原始 RED 日志缺失、Go VCS stamp 与报告者部署限制继续保留。
