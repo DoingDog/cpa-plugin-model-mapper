@@ -1,17 +1,25 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"debug/buildinfo"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -698,42 +706,51 @@ func TestRunStreamCaseAcceptsMultiDataJSONEvent(t *testing.T) {
 	}
 }
 
-func TestCPAPluginIntegration(t *testing.T) {
-	cpaBin := os.Getenv("CPA_SMOKE_CPA_BIN")
-	if cpaBin == "" || os.Getenv("CPA_SMOKE_INTEGRATION") != "1" {
-		t.Skip("make integration is required for CPA integration")
-	}
-	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
-	if err != nil {
+func requireFunctionalOpenAIStream(t *testing.T, body []byte, model string, completions bool) {
+	t.Helper()
+	if err := validateOpenAIStream(body, caseConfig{wantOriginalModel: model}); err != nil {
 		t.Fatal(err)
 	}
-	var upstreamCalls atomic.Int32
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamCalls.Add(1)
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/chat/completions" || r.Header.Get("Authorization") != "Bearer fake-upstream-key" {
-			http.Error(w, "unexpected upstream request", http.StatusBadRequest)
-			return
+	if bytes.Count(body, []byte("data: [DONE]")) != 1 || bytes.Contains(body, []byte("data: data:")) {
+		t.Fatalf("invalid framing: %q", body)
+	}
+	var content strings.Builder
+	for _, line := range bytes.Split(body, []byte("\n")) {
+		if !bytes.HasPrefix(line, []byte("data: ")) {
+			continue
 		}
-		var request struct {
-			Model    string `json:"model"`
-			Messages []struct {
-				Role    string `json:"role"`
-				Content string `json:"content"`
-			} `json:"messages"`
+		raw := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data: ")))
+		if bytes.Equal(raw, []byte("[DONE]")) {
+			continue
 		}
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
+		var event struct {
+			Model   string
+			Choices []struct {
+				Text  string
+				Delta struct{ Content string }
+			}
 		}
-		if request.Model != "deepseek-v4-flash" || len(request.Messages) != 1 || request.Messages[0].Role != "user" || request.Messages[0].Content != "say ok" {
-			http.Error(w, "unexpected upstream body", http.StatusBadRequest)
-			return
+		if err := json.Unmarshal(raw, &event); err != nil {
+			t.Fatal(err)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"deepseek-v4-flash","choices":[{"index":0,"message":{"role":"assistant","content":"upstream deepseek-v4-flash remains"},"finish_reason":"stop"}]}`))
-	}))
-	defer upstream.Close()
+		if event.Model != model {
+			t.Fatalf("model=%q want=%q", event.Model, model)
+		}
+		for _, choice := range event.Choices {
+			if completions {
+				content.WriteString(choice.Text)
+			} else {
+				content.WriteString(choice.Delta.Content)
+			}
+		}
+	}
+	if content.String() != "onetwo" {
+		t.Fatalf("content=%q want=onetwo", content.String())
+	}
+}
 
+func functionalCPAProcess(t *testing.T, repoRoot, cpaBin, upstreamURL, rules, extra string, enabled bool) smokeEnv {
+	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -743,25 +760,30 @@ func TestCPAPluginIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
-	env := smokeEnv{
-		repoRoot: repoRoot, cpaBin: cpaBin, dir: dir, port: port,
-		baseURL: upstream.URL + "/v1", apiKey: "fake-upstream-key",
-		config:  filepath.Join(dir, "config.yaml"),
-		logsDir: filepath.Join(dir, "logs"), logFile: filepath.Join(dir, "logs", "cpa.log"),
-	}
-	source := os.Getenv("CPA_SMOKE_PLUGIN")
-	if source == "" {
-		t.Fatal("CPA_SMOKE_PLUGIN is required for CPA integration")
-	}
+	env := smokeEnv{repoRoot: repoRoot, cpaBin: cpaBin, dir: dir, port: port, baseURL: upstreamURL + "/v1", apiKey: "fake-upstream-key", config: filepath.Join(dir, "config.yaml"), logsDir: filepath.Join(dir, "logs"), logFile: filepath.Join(dir, "logs", "cpa.log")}
 	_, env.plugin = smokePluginPaths(repoRoot, dir)
 	if err := prepareDirs(env); err != nil {
 		t.Fatal(err)
 	}
+	source := os.Getenv("CPA_SMOKE_PLUGIN")
+	if source == "" {
+		t.Fatal("CPA_SMOKE_PLUGIN is required")
+	}
 	if err := copyFile(source, env.plugin); err != nil {
 		t.Fatal(err)
 	}
-	config := buildConfig(env, caseConfig{pluginRules: "deepseek-v4-pro=>deepseek-v4-flash"}) +
-		"remote-management:\n  secret-key: local-integration-management-key\n  disable-control-panel: true\n"
+	original, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copied, err := os.ReadFile(env.plugin)
+	if err != nil || sha256.Sum256(original) != sha256.Sum256(copied) {
+		t.Fatalf("DLL copy: %v", err)
+	}
+	config := buildConfig(env, caseConfig{pluginRules: rules, rulesField: "global_rules"}) + "remote-management:\n  secret-key: local-integration-management-key\n  disable-control-panel: true\n" + extra
+	if !enabled {
+		config = strings.Replace(config, "plugins:\n  enabled: true\n", "plugins:\n  enabled: false\n", 1)
+	}
 	if err := writeSmokeConfig(env.config, []byte(config)); err != nil {
 		t.Fatal(err)
 	}
@@ -777,69 +799,434 @@ func TestCPAPluginIntegration(t *testing.T) {
 	if err := waitReady(proc, port, localAPIKey); err != nil {
 		t.Fatal(err)
 	}
-	if runtime.GOOS == "windows" {
+	if runtime.GOOS == "windows" && enabled {
 		shadowDir := filepath.Join(env.dir, "tmp", "cliproxy-pluginhost", fmt.Sprintf("pid-%d", proc.cmd.Process.Pid))
-		if entries, err := os.ReadDir(shadowDir); err != nil || len(entries) == 0 {
-			t.Fatalf("CPA shadow directory %s: entries=%d err=%v", shadowDir, len(entries), err)
+		entries, err := os.ReadDir(shadowDir)
+		if err != nil || len(entries) == 0 {
+			t.Fatalf("shadow directory: %v", err)
 		}
-	}
-
-	url := fmt.Sprintf("http://127.0.0.1:%d/v0/management/plugins", port)
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("X-Management-Key", "local-integration-management-key")
-	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("management plugins status = %d, want 200", resp.StatusCode)
-	}
-	var listing struct {
-		Plugins []struct {
-			ID               string `json:"id"`
-			Registered       bool   `json:"registered"`
-			EffectiveEnabled bool   `json:"effective_enabled"`
-		} `json:"plugins"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&listing); err != nil {
-		t.Fatal(err)
-	}
-	found := false
-	for _, plugin := range listing.Plugins {
-		if plugin.ID == "model-mapper" {
-			found = true
-			if !plugin.Registered || !plugin.EffectiveEnabled {
-				t.Fatalf("model-mapper registered=%t effective_enabled=%t", plugin.Registered, plugin.EffectiveEnabled)
+		shadows := 0
+		for _, entry := range entries {
+			if entry.IsDir() || filepath.Ext(entry.Name()) != ".dll" {
+				continue
 			}
-			break
+			shadow, err := os.ReadFile(filepath.Join(shadowDir, entry.Name()))
+			if err != nil || sha256.Sum256(shadow) != sha256.Sum256(original) {
+				t.Fatalf("shadow identity: %v", err)
+			}
+			shadows++
+			t.Logf("DLL source=%s copy=%s shadow=%s SHA256=%x", source, env.plugin, entry.Name(), sha256.Sum256(shadow))
+		}
+		if shadows != 1 {
+			t.Fatalf("native DLL shadows=%d want=1", shadows)
 		}
 	}
-	if !found {
-		t.Fatal("model-mapper missing from CPA management plugins")
-	}
-	status, body, err := sendRequest(port, "openai", "deepseek-v4-pro", localAPIKey, false)
+	return env
+}
+
+func functionalHTTPRequest(t *testing.T, port int, path string, body []byte) (int, http.Header, []byte) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d%s", port, path), bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
-	var completion struct {
-		Model   string `json:"model"`
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	if err := json.Unmarshal(body, &completion); err != nil {
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+localAPIKey)
+	resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if status != http.StatusOK || completion.Model != "deepseek-v4-pro" || len(completion.Choices) != 1 || completion.Choices[0].Message.Content != "upstream deepseek-v4-flash remains" {
-		t.Fatalf("client completion status=%d body=%s", status, body)
+	raw, readErr := io.ReadAll(resp.Body)
+	closeErr := resp.Body.Close()
+	if readErr != nil || closeErr != nil {
+		t.Fatalf("HTTP read=%v close=%v", readErr, closeErr)
 	}
-	if calls := upstreamCalls.Load(); calls != 1 {
-		t.Fatalf("upstream calls = %d, want 1", calls)
+	if len(raw) > 1<<20 {
+		t.Logf("HTTP path=%s request=%s status=%d headers=%v responseBytes=%d SHA256=%x", path, body, resp.StatusCode, resp.Header, len(raw), sha256.Sum256(raw))
+	} else {
+		t.Logf("HTTP path=%s request=%s status=%d headers=%v response=%s", path, body, resp.StatusCode, resp.Header, raw)
 	}
+	return resp.StatusCode, resp.Header, raw
+}
+
+func prepareFunctionalCPAOverlay(t *testing.T, repoRoot string) (string, string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "list", "-mod=readonly", "-m", "-json", "github.com/router-for-me/CLIProxyAPI/v7")
+	cmd.Dir, cmd.Env = repoRoot, append(os.Environ(), "GOWORK=off")
+	raw, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go list CPA: %v\n%s", err, raw)
+	}
+	var module struct{ Path, Version, Dir, Sum string }
+	if err := json.Unmarshal(raw, &module); err != nil {
+		t.Fatal(err)
+	}
+	if module.Path != "github.com/router-for-me/CLIProxyAPI/v7" || module.Version != "v7.2.152" || module.Dir == "" || module.Sum != "h1:FkvGzpOCvuDGswaOyoVfbY5Ua7OlP/wMXw3agiNMUQI=" {
+		t.Fatalf("unexpected CPA module: %+v", module)
+	}
+	work := t.TempDir()
+	checkout := filepath.Join(work, "cpa-v7.2.152")
+	err = filepath.WalkDir(module.Dir, func(source string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(module.Dir, source)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(checkout, relative)
+		if entry.IsDir() {
+			return os.MkdirAll(target, 0700)
+		}
+		if !entry.Type().IsRegular() {
+			return fmt.Errorf("unexpected CPA source entry %s", source)
+		}
+		return copyFile(source, target)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := filepath.Join(repoRoot, ".github", "scripts", "testdata", "cpa-functional-regression_test.go")
+	if info, err := os.Stat(fixture); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("fixture %s: %v", fixture, err)
+	}
+	target := filepath.Join(checkout, "internal", "pluginhost", "model_mapper_functional_test.go")
+	if _, err := os.Stat(target); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("overlay target already exists: %s %v", target, err)
+	}
+	encoded, err := json.Marshal(struct{ Replace map[string]string }{Replace: map[string]string{target: fixture}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlay := filepath.Join(work, "overlay.json")
+	if err := os.WriteFile(overlay, encoded, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("CPA version=%s Sum=%s source=%s copy=%s overlay=%s", module.Version, module.Sum, module.Dir, checkout, overlay)
+	return checkout, overlay
+}
+
+func runFunctionalCPAOverlay(t *testing.T, repoRoot string, env []string) {
+	t.Helper()
+	checkout, overlay := prepareFunctionalCPAOverlay(t, repoRoot)
+	ctx, cancel := context.WithTimeout(context.Background(), 210*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "-C", checkout, "test", "-mod=readonly", "-overlay", overlay, "-count=1", "-v", "./internal/pluginhost", "-run", "^TestModelMapperFunctional|^TestStreamBridge(CloseUnblocksPendingEmit|ClosePreservesTerminalErrorWhenBufferIsFull)$", "-timeout", "180s")
+	cmd.Dir, cmd.Env = repoRoot, append(append(os.Environ(), "GOWORK=off"), env...)
+	output, err := cmd.CombinedOutput()
+	t.Logf("CPA overlay command=%v\n%s", cmd.Args, output)
+	if err != nil {
+		t.Fatalf("CPA overlay: %v", err)
+	}
+}
+
+func TestCPAPluginIntegration(t *testing.T) {
+	cpaBin := os.Getenv("CPA_SMOKE_CPA_BIN")
+	if cpaBin == "" || os.Getenv("CPA_SMOKE_INTEGRATION") != "1" {
+		t.Skip("make integration is required for CPA integration")
+	}
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := buildinfo.ReadFile(cpaBin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := make(map[string]string)
+	for _, setting := range info.Settings {
+		settings[setting.Key] = setting.Value
+	}
+	if info.Main.Version != "v7.2.152" || settings["vcs.revision"] != "c76dfd4e0edabab9000628b1560ab8ab379eadb8" || settings["vcs.modified"] != "false" {
+		t.Fatalf("unexpected CPA binary: %+v", info)
+	}
+	binary, err := os.ReadFile(cpaBin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("CPA binary=%s SHA256=%x revision=%s Go=%s", cpaBin, sha256.Sum256(binary), settings["vcs.revision"], info.GoVersion)
+	var calls atomic.Int32
+	var upstreamMode atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		t.Logf("upstream path=%s headers=%v body=%s", r.URL.Path, r.Header, raw)
+		var request struct {
+			Model    string
+			Stream   bool
+			Messages []struct{ Role, Content string }
+		}
+		if err := json.Unmarshal(raw, &request); err != nil {
+			t.Error(err)
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/chat/completions" || request.Model != "deepseek-v4-flash" || r.Header.Get("Authorization") != "Bearer fake-upstream-key" {
+			http.Error(w, "unexpected upstream request", 400)
+			return
+		}
+		if upstreamMode.Load() == 1 && !request.Stream {
+			want := `{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"first"}],"messages":[{"role":"user","content":"second"}]}`
+			if string(raw) != want {
+				t.Errorf("duplicate request=%s want=%s", raw, want)
+			}
+		}
+		if !request.Stream {
+			w.Header().Set("Content-Type", "application/json")
+			if upstreamMode.Load() == 2 {
+				_, _ = io.WriteString(w, `{"model":"deepseek-v4-flash","choices":[{"text":"first"}],"model":"deepseek-v4-pro","choices":[{"text":"second"}]}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"deepseek-v4-flash","choices":[{"index":0,"message":{"role":"assistant","content":"upstream deepseek-v4-flash remains"},"finish_reason":"stop"}]}`)
+			return
+		}
+		contentTypes := []string{"text/event-stream", "", "text/event-stream; charset=utf-8", "application/json"}
+		if header := contentTypes[upstreamMode.Load()]; header != "" {
+			w.Header().Set("Content-Type", header)
+		}
+		for _, payload := range []string{
+			`{"id":"chatcmpl-functional","object":"chat.completion.chunk","created":1,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"one"},"finish_reason":null}]}`,
+			`{"id":"chatcmpl-functional","object":"chat.completion.chunk","created":1,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"two"},"finish_reason":"stop"}]}`,
+		} {
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", payload); err != nil {
+				return
+			}
+			w.(http.Flusher).Flush()
+		}
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	env := functionalCPAProcess(t, repoRoot, cpaBin, upstream.URL, "deepseek-v4-pro=>deepseek-v4-flash", "", true)
+	t.Run("registration", func(t *testing.T) {
+		req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/v0/management/plugins", env.port), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-Management-Key", "local-integration-management-key")
+		response, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		var listing struct {
+			Plugins []struct {
+				ID               string
+				Registered       bool
+				EffectiveEnabled bool `json:"effective_enabled"`
+			}
+		}
+		if err := json.NewDecoder(response.Body).Decode(&listing); err != nil {
+			t.Fatal(err)
+		}
+		if response.StatusCode != 200 || len(listing.Plugins) != 1 || listing.Plugins[0].ID != "model-mapper" || !listing.Plugins[0].Registered || !listing.Plugins[0].EffectiveEnabled {
+			t.Fatalf("registration status=%d listing=%+v", response.StatusCode, listing)
+		}
+	})
+	for _, endpoint := range []string{"chat", "completions"} {
+		for _, model := range []string{"deepseek-v4-pro", "deepseek-v4-flash"} {
+			for _, stream := range []bool{false, true} {
+				for header := 0; header < 4; header++ {
+					if !stream && header != 0 {
+						continue
+					}
+					t.Run(fmt.Sprintf("%s/model=%s/stream=%v/header=%d", endpoint, model, stream, header), func(t *testing.T) {
+						upstreamMode.Store(int32(header))
+						calls.Store(0)
+						path, field := "/v1/chat/completions", `"messages":[{"role":"user","content":"say ok"}]`
+						if endpoint == "completions" {
+							path, field = "/v1/completions", `"prompt":"say ok"`
+						}
+						body := []byte(fmt.Sprintf(`{"model":%q,%s,"stream":%v}`, model, field, stream))
+						status, _, raw := functionalHTTPRequest(t, env.port, path, body)
+						if status != 200 || calls.Load() != 1 {
+							t.Fatalf("status=%d calls=%d", status, calls.Load())
+						}
+						if stream {
+							requireFunctionalOpenAIStream(t, raw, model, endpoint == "completions")
+							return
+						}
+						var value struct {
+							Model   string
+							Choices []struct {
+								Text    string
+								Message struct{ Content string }
+							}
+						}
+						if err := json.Unmarshal(raw, &value); err != nil {
+							t.Fatal(err)
+						}
+						if value.Model != model || len(value.Choices) != 1 {
+							t.Fatalf("completion=%s", raw)
+						}
+						content := value.Choices[0].Message.Content
+						if endpoint == "completions" {
+							content = value.Choices[0].Text
+						}
+						if content != "upstream deepseek-v4-flash remains" {
+							t.Fatalf("content=%q", content)
+						}
+					})
+				}
+			}
+		}
+	}
+	t.Run("request-duplicate-content", func(t *testing.T) {
+		upstreamMode.Store(1)
+		calls.Store(0)
+		status, _, _ := functionalHTTPRequest(t, env.port, "/v1/chat/completions", []byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"first"}],"model":"deepseek-v4-pro","messages":[{"role":"user","content":"second"}]}`))
+		if status != 200 || calls.Load() != 1 {
+			t.Fatalf("status=%d calls=%d", status, calls.Load())
+		}
+	})
+	t.Run("response-duplicate-content", func(t *testing.T) {
+		upstreamMode.Store(2)
+		calls.Store(0)
+		status, _, raw := functionalHTTPRequest(t, env.port, "/v1/chat/completions", []byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"say ok"}]}`))
+		want := `{"model":"deepseek-v4-pro","choices":[{"text":"first"}],"model":"deepseek-v4-pro","choices":[{"text":"second"}]}`
+		if status != 200 || string(raw) != want || calls.Load() != 1 {
+			t.Fatalf("status=%d calls=%d response=%s want=%s", status, calls.Load(), raw, want)
+		}
+	})
+	upstreamMode.Store(0)
+	t.Run("route-runtime-empty", func(t *testing.T) {
+		empty := functionalCPAProcess(t, repoRoot, cpaBin, upstream.URL, "deepseek-v4-flash*=>$1", "", true)
+		for _, stream := range []bool{false, true} {
+			calls.Store(0)
+			status, _, raw := functionalHTTPRequest(t, empty.port, "/v1/chat/completions", []byte(fmt.Sprintf(`{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"say ok"}],"stream":%v}`, stream)))
+			if status < 400 || !bytes.Contains(raw, []byte("empty mapped model")) || calls.Load() != 0 {
+				t.Errorf("stream=%v status=%d calls=%d response=%s", stream, status, calls.Load(), raw)
+			}
+		}
+	})
+	binaryCaptures := functionalNativeBinaryCaptures(t, repoRoot, cpaBin)
+	t.Run("native-host-and-responses-ws", func(t *testing.T) {
+		runFunctionalCPAOverlay(t, repoRoot, []string{"CPA_SMOKE_PLUGIN=" + env.plugin, fmt.Sprintf("CPA_FUNCTIONAL_WS_URL=ws://127.0.0.1:%d/v1/responses", env.port), "CPA_FUNCTIONAL_LOCAL_KEY=" + localAPIKey, "CPA_FUNCTIONAL_BINARY_CAPTURES=" + binaryCaptures})
+	})
+}
+
+func functionalNativeBinaryCaptures(t *testing.T, repoRoot, cpaBin string) string {
+	t.Helper()
+	const output = `[{"id":"msg-issue8","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ordinary grok-4.7 opaque 中文 output","annotations":[]}]}]`
+	type capture struct {
+		Name, ClientModel, UpstreamModel string
+		Stream                           bool
+		Status                           int
+		Headers                          http.Header
+		Body, Request, UpstreamResponse  []byte
+		RequestHeaders                   http.Header
+		Path                             string
+	}
+	var captures []capture
+	for _, provider := range []string{"xai", "codex"} {
+		var mapped []capture
+		for _, variant := range []string{"mapped", "direct", "disabled"} {
+			t.Run(provider+"/"+variant, func(t *testing.T) {
+				model, enabled := "grok-4.6", variant != "disabled"
+				if variant == "direct" {
+					model = "grok-4.7"
+				}
+				var mu sync.Mutex
+				var records []capture
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					var req struct {
+						Model  string
+						Stream bool
+					}
+					if err := json.Unmarshal(body, &req); err != nil {
+						t.Error(err)
+						return
+					}
+					if r.URL.Path != "/v1/responses" || !req.Stream || r.Header.Get("Authorization") != "Bearer fake-upstream-key" {
+						t.Errorf("native upstream path=%s headers=%v body=%s", r.URL.Path, r.Header, body)
+					}
+					payloads := []string{`{"type":"response.created","response":{"model":"MODEL","status":"in_progress","output":[]}}`, `{"type":"response.in_progress","response":{"model":"MODEL","status":"in_progress","output":[]}}`, `{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}`, `{"type":"response.content_part.added","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}`, `{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"ordinary grok-4.7 opaque 中文 output"}`, `{"type":"response.output_text.done","output_index":0,"content_index":0,"text":"ordinary grok-4.7 opaque 中文 output"}`, `{"type":"response.content_part.done","output_index":0,"content_index":0,"part":{"type":"output_text","text":"ordinary grok-4.7 opaque 中文 output","annotations":[]}}`, `{"type":"response.output_item.done","output_index":0,"item":{"id":"msg-issue8","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ordinary grok-4.7 opaque 中文 output","annotations":[]}]}}`, `{"type":"response.completed","response":{"id":"resp-issue8","object":"response","status":"completed","model":"MODEL","output":` + output + `}}`}
+					var wire strings.Builder
+					for _, payload := range payloads {
+						payload = strings.Replace(payload, `"model":"MODEL"`, `"model":"`+req.Model+`"`, 1)
+						var event struct{ Type string }
+						if err := json.Unmarshal([]byte(payload), &event); err != nil {
+							t.Error(err)
+							return
+						}
+						fmt.Fprintf(&wire, "event: %s\ndata: %s\n\n", event.Type, payload)
+					}
+					mu.Lock()
+					records = append(records, capture{UpstreamModel: req.Model, Request: bytes.Clone(body), RequestHeaders: r.Header.Clone(), Path: r.URL.RequestURI(), UpstreamResponse: []byte(wire.String())})
+					mu.Unlock()
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, wire.String())
+				}))
+				defer upstream.Close()
+				extra := fmt.Sprintf("%s-api-key:\n  - api-key: fake-upstream-key\n    base-url: %q\n    proxy-url: direct\n    models:\n      - name: grok-4.6\n        alias: grok-4.6\n      - name: grok-4.7\n        alias: grok-4.7\n", provider, upstream.URL+"/v1")
+				env := functionalCPAProcess(t, repoRoot, cpaBin, upstream.URL, "grok-4.6=>grok-4.7", extra, enabled)
+				for _, stream := range []bool{false, true} {
+					mu.Lock()
+					records = nil
+					mu.Unlock()
+					body := []byte(fmt.Sprintf(`{"model":%q,"input":[{"role":"user","content":[{"type":"input_text","text":"opaque grok-4.6 and grok-4.7"}]}],"stream":%v,"prompt_cache_key":"task-e-binary-local"}`, model, stream))
+					status, headers, raw := functionalHTTPRequest(t, env.port, "/v1/responses", body)
+					mu.Lock()
+					got := append([]capture(nil), records...)
+					mu.Unlock()
+					wantUpstream := model
+					if variant == "mapped" {
+						wantUpstream = "grok-4.7"
+					}
+					if len(got) != 1 || got[0].UpstreamModel != wantUpstream {
+						t.Fatalf("upstream calls=%+v", got)
+					}
+					record := got[0]
+					record.Name, record.ClientModel, record.Stream, record.Status, record.Headers, record.Body = provider+"/"+variant, model, stream, status, headers, raw
+					captures = append(captures, record)
+					if status != 200 {
+						t.Errorf("native %s stream=%v status=%d error=%s", record.Name, stream, status, raw)
+					}
+					if variant == "mapped" {
+						mapped = append(mapped, record)
+					} else if variant == "direct" {
+						index := 0
+						if stream {
+							index = 1
+						}
+						if len(mapped) != 2 || !bytes.Equal(mapped[index].Request, record.Request) || !reflect.DeepEqual(mapped[index].RequestHeaders, record.RequestHeaders) || mapped[index].Path != record.Path || !bytes.Equal(mapped[index].UpstreamResponse, record.UpstreamResponse) {
+							t.Errorf("mapped/direct upstream bytes or headers differ: mapped=%+v direct=%+v", mapped, record)
+						}
+					} else {
+						index := 0
+						if stream {
+							index = 1
+						}
+						if len(mapped) != 2 {
+							t.Fatalf("mapped captures=%d want=2", len(mapped))
+						}
+						want := bytes.Replace(record.Request, []byte(`"model":"grok-4.6"`), []byte(`"model":"grok-4.7"`), 1)
+						if !bytes.Equal(want, mapped[index].Request) {
+							t.Errorf("disabled non-model request bytes changed: mapped=%s disabled=%s", mapped[index].Request, record.Request)
+						}
+					}
+					t.Logf("native binary %s stream=%v upstreamRequest=%s requestHeaders=%v upstreamSHA256=%x", record.Name, stream, record.Request, record.RequestHeaders, sha256.Sum256(record.UpstreamResponse))
+				}
+			})
+		}
+	}
+	encoded, err := json.Marshal(captures)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "native-binary-captures.json")
+	if err := os.WriteFile(path, encoded, 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }

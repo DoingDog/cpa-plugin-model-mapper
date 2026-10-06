@@ -2352,7 +2352,7 @@ git -C "$G" status --short
 
 ### E1：保存 baseline，并证明新增实际回归 RED
 
-- [ ] 在 A/B/C/D/G 完成并合并后的独立 E worktree 建立 `dist/functional-baseline/` 和 `dist/functional-fixed/`，两者已被 `dist/` ignore 覆盖。用独立 baseline worktree 从 `7855e55904f9a208ef915aa7878b77db8577a294` 构建 DLL，不回退或修改当前 E worktree。F01..F14 的上述 baseline 不变；F15 另按 G4 从固定 `6c7f060f4da5bb33e7b2ecd74c44499c9676a93c` Git object 构建，独立记录 source hash、构建参数和资产身份，不混用两个 baseline。
+- [ ] 在 A/B/C/D/G 完成并合并后的独立 E worktree 建立 `dist/functional-baseline/`、`dist/functional-baseline-f15/` 和 `dist/functional-fixed/`，这些目录已被 `dist/` ignore 覆盖。从 E 自身 Git objects 导出固定完整 SHA 的 Git archive，用标准库 archive parser 提取到本任务的 OS 临时源码副本，构建 DLL 后保存到 E 自有的上述 ignored 目录，运行结束清理临时副本，不回退或修改当前 E worktree。F01..F14 baseline 为 `7855e55904f9a208ef915aa7878b77db8577a294`；F15 baseline 为 `6c7f060f4da5bb33e7b2ecd74c44499c9676a93c`，分别记录 source hash、构建参数和资产身份，不混用两个 baseline。
 
 ```bash
 CGO_ENABLED=1 GOOS=windows GOARCH=amd64 go build -trimpath -buildmode=c-shared -o dist/functional-baseline/model-mapper.dll .
@@ -2360,7 +2360,7 @@ go version -m dist/functional-baseline/model-mapper.dll
 go version -m C:/Users/user/Downloads/cpa-plugin/dist/integration/cpa.exe
 ```
 
-baseline build 命令在 baseline worktree 执行；把产物复制到 E 的上述 ignored 目录。记录源码 commit 与构建参数，不能仅靠 DLL 的外层 VCS metadata 推断源码位置。
+baseline build 命令在对应固定 SHA 的 OS 临时源码副本执行；把产物保存到 E 的对应 ignored 目录。逐个核对 archive 源码与自身固定 Git object，记录源码 commit 与构建参数，不能仅靠 DLL 的外层 VCS metadata 推断源码位置。
 
 - [ ] 把现有 `TestCPAPluginIntegration` 的启动部分复用为同文件测试 helper；测试仍从唯一入口 `t.Run` 调用各协议用例。加入实际 Chat/Completions 流检查，以下 validator 直接运行，使用现有 `validateOpenAIStream` 确认完整 SSE boundaries。
 
