@@ -36,6 +36,7 @@ type sseRewriter struct {
 	scanFrom           int
 	bomPrefix          []byte
 	bomDone            bool
+	started            bool
 	trackDone          bool
 	sawDone            bool
 	logicalEventFormat string
@@ -195,6 +196,9 @@ func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
 	p = r.consumeLeadingBOM(p)
 	if len(p) == 0 && !r.bomDone && len(r.bomPrefix) > 0 {
 		return nil, nil
+	}
+	if len(p) > 0 {
+		r.started = true
 	}
 	r.buf = append(r.buf, p...)
 	out, err := r.drain(false)
@@ -827,6 +831,7 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 		return r.writeRawJSONArray(p, true)
 	}
 	if r.frameRawJSONAsSSE && !couldStartJSONValue(p) && (r.sse.logicalEventFormat == "" || !bytes.Contains(p, []byte("event:"))) && completeSSEEvents(p) && !mightContainResponseModelField(p) && !sseContainsEscapedModelField(p) {
+		r.sse.started = true
 		if r.sse.trackDone {
 			r.sse.sawDone = r.sse.sawDone || hasSSEDoneEvent(p)
 		}
@@ -837,7 +842,7 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 	}
 	trimmed := bytes.TrimSpace(p)
 	if len(trimmed) > 0 && trimmed[0] != '{' && trimmed[0] != '[' && couldStartJSONValue(p) {
-		if isSSEChunk(p) {
+		if r.sse.started || isSSEChunk(p) {
 			if r.frameRawJSONAsSSE && len(p) > maxPendingStreamBytes {
 				// 完整 scalar 转为 SSE unknown field 后仍不计入未完成 suffix 限额。
 				_, r.sse.rawJSONPrefix, _, _ = splitJSONValues(p, false, false)
@@ -1123,12 +1128,20 @@ func splitJSONValues(p []byte, framed, eof bool) ([][]byte, int, bool, bool) {
 	dec := json.NewDecoder(bytes.NewReader(p))
 	values := make([][]byte, 0, 1)
 	consumed := 0
+	scalarStart, scalarOffset := 0, 0
+	splitBeforeSSESuffix := func(start int) ([][]byte, int, bool, bool) {
+		// unknown field 内未分隔的 scalar tokens 不属于完整 raw 前缀。
+		if start == 0 && scalarStart < len(values) {
+			return values[:scalarStart], scalarOffset, scalarStart > 0, false
+		}
+		return values, consumed, len(values) > 0, false
+	}
 	for {
 		suffix := p[consumed:]
 		start := skipTopLevelModelJSONSpace(suffix, 0)
 		if len(values) > 0 && start < len(suffix) && suffix[start] != '{' && suffix[start] != '[' {
-			if isSSEChunk(suffix) || isIncompleteSSEPrefix(suffix) {
-				return values, consumed, true, false
+			if (framed || !couldStartJSONValue(suffix)) && (isSSEChunk(suffix) || isIncompleteSSEPrefix(suffix)) {
+				return splitBeforeSSESuffix(start)
 			}
 			// scalar 与 unknown field 的分界需要后续字节或 EOF，已完成的 raw 前缀仍可发送。
 			if !eof && (framed || !couldStartJSONValue(suffix)) {
@@ -1144,14 +1157,19 @@ func splitJSONValues(p []byte, framed, eof bool) ([][]byte, int, bool, bool) {
 			if err == io.ErrUnexpectedEOF {
 				return values, consumed, len(values) > 0, true
 			}
-			suffix := p[consumed:]
-			if len(values) > 0 && !couldStartJSONValue(suffix) && (isSSEChunk(suffix) || isIncompleteSSEPrefix(suffix)) {
-				return values, consumed, true, false
+			if len(values) > 0 && start < len(suffix) && suffix[start] != '{' && suffix[start] != '[' && (isSSEChunk(suffix) || isIncompleteSSEPrefix(suffix)) {
+				return splitBeforeSSESuffix(start)
 			}
 			return nil, 0, false, false
 		}
+		end := int(dec.InputOffset())
+		if raw[0] == '{' || raw[0] == '[' {
+			scalarStart, scalarOffset = len(values)+1, end
+		} else if start > 0 {
+			scalarStart, scalarOffset = len(values), consumed
+		}
 		values = append(values, raw)
-		consumed = int(dec.InputOffset())
+		consumed = end
 	}
 }
 
@@ -2054,9 +2072,6 @@ func (s *executorStream) processPayload(rewriter *streamChunkRewriter, payload [
 }
 
 func (s *executorStream) flushAndEmit(rewriter *streamChunkRewriter, cleanCompletion bool) error {
-	if rewriter.emitFailed {
-		return nil
-	}
 	var (
 		flushed [][]byte
 		err     error
@@ -2068,6 +2083,9 @@ func (s *executorStream) flushAndEmit(rewriter *streamChunkRewriter, cleanComple
 	}
 	if err != nil {
 		err = fmt.Errorf("flush stream rewriter: %w", err)
+	}
+	if rewriter.emitFailed {
+		return err
 	}
 	emitErr := emitRewritten(flushed, rewriter.batchSSEOutput, s.emit)
 	if emitErr != nil {

@@ -262,12 +262,40 @@ func TestFunctionalEmitFailureStopsRawChunks(t *testing.T) {
 	}
 }
 
+func TestFunctionalEmitFailureRetainsFlushError(t *testing.T) {
+	for _, clean := range []bool{false, true} {
+		t.Run(fmt.Sprintf("clean=%v", clean), func(t *testing.T) {
+			emitErr := errors.New("expected first emit failure")
+			emits := 0
+			stream := &executorStream{call: func(method string, _ any) (json.RawMessage, error) {
+				if method != pluginabi.MethodHostStreamEmit {
+					return nil, fmt.Errorf("unexpected callback %s", method)
+				}
+				emits++
+				return nil, emitErr
+			}}
+			r := newStreamChunkRewriter("client")
+			r.frameRawJSONAsSSE = true
+			if err := stream.processPayload(r, []byte(`{"model":"upstream"} {"text":"`)); !errors.Is(err, emitErr) || emits != 1 {
+				t.Fatalf("process error=%v emits=%d", err, emits)
+			}
+			if err := stream.flushAndEmit(r, clean); err == nil || !strings.Contains(err.Error(), "incomplete raw JSON stream") || emits != 1 {
+				t.Fatalf("flush error=%v emits=%d, want parser error without another emit", err, emits)
+			}
+			if err := stream.flushAndEmit(r, clean); err != nil || emits != 1 {
+				t.Fatalf("second flush error=%v emits=%d", err, emits)
+			}
+		})
+	}
+}
+
 func TestFunctionalEmitFailureStopsPendingUnits(t *testing.T) {
-	for _, tc := range []struct{ name, format, input, wantFirst string }{
-		{"SSE LF", "claude", "data: {\"model\":\"upstream\",\"id\":1}\n\ndata: {\"model\":\"upstream\",\"id\":2}", "data: {\"model\":\"client\",\"id\":1}\n\n"},
-		{"SSE CRLF", "claude", "data: {\"model\":\"upstream\",\"id\":1}\r\n\r\ndata: {\"model\":\"upstream\",\"id\":2}", "data: {\"model\":\"client\",\"id\":1}\r\n\r\n"},
-		{"SSE CR", "claude", "data: {\"model\":\"upstream\",\"id\":1}\r\rdata: {\"model\":\"upstream\",\"id\":2}", "data: {\"model\":\"client\",\"id\":1}\r\r"},
-		{"deferred scalar", "openai-response", `{"model":"upstream","id":1} true`, "data: {\"model\":\"client\",\"id\":1}\n\n"},
+	for _, tc := range []struct{ name, format, input, wantFirst, wantFlushError string }{
+		{"SSE LF", "claude", "data: {\"model\":\"upstream\",\"id\":1}\n\ndata: {\"model\":\"upstream\",\"id\":2}", "data: {\"model\":\"client\",\"id\":1}\n\n", ""},
+		{"SSE CRLF", "claude", "data: {\"model\":\"upstream\",\"id\":1}\r\n\r\ndata: {\"model\":\"upstream\",\"id\":2}", "data: {\"model\":\"client\",\"id\":1}\r\n\r\n", ""},
+		{"SSE CR", "claude", "data: {\"model\":\"upstream\",\"id\":1}\r\rdata: {\"model\":\"upstream\",\"id\":2}", "data: {\"model\":\"client\",\"id\":1}\r\r", ""},
+		{"deferred scalar", "openai-response", `{"model":"upstream","id":1} true`, "data: {\"model\":\"client\",\"id\":1}\n\n", ""},
+		{"incomplete raw tail", "openai-response", `{"model":"upstream"} {"text":"`, "data: {\"model\":\"client\"}\n\n", "incomplete raw JSON stream"},
 	} {
 		for _, terminal := range []string{"continuing", "done", "error"} {
 			t.Run(tc.name+"/"+terminal, func(t *testing.T) {
@@ -345,6 +373,9 @@ func TestFunctionalEmitFailureStopsPendingUnits(t *testing.T) {
 				}
 				if terminal == "error" && (!strings.Contains(closeText, "expected upstream failure") || strings.Index(closeText, "expected upstream failure") > strings.Index(closeText, emitErr.Error())) {
 					t.Errorf("upstream error order=%q", closeText)
+				}
+				if tc.wantFlushError != "" && (!strings.Contains(closeText, tc.wantFlushError) || strings.Index(closeText, emitErr.Error()) > strings.Index(closeText, tc.wantFlushError)) {
+					t.Errorf("terminal=%q, want emit error followed by %q", closeText, tc.wantFlushError)
 				}
 			})
 		}
@@ -1273,6 +1304,144 @@ func TestFunctionalCompleteRawScalarUnknownSSEPartitions(t *testing.T) {
 	}
 }
 
+func TestFunctionalCompleteRawScalarBatchBeforeSSESuffix(t *testing.T) {
+	value, err := json.Marshal(strings.Repeat("x", maxPendingStreamBytes+1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, lineEnd := range []string{"\n", "\r\n", "\r"} {
+		prefix := append(bytes.Clone(value), lineEnd...)
+		prefix = append(prefix, value...)
+		prefix = append(prefix, []byte(lineEnd+"x-vendor-field"+lineEnd+"data:")...)
+		tail := []byte(" {\"model\":\"upstream\"}" + lineEnd + lineEnd)
+		input := append(bytes.Clone(prefix), tail...)
+		want := append(bytes.Clone(prefix), []byte(" {\"model\":\"client\"}"+lineEnd+lineEnd)...)
+		for _, tc := range []struct {
+			name  string
+			parts [][]byte
+		}{
+			{"whole", [][]byte{input}},
+			{"two reads", [][]byte{prefix, tail}},
+			{"pending at limit", [][]byte{prefix[:maxPendingStreamBytes], prefix[maxPendingStreamBytes:], tail}},
+			{"pending complete first value", [][]byte{value, prefix[len(value):], tail}},
+		} {
+			t.Run(fmt.Sprintf("eol=%q/%s", lineEnd, tc.name), func(t *testing.T) {
+				got := functionalProtocolParts(t, "openai-response", tc.parts...)
+				if !bytes.Equal(got, want) {
+					t.Fatalf("output=%d bytes, want %d; complete scalar fields must remain unchanged", len(got), len(want))
+				}
+			})
+		}
+		t.Run(fmt.Sprintf("eol=%q/incomplete suffix", lineEnd), func(t *testing.T) {
+			r := newStreamChunkRewriter("client")
+			r.format, r.frameRawJSONAsSSE = "openai-response", true
+			chunks, err := r.Write(prefix)
+			if err != nil || len(chunks) != 0 {
+				t.Fatalf("complete prefix Write=(%d,%v), want pending data field", len(chunks), err)
+			}
+			tail := append([]byte(` {"text":"`), bytes.Repeat([]byte{'x'}, maxPendingStreamBytes)...)
+			chunks, err = r.Write(tail)
+			if err == nil || !strings.Contains(err.Error(), "stream pending data exceeds") || len(chunks) != 0 {
+				t.Fatalf("incomplete suffix=(%d,%v)", len(chunks), err)
+			}
+			if r.pending != nil || r.sse.buf != nil || r.rawScan.active {
+				t.Fatal("oversized incomplete suffix retained")
+			}
+			if chunks, err := r.Finish(); err != nil || len(chunks) != 0 {
+				t.Fatalf("cleared suffix Finish=(%d,%v)", len(chunks), err)
+			}
+		})
+	}
+	t.Run("pure raw EOF control", func(t *testing.T) {
+		input := append(bytes.Clone(value), '\n')
+		input = append(input, value...)
+		want := append([]byte("data: "), value...)
+		want = append(want, []byte("\n\ndata: ")...)
+		want = append(want, value...)
+		want = append(want, '\n', '\n')
+		if got := functionalProtocolParts(t, "openai-response", input); !bytes.Equal(got, want) {
+			t.Fatalf("pure raw output=%d bytes, want %d", len(got), len(want))
+		}
+	})
+}
+
+func TestFunctionalCompleteRawScalarBatchBeforeSSEScalarLikeSuffix(t *testing.T) {
+	value, err := json.Marshal(strings.Repeat("x", maxPendingStreamBytes+1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, lineEnd := range []string{"\n", "\r\n", "\r"} {
+		for _, field := range []string{"x-vendor-field", "t-vendor-field", "false-status", "null-value", "123-id"} {
+			prefix := append(bytes.Clone(value), lineEnd...)
+			prefix = append(prefix, value...)
+			prefix = append(prefix, []byte(lineEnd+field+lineEnd+"data:")...)
+			tail := []byte(" {\"model\":\"upstream\"}" + lineEnd + lineEnd)
+			want := append(bytes.Clone(prefix), []byte(" {\"model\":\"client\"}"+lineEnd+lineEnd)...)
+			for _, tc := range []struct {
+				name  string
+				parts [][]byte
+			}{
+				{"whole", [][]byte{append(bytes.Clone(prefix), tail...)}},
+				{"two reads", [][]byte{prefix, tail}},
+			} {
+				t.Run(fmt.Sprintf("eol=%q/field=%s/%s", lineEnd, field, tc.name), func(t *testing.T) {
+					if got := functionalProtocolParts(t, "openai-response", tc.parts...); !bytes.Equal(got, want) {
+						t.Fatalf("output=%d bytes, want %d; complete values before a scalar-like SSE unknown field must remain unchanged", len(got), len(want))
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestFunctionalSSEScalarLikeSuffixExactIncompleteLimit(t *testing.T) {
+	value, err := json.Marshal(strings.Repeat("x", maxPendingStreamBytes+1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix := append(bytes.Clone(value), '\n')
+	prefix = append(prefix, value...)
+	for _, field := range []string{"x-vendor-field", "t-vendor-field", "false-status", "null-value", "123-id", "false123-id", "false_status", `"tag"suffix`} {
+		for _, size := range []int{maxPendingStreamBytes, maxPendingStreamBytes + 1} {
+			for _, continued := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/size=%d/continued=%v", field, size, continued), func(t *testing.T) {
+					suffix := []byte("\n" + field + "\ndata: {\"text\":\"")
+					suffix = append(suffix, bytes.Repeat([]byte{'x'}, size-len(suffix))...)
+					r := newStreamChunkRewriter("client")
+					r.format, r.frameRawJSONAsSSE = "openai-response", true
+					input := append(bytes.Clone(prefix), suffix...)
+					if continued {
+						chunks, err := r.Write(prefix)
+						if err != nil || len(chunks) != 0 {
+							t.Fatalf("complete prefix Write=(%d,%v)", len(chunks), err)
+						}
+						input = suffix
+					}
+					chunks, err := r.Write(input)
+					if len(chunks) != 0 {
+						t.Fatalf("incomplete event emitted %d chunks", len(chunks))
+					}
+					if size == maxPendingStreamBytes {
+						if err != nil {
+							t.Fatalf("incomplete suffix at the limit: %v", err)
+						}
+						return
+					}
+					if err == nil || !strings.Contains(err.Error(), "stream pending data exceeds") {
+						t.Fatalf("incomplete suffix=%d bytes error=%v, want limit error", len(suffix), err)
+					}
+					if r.pending != nil || r.sse.buf != nil || r.rawScan.active {
+						t.Fatal("oversized incomplete suffix retained")
+					}
+					if chunks, err := r.Finish(); err != nil || len(chunks) != 0 {
+						t.Fatalf("cleared suffix Finish=(%d,%v)", len(chunks), err)
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestFunctionalRawScalarSSEIncompleteLimit(t *testing.T) {
 	value, err := json.Marshal(strings.Repeat("x", maxPendingStreamBytes+1))
 	if err != nil {
@@ -1366,6 +1535,71 @@ func TestFunctionalCompleteRawScalarAfterRawPrefix(t *testing.T) {
 					t.Fatalf("Finish=(%d,%v), want both complete units", len(bytes.Join(out, nil)), err)
 				}
 			})
+		}
+	}
+}
+
+func TestFunctionalSSEUnknownScalarEOFPartitions(t *testing.T) {
+	for _, format := range []string{"openai-response", "claude", "interactions"} {
+		for _, event := range []struct{ name, input, want string }{
+			{"model", `data: {"model":"upstream","opaque":{"model":"upstream"}}`, `data: {"model":"client","opaque":{"model":"upstream"}}`},
+			{"markerless", `data: {"text":"opaque upstream"}`, `data: {"text":"opaque upstream"}`},
+		} {
+			for _, lineEnd := range []string{"\n", "\r\n", "\r"} {
+				for _, ending := range []string{"", lineEnd} {
+					for _, scalar := range []string{"true", "false", "null", "123", "-1", "1.5", `"scalar"`} {
+						t.Run(fmt.Sprintf("%s/%s/eol=%q/ending=%q/field=%s", format, event.name, lineEnd, ending, scalar), func(t *testing.T) {
+							input := []byte(event.input + lineEnd + lineEnd + scalar + ending)
+							want := []byte(event.want + lineEnd + lineEnd + scalar + ending)
+							for split := 0; split <= len(input); split++ {
+								got := functionalProtocolParts(t, format, input[:split], input[split:])
+								if !bytes.Equal(got, want) {
+									t.Fatalf("split=%d output=%q, want %q", split, got, want)
+								}
+							}
+							parts := make([][]byte, len(input))
+							for i := range input {
+								parts[i] = input[i : i+1]
+							}
+							if got := functionalProtocolParts(t, format, parts...); !bytes.Equal(got, want) {
+								t.Fatalf("bytewise output=%q, want %q", got, want)
+							}
+						})
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestFunctionalSSEUnknownScalarEOFForwarder(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	t.Cleanup(func() {
+		shutdownExecutorStreams()
+		resetExecutorStreamLifecycle()
+		setLoadedConfigForTest(defaultConfig())
+	})
+	for _, format := range []string{"openai-response", "claude", "interactions"} {
+		for _, lineEnd := range []string{"\n", "\r\n", "\r"} {
+			for _, ending := range []string{"", lineEnd} {
+				for _, scalar := range []string{"true", "false", "null", "123"} {
+					t.Run(fmt.Sprintf("%s/eol=%q/ending=%q/field=%s", format, lineEnd, ending, scalar), func(t *testing.T) {
+						req := rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+							Model: "client", Format: format, SourceFormat: format, Stream: true,
+							OriginalRequest: []byte(`{"model":"client","stream":true}`),
+						}, StreamID: "functional-unknown-eof"}
+						reads := []pluginapi.HostModelStreamReadResponse{
+							{Payload: []byte("data: {\"model\":\"upstream\"}" + lineEnd + lineEnd)},
+							{Payload: []byte(scalar + ending), Done: true},
+						}
+						emitted, hostClosed, pluginClosed, _, err := runExecutorStreamTestWithForwarded(req, reads, nil)
+						want := "data: {\"model\":\"client\"}" + lineEnd + lineEnd + scalar + ending
+						if got := strings.Join(emitted, ""); err != nil || !hostClosed || !pluginClosed || got != want {
+							t.Fatalf("output=%q close=%v/%v error=%v, want %q", got, hostClosed, pluginClosed, err, want)
+						}
+					})
+				}
+			}
 		}
 	}
 }
