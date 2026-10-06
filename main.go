@@ -30,16 +30,18 @@ var pluginVersion = "0.0.0-dev"
 const maxPendingStreamBytes = 16 << 20
 
 type sseRewriter struct {
-	originalModel          string
-	encodedModel           json.RawMessage
-	buf                    []byte
-	scanFrom               int
-	bomPrefix              []byte
-	bomDone                bool
-	trackDone              bool
-	sawDone                bool
-	recoverResponsesEvents bool
-	delimiterless          delimiterlessResponsesEventScanner
+	originalModel      string
+	encodedModel       json.RawMessage
+	buf                []byte
+	scanFrom           int
+	bomPrefix          []byte
+	bomDone            bool
+	started            bool
+	trackDone          bool
+	sawDone            bool
+	logicalEventFormat string
+	rawJSONPrefix      int
+	delimiterless      delimiterlessResponsesEventScanner
 }
 
 type delimiterlessResponsesEventScanner struct {
@@ -64,7 +66,10 @@ type streamChunkRewriter struct {
 	originalModel     string
 	format            string
 	frameRawJSONAsSSE bool
+	batchSSEOutput    bool
+	emitFailed        bool
 	framedRawJSON     bool
+	rawJSONBoundary   bool
 	sse               *sseRewriter
 	pending           []byte
 	rawJSONArray      bool
@@ -113,6 +118,7 @@ func newSSERewriter(originalModel string) *sseRewriter {
 
 func (r *sseRewriter) resetDelimiterlessResponsesEventScanner() {
 	r.delimiterless = delimiterlessResponsesEventScanner{}
+	r.rawJSONPrefix = 0
 }
 
 var utf8SSEBOM = [...]byte{0xef, 0xbb, 0xbf}
@@ -191,16 +197,23 @@ func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
 	if len(p) == 0 && !r.bomDone && len(r.bomPrefix) > 0 {
 		return nil, nil
 	}
+	if len(p) > 0 {
+		r.started = true
+	}
 	r.buf = append(r.buf, p...)
 	out, err := r.drain(false)
 	if err != nil {
-		return nil, err
+		return out, err
 	}
-	if len(r.buf) > maxPendingStreamBytes {
+	if len(r.buf)-max(r.delimiterless.completeEnd, r.rawJSONPrefix) > maxPendingStreamBytes {
+		// 末尾 CR 可能属于 CRLF，完整 event 等待下一字节或 EOF。
+		if _, delimiterLen, _ := findSSEEventDelimiter(r.buf, r.scanFrom, true); delimiterLen > 0 {
+			return out, nil
+		}
 		r.buf = nil
 		r.scanFrom = 0
 		r.resetDelimiterlessResponsesEventScanner()
-		return nil, fmt.Errorf("stream pending data exceeds %d bytes", maxPendingStreamBytes)
+		return out, fmt.Errorf("stream pending data exceeds %d bytes", maxPendingStreamBytes)
 	}
 	return out, nil
 }
@@ -220,7 +233,7 @@ func (r *sseRewriter) drain(eof bool) ([][]byte, error) {
 	consumed := false
 	for {
 		logicalEnd, logical := 0, false
-		if r.recoverResponsesEvents {
+		if r.logicalEventFormat != "" {
 			logicalEnd, logical = r.findDelimiterlessResponsesEventEnd(eof)
 		}
 		standardEnd, n, next := findSSEEventDelimiter(r.buf, r.scanFrom, eof)
@@ -233,9 +246,12 @@ func (r *sseRewriter) drain(eof bool) ([][]byte, error) {
 			var err error
 			out, err = r.rewriteEvent(out, event)
 			if err != nil {
-				return nil, err
+				return out, err
 			}
 			out = append(out, []byte("\n\n"))
+			if eof && len(r.buf) < len("event:") && bytes.HasPrefix([]byte("event:"), r.buf) {
+				r.buf = nil
+			}
 			continue
 		}
 		if n == 0 {
@@ -254,7 +270,7 @@ func (r *sseRewriter) drain(eof bool) ([][]byte, error) {
 		var err error
 		out, err = r.rewriteEvent(out, event)
 		if err != nil {
-			return nil, err
+			return out, err
 		}
 		out = append(out, delimiter)
 	}
@@ -266,14 +282,14 @@ func (r *sseRewriter) drain(eof bool) ([][]byte, error) {
 		var err error
 		out, err = r.rewriteEvent(out, event)
 		if err != nil {
-			return nil, err
+			return out, err
 		}
 	}
 	if len(r.buf) == 0 {
 		r.buf = nil
 		r.scanFrom = 0
 		r.resetDelimiterlessResponsesEventScanner()
-	} else if bufferCap > maxPendingStreamBytes || (consumed && bufferCap > 2*len(r.buf)) {
+	} else if bufferCap > maxPendingStreamBytes && len(r.buf) <= maxPendingStreamBytes || (consumed && bufferCap > 2*len(r.buf)) {
 		r.buf = bytes.Clone(r.buf)
 	}
 	return out, nil
@@ -364,14 +380,14 @@ func (r *sseRewriter) rewriteMultiDataEvent(out [][]byte, event []byte) ([][]byt
 	}
 	restored, changed, _, err := r.restoreResponseModelCandidate(joined)
 	if err != nil {
-		return nil, err
+		return out, err
 	}
 	if !changed {
 		return appendUnchangedSSEEvent(out, event), nil
 	}
 	var compact bytes.Buffer
 	if err := json.Compact(&compact, restored); err != nil {
-		return nil, err
+		return out, err
 	}
 	restored = compact.Bytes()
 
@@ -430,7 +446,7 @@ func (r *sseRewriter) rewriteEvent(out [][]byte, event []byte) ([][]byte, error)
 			}
 			restored, changed, _, err := r.restoreResponseModelCandidate(value)
 			if err != nil {
-				return nil, err
+				return out[:originalOutLen], err
 			}
 			if changed {
 				out = append(out, append(append([]byte("data: "), restored...), lineBreak...))
@@ -531,9 +547,19 @@ func (r *sseRewriter) findDelimiterlessResponsesEventEnd(eof bool) (int, bool) {
 				continue
 			}
 			s.eventType = strings.TrimSpace(string(buf[len("event:"):s.headerScan]))
-			if !strings.HasPrefix(s.eventType, "response.") {
-				s.disabled = true
-				return 0, false
+			switch r.logicalEventFormat {
+			case "openai-response":
+				if !strings.HasPrefix(s.eventType, "response.") {
+					s.disabled = true
+					return 0, false
+				}
+			case "interactions":
+				switch s.eventType {
+				case "interaction.created", "interaction.status_update", "step.start", "step.delta", "step.stop", "interaction.completed", "done":
+				default:
+					s.disabled = true
+					return 0, false
+				}
 			}
 			s.headerComplete = true
 			break
@@ -572,7 +598,7 @@ func (r *sseRewriter) findDelimiterlessResponsesEventEnd(eof bool) (int, bool) {
 					s.jsonScan++
 					continue
 				}
-				if b != '{' {
+				if b != '{' && !(r.logicalEventFormat == "interactions" && s.eventType == "done" && b == '[') {
 					s.disabled = true
 					return 0, false
 				}
@@ -611,10 +637,26 @@ func (r *sseRewriter) findDelimiterlessResponsesEventEnd(eof bool) (int, bool) {
 		if s.completeEnd == 0 {
 			return 0, false
 		}
-		var typed struct {
-			Type string `json:"type"`
+		value := buf[s.valueStart:s.completeEnd]
+		matched := false
+		switch r.logicalEventFormat {
+		case "openai-response":
+			var typed struct {
+				Type string `json:"type"`
+			}
+			matched = json.Unmarshal(value, &typed) == nil && typed.Type == s.eventType
+		case "interactions":
+			if s.eventType == "done" {
+				matched = bytes.Equal(bytes.TrimSpace(value), []byte("[DONE]"))
+			} else {
+				var typed struct {
+					EventType string `json:"event_type"`
+				}
+				matched = json.Unmarshal(value, &typed) == nil && typed.EventType == s.eventType
+			}
 		}
-		if json.Unmarshal(buf[s.valueStart:s.completeEnd], &typed) != nil || typed.Type != s.eventType {
+		if !matched {
+			s.completeEnd = 0
 			s.disabled = true
 			return 0, false
 		}
@@ -627,7 +669,7 @@ func (r *sseRewriter) findDelimiterlessResponsesEventEnd(eof bool) (int, bool) {
 		return s.completeEnd, true
 	}
 	if bytes.HasPrefix([]byte("event:"), suffix) {
-		return 0, false
+		return s.completeEnd, eof
 	}
 	s.disabled = true
 	return 0, false
@@ -716,7 +758,15 @@ func hasSSEDoneEvent(p []byte) bool {
 
 func (r *streamChunkRewriter) retainPending(p []byte) error {
 	r.rawScan = rawJSONScan{}
-	if len(p) > maxPendingStreamBytes {
+	incompleteBytes := len(p)
+	if incompleteBytes > maxPendingStreamBytes && r.frameRawJSONAsSSE && couldStartJSONValue(p) {
+		_, consumed, ok, _ := splitJSONValues(p, false, false)
+		if ok {
+			// 完整单位等待 SSE 分类或 EOF，只限制未完成 suffix。
+			incompleteBytes = len(p) - consumed
+		}
+	}
+	if incompleteBytes > maxPendingStreamBytes {
 		r.pending = nil
 		return fmt.Errorf("stream pending data exceeds %d bytes", maxPendingStreamBytes)
 	}
@@ -732,8 +782,14 @@ func (r *streamChunkRewriter) retainPending(p []byte) error {
 }
 
 func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
+	r.batchSSEOutput = r.frameRawJSONAsSSE
 	r.sse.trackDone = r.format == "openai"
-	r.sse.recoverResponsesEvents = r.format == "openai-response"
+	switch r.format {
+	case "openai-response", "interactions":
+		r.sse.logicalEventFormat = r.format
+	default:
+		r.sse.logicalEventFormat = ""
+	}
 	if !r.sse.bomDone {
 		p = r.sse.consumeLeadingBOM(p)
 		if len(p) == 0 && !r.sse.bomDone {
@@ -757,7 +813,15 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 		r.pending = nil
 	}
 	if len(r.sse.buf) > 0 {
+		r.batchSSEOutput = true
 		return r.sse.Write(p)
+	}
+	if r.rawJSONBoundary {
+		p = bytes.TrimLeft(p, " \t\r\n")
+		if len(p) == 0 {
+			return nil, nil
+		}
+		r.rawJSONBoundary = false
 	}
 	if r.rawJSONArray {
 		return r.writeRawJSONArray(p, false)
@@ -766,7 +830,8 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 	if !r.frameRawJSONAsSSE && start < len(p) && p[start] == '[' {
 		return r.writeRawJSONArray(p, true)
 	}
-	if r.frameRawJSONAsSSE && !couldStartJSONValue(p) && completeSSEEvents(p) && !mightContainResponseModelField(p) && !sseContainsEscapedModelField(p) {
+	if r.frameRawJSONAsSSE && !couldStartJSONValue(p) && (r.sse.logicalEventFormat == "" || !bytes.Contains(p, []byte("event:"))) && completeSSEEvents(p) && !mightContainResponseModelField(p) && !sseContainsEscapedModelField(p) {
+		r.sse.started = true
 		if r.sse.trackDone {
 			r.sse.sawDone = r.sse.sawDone || hasSSEDoneEvent(p)
 		}
@@ -776,22 +841,40 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 		return r.sse.Write(p)
 	}
 	trimmed := bytes.TrimSpace(p)
-	if r.frameRawJSONAsSSE && len(trimmed) > 0 && trimmed[0] != '{' && trimmed[0] != '[' && couldStartJSONValue(p) && !isSSEChunk(p) {
-		if err := r.retainPending(p); err != nil {
-			return nil, err
+	if len(trimmed) > 0 && trimmed[0] != '{' && trimmed[0] != '[' && couldStartJSONValue(p) {
+		if r.sse.started || isSSEChunk(p) {
+			if r.frameRawJSONAsSSE && len(p) > maxPendingStreamBytes {
+				// 完整 scalar 转为 SSE unknown field 后仍不计入未完成 suffix 限额。
+				_, r.sse.rawJSONPrefix, _, _ = splitJSONValues(p, false, false)
+			}
+			r.batchSSEOutput = true
+			return r.sse.Write(p)
 		}
-		return nil, nil
+		if r.frameRawJSONAsSSE {
+			if err := r.retainPending(p); err != nil {
+				chunks, _, _, _, rewriteErr := r.tryRawJSONChunks(p, true)
+				return chunks, joinStreamErrors(rewriteErr, err)
+			}
+			return nil, nil
+		}
 	}
 	if couldStartJSONValue(p) {
-		chunks, consumed, ok, incomplete, err := r.tryRawJSONChunks(p)
+		chunks, consumed, ok, incomplete, err := r.tryRawJSONChunks(p, false)
 		if err != nil {
-			return nil, err
+			return chunks, err
 		}
 		if ok {
 			if incomplete {
 				if err := r.retainPending(p[consumed:]); err != nil {
-					return nil, err
+					completed, _, completedOK, _, rewriteErr := r.tryRawJSONChunks(p, true)
+					if completedOK {
+						chunks = completed
+					}
+					return chunks, joinStreamErrors(rewriteErr, err)
 				}
+			} else if consumed < len(p) {
+				sseChunks, err := r.writeSSESuffix(p[consumed:])
+				return append(chunks, sseChunks...), err
 			}
 			return chunks, nil
 		}
@@ -802,25 +885,8 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 			return nil, nil
 		}
 	}
-	if r.frameRawJSONAsSSE && couldStartJSONValue(p) {
-		dec := json.NewDecoder(bytes.NewReader(p))
-		var raw json.RawMessage
-		if dec.Decode(&raw) == nil {
-			suffix := bytes.TrimLeft(p[dec.InputOffset():], " \t\r\n")
-			if len(suffix) > 0 && (isSSEChunk(suffix) || isIncompleteSSEPrefix(suffix)) {
-				restored, _, err := r.sse.restoreResponseModel(raw)
-				if err != nil {
-					return nil, err
-				}
-				chunks, err := r.sse.Write(suffix)
-				if err != nil {
-					return nil, err
-				}
-				return append([][]byte{r.frameRawJSON(restored)}, chunks...), nil
-			}
-		}
-	}
 	if isSSEChunk(p) {
+		r.batchSSEOutput = true
 		return r.sse.Write(p)
 	}
 	if isIncompleteSSEPrefix(p) {
@@ -834,6 +900,10 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 			return nil, err
 		}
 		return nil, nil
+	}
+	if r.frameRawJSONAsSSE || r.format != "" {
+		r.batchSSEOutput = true
+		return r.sse.Write(p)
 	}
 	return r.rawJSONChunks(p)
 }
@@ -863,6 +933,7 @@ func (r *streamChunkRewriter) writeRawJSONArray(p []byte, opening bool) ([][]byt
 			r.rawJSONArray = false
 			if start+1 < len(p) {
 				suffix, err := r.Write(p[start+1:])
+				r.batchSSEOutput = false
 				return append(out, suffix...), err
 			}
 			return out, nil
@@ -876,7 +947,7 @@ func (r *streamChunkRewriter) writeRawJSONArray(p []byte, opening bool) ([][]byt
 		}
 		if !complete {
 			if err := r.retainPending(p[cursor:]); err != nil {
-				return nil, err
+				return out, err
 			}
 			return out, nil
 		}
@@ -891,7 +962,7 @@ func (r *streamChunkRewriter) writeRawJSONArray(p []byte, opening bool) ([][]byt
 			var err error
 			restored, _, err = r.sse.restoreResponseModel(p[start:end])
 			if err != nil {
-				return nil, err
+				return out, err
 			}
 		}
 		capacity := start - cursor + len(restored) + next - end
@@ -912,6 +983,7 @@ func (r *streamChunkRewriter) writeRawJSONArray(p []byte, opening bool) ([][]byt
 			r.rawJSONArray = false
 			if cursor < len(p) {
 				suffix, err := r.Write(p[cursor:])
+				r.batchSSEOutput = false
 				return append(out, suffix...), err
 			}
 			return out, nil
@@ -920,24 +992,36 @@ func (r *streamChunkRewriter) writeRawJSONArray(p []byte, opening bool) ([][]byt
 	return out, nil
 }
 
+func (r *streamChunkRewriter) writeSSESuffix(p []byte) ([][]byte, error) {
+	if r.frameRawJSONAsSSE {
+		p = bytes.TrimLeft(p, " \t\r\n")
+	}
+	r.rawJSONBoundary = false
+	return r.sse.Write(p)
+}
+
 func (r *streamChunkRewriter) rawJSONChunks(p []byte) ([][]byte, error) {
-	chunks, _, ok, incomplete, err := r.tryRawJSONChunks(p)
+	chunks, consumed, ok, incomplete, err := r.tryRawJSONChunks(p, true)
 	if err != nil {
-		return nil, err
+		return chunks, err
 	}
 	if !ok && !incomplete {
 		return [][]byte{bytes.Clone(p)}, nil
 	}
 	if incomplete {
 		if r.frameRawJSONAsSSE {
-			return nil, fmt.Errorf("incomplete raw JSON stream")
+			return chunks, fmt.Errorf("incomplete raw JSON stream")
 		}
 		return [][]byte{bytes.Clone(p)}, nil
+	}
+	if consumed < len(p) {
+		sseChunks, err := r.writeSSESuffix(p[consumed:])
+		return append(chunks, sseChunks...), err
 	}
 	return chunks, nil
 }
 
-func (r *streamChunkRewriter) tryRawJSONChunks(p []byte) ([][]byte, int, bool, bool, error) {
+func (r *streamChunkRewriter) tryRawJSONChunks(p []byte, eof bool) ([][]byte, int, bool, bool, error) {
 	start := skipTopLevelModelJSONSpace(p, 0)
 	end := len(p)
 	for end > start {
@@ -1005,7 +1089,7 @@ trimmed:
 			return [][]byte{out}, len(p), true, false, nil
 		}
 	}
-	values, consumed, ok, incomplete := splitJSONValues(p)
+	values, consumed, ok, incomplete := splitJSONValues(p, r.frameRawJSONAsSSE, eof)
 	if !ok {
 		return nil, 0, false, incomplete, nil
 	}
@@ -1019,7 +1103,7 @@ trimmed:
 		end := start + len(value)
 		restored, _, err := r.sse.restoreResponseModel(value)
 		if err != nil {
-			return nil, 0, false, false, err
+			return out, cursor, true, false, err
 		}
 		if r.frameRawJSONAsSSE {
 			out = append(out, r.frameRawJSON(restored))
@@ -1037,14 +1121,33 @@ trimmed:
 	return out, consumed, true, incomplete, nil
 }
 
-func splitJSONValues(p []byte) ([][]byte, int, bool, bool) {
+func splitJSONValues(p []byte, framed, eof bool) ([][]byte, int, bool, bool) {
 	if len(bytes.TrimSpace(p)) == 0 {
 		return nil, len(p), true, false
 	}
 	dec := json.NewDecoder(bytes.NewReader(p))
 	values := make([][]byte, 0, 1)
 	consumed := 0
+	scalarStart, scalarOffset := 0, 0
+	splitBeforeSSESuffix := func(start int) ([][]byte, int, bool, bool) {
+		// unknown field 内未分隔的 scalar tokens 不属于完整 raw 前缀。
+		if start == 0 && scalarStart < len(values) {
+			return values[:scalarStart], scalarOffset, scalarStart > 0, false
+		}
+		return values, consumed, len(values) > 0, false
+	}
 	for {
+		suffix := p[consumed:]
+		start := skipTopLevelModelJSONSpace(suffix, 0)
+		if len(values) > 0 && start < len(suffix) && suffix[start] != '{' && suffix[start] != '[' {
+			if (framed || !couldStartJSONValue(suffix)) && (isSSEChunk(suffix) || isIncompleteSSEPrefix(suffix)) {
+				return splitBeforeSSESuffix(start)
+			}
+			// scalar 与 unknown field 的分界需要后续字节或 EOF，已完成的 raw 前缀仍可发送。
+			if !eof && (framed || !couldStartJSONValue(suffix)) {
+				return values, consumed, true, true
+			}
+		}
 		var raw json.RawMessage
 		err := dec.Decode(&raw)
 		if err == io.EOF {
@@ -1054,14 +1157,24 @@ func splitJSONValues(p []byte) ([][]byte, int, bool, bool) {
 			if err == io.ErrUnexpectedEOF {
 				return values, consumed, len(values) > 0, true
 			}
+			if len(values) > 0 && start < len(suffix) && suffix[start] != '{' && suffix[start] != '[' && (isSSEChunk(suffix) || isIncompleteSSEPrefix(suffix)) {
+				return splitBeforeSSESuffix(start)
+			}
 			return nil, 0, false, false
 		}
+		end := int(dec.InputOffset())
+		if raw[0] == '{' || raw[0] == '[' {
+			scalarStart, scalarOffset = len(values)+1, end
+		} else if start > 0 {
+			scalarStart, scalarOffset = len(values), consumed
+		}
 		values = append(values, raw)
-		consumed = int(dec.InputOffset())
+		consumed = end
 	}
 }
 
 func (r *streamChunkRewriter) Flush() ([][]byte, error) {
+	r.batchSSEOutput = r.frameRawJSONAsSSE
 	r.rawScan = rawJSONScan{}
 	if r.rawJSONArray {
 		r.rawJSONArray = false
@@ -1076,34 +1189,25 @@ func (r *streamChunkRewriter) Flush() ([][]byte, error) {
 	if len(r.pending) > 0 {
 		pending := append([]byte(nil), r.pending...)
 		r.pending = nil
-		if couldStartJSONValue(pending) {
+		start := skipTopLevelModelJSONSpace(pending, 0)
+		if couldStartJSONValue(pending) && (pending[start] == '{' || pending[start] == '[' || !isSSEChunk(pending)) {
 			chunks, err := r.rawJSONChunks(pending)
-			if err != nil {
-				return nil, err
-			}
-			flushed, err := r.sse.Flush()
-			if err != nil {
-				return nil, err
-			}
-			return append(chunks, flushed...), nil
+			flushed, flushErr := r.sse.Flush()
+			return append(chunks, flushed...), joinStreamErrors(err, flushErr)
 		}
+		r.batchSSEOutput = true
 		chunks, err := r.sse.Write(pending)
-		if err != nil {
-			return nil, err
-		}
-		flushed, err := r.sse.Flush()
-		if err != nil {
-			return nil, err
-		}
-		return append(chunks, flushed...), nil
+		flushed, flushErr := r.sse.Flush()
+		return append(chunks, flushed...), joinStreamErrors(err, flushErr)
 	}
+	r.batchSSEOutput = true
 	return r.sse.Flush()
 }
 
 func (r *streamChunkRewriter) Finish() ([][]byte, error) {
 	chunks, err := r.Flush()
 	if err != nil {
-		return nil, err
+		return chunks, err
 	}
 	r.sse.resetDelimiterlessResponsesEventScanner()
 	if r.format == "openai" && r.frameRawJSONAsSSE && r.framedRawJSON && !r.sse.sawDone {
@@ -1114,6 +1218,7 @@ func (r *streamChunkRewriter) Finish() ([][]byte, error) {
 
 func (r *streamChunkRewriter) frameRawJSON(p []byte) []byte {
 	r.framedRawJSON = true
+	r.rawJSONBoundary = true
 	eventType := ""
 	if r.format == "openai-response" || r.format == "claude" {
 		var event struct {
@@ -1193,11 +1298,16 @@ func couldStartJSONValue(p []byte) bool {
 	}
 }
 func isSSEChunk(p []byte) bool {
-	if hasSSEFieldPrefix(p) {
-		return true
+	for remaining := p; len(remaining) > 0; {
+		line, _, next := splitSSELine(remaining)
+		remaining = next
+		if !couldStartJSONValue(line) && hasSSEFieldPrefix(line) {
+			return true
+		}
 	}
 	_, delimiterLength, _ := findSSEEventDelimiter(p, 0, true)
-	return delimiterLength > 0 || hasSSEDataField(p)
+	trimmed := bytes.TrimLeft(p, " \t\r\n")
+	return delimiterLength > 0 || len(trimmed) > 0 && !couldStartJSONValue(trimmed) && bytes.ContainsAny(trimmed, "\r\n")
 }
 
 func isIncompleteSSEPrefix(p []byte) bool {
@@ -1917,7 +2027,7 @@ func prepareExecutorStream(req *executorRPCRequest, call hostCaller) (*executorS
 		}
 		headers.Set("Content-Type", contentType)
 	}
-	stream.frameRawJSONAsSSE = req.Format != "gemini" && isEventStreamContentType(headers.Get("Content-Type"))
+	stream.frameRawJSONAsSSE = req.Format != "gemini" && req.Format != "openai" && isEventStreamContentType(headers.Get("Content-Type"))
 	return stream, headers, nil
 }
 
@@ -1980,17 +2090,19 @@ func joinStreamErrors(primary error, cleanup ...error) error {
 }
 
 func (s *executorStream) processPayload(rewriter *streamChunkRewriter, payload []byte) error {
-	if len(payload) == 0 {
+	if len(payload) == 0 || rewriter.emitFailed {
 		return nil
 	}
-	chunks, err := rewriter.Write(payload)
-	if err != nil {
-		return fmt.Errorf("rewrite stream chunk: %w", err)
+	chunks, rewriteErr := rewriter.Write(payload)
+	if rewriteErr != nil {
+		rewriteErr = fmt.Errorf("rewrite stream chunk: %w", rewriteErr)
 	}
-	if err := emitRewritten(chunks, rewriter.frameRawJSONAsSSE, s.emit); err != nil {
-		return fmt.Errorf("emit stream chunk: %w", err)
+	emitErr := emitRewritten(chunks, rewriter.batchSSEOutput, s.emit)
+	if emitErr != nil {
+		rewriter.emitFailed = true
+		emitErr = fmt.Errorf("emit stream chunk: %w", emitErr)
 	}
-	return nil
+	return joinStreamErrors(rewriteErr, emitErr)
 }
 
 func (s *executorStream) flushAndEmit(rewriter *streamChunkRewriter, cleanCompletion bool) error {
@@ -2004,12 +2116,17 @@ func (s *executorStream) flushAndEmit(rewriter *streamChunkRewriter, cleanComple
 		flushed, err = rewriter.Flush()
 	}
 	if err != nil {
-		return fmt.Errorf("flush stream rewriter: %w", err)
+		err = fmt.Errorf("flush stream rewriter: %w", err)
 	}
-	if err := emitRewritten(flushed, rewriter.frameRawJSONAsSSE, s.emit); err != nil {
-		return fmt.Errorf("emit flushed stream chunk: %w", err)
+	if rewriter.emitFailed {
+		return err
 	}
-	return nil
+	emitErr := emitRewritten(flushed, rewriter.batchSSEOutput, s.emit)
+	if emitErr != nil {
+		rewriter.emitFailed = true
+		emitErr = fmt.Errorf("emit flushed stream chunk: %w", emitErr)
+	}
+	return joinStreamErrors(err, emitErr)
 }
 
 func (s *executorStream) selectTerminal(primary error, completed bool) error {
