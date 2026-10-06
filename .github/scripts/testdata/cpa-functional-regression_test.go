@@ -217,14 +217,18 @@ func gCPACoreFields(t *testing.T, p *gCPALocalProducer, ctx context.Context) []s
 		t.Fatal(err)
 	}
 	var parts []string
+	empty := 0
 	for chunk := range stream.Chunks {
 		if chunk.Err != nil {
 			t.Fatal(chunk.Err)
 		}
 		if len(chunk.Payload) > 0 {
 			parts = append(parts, string(chunk.Payload))
+		} else {
+			empty++
 		}
 	}
+	t.Logf("builtin core provider=%s fixture=%s fields=%q emptyChunks=%d", p.provider.Identifier(), p.fixture.name, parts, empty)
 	return parts
 }
 
@@ -243,20 +247,15 @@ func gCPAHostFields(t *testing.T, p *gCPALocalProducer, ctx context.Context) []s
 			parts = append(parts, string(chunk.Payload))
 		}
 	}
+	t.Logf("builtin host provider=%s fixture=%s fields=%q", p.provider.Identifier(), p.fixture.name, parts)
 	return parts
 }
 
 func gCPARequireResponse(t *testing.T, raw []byte, model string) {
 	t.Helper()
-	var response struct {
-		Model, Status string
-		Output        json.RawMessage
-	}
-	if err := json.Unmarshal(raw, &response); err != nil {
-		t.Fatal(err)
-	}
-	if response.Model != model || response.Status != "completed" || string(response.Output) != gCPAOutput {
-		t.Fatalf("response model=%q status=%q output=%s", response.Model, response.Status, response.Output)
+	want := `{"id":"resp-issue8","object":"response","status":"completed","model":"` + model + `","output":` + gCPAOutput + `}`
+	if string(raw) != want {
+		t.Fatalf("completed response=%s want=%s", raw, want)
 	}
 }
 
@@ -1526,8 +1525,13 @@ func TestModelMapperFunctionalCompatLifecycle(t *testing.T) {
 					t.Error(err)
 					return
 				}
-				if r.URL.Path != "/v1/chat/completions" || req.Model != "grok-4.7" || !req.Stream {
+				if r.URL.Path != "/v1/chat/completions" || req.Model != "grok-4.7" {
 					t.Errorf("compat upstream path=%s body=%s", r.URL.Path, raw)
+				}
+				if !req.Stream {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"id":"interaction-functional","object":"chat.completion","created":1,"model":"`+req.Model+`","choices":[{"index":0,"message":{"role":"assistant","content":"ordinary grok-4.7 opaque 中文 output"},"finish_reason":"stop"}]}`)
+					return
 				}
 				w.Header().Set("Content-Type", "text/event-stream")
 				for i := 0; i < count; i++ {
@@ -1711,6 +1715,22 @@ func TestModelMapperFunctionalCompatLifecycle(t *testing.T) {
 						}
 						t.Logf("OpenAI-compatible Interactions model=%s complete events=%q upstream=%s", model, names, upstream)
 					})
+					t.Run("interactions-nonstream/"+model, func(t *testing.T) {
+						calls = 0
+						status, _, raw := eHTTP(t, server, "/v1beta/interactions", []byte(fmt.Sprintf(`{"model":%q,"input":"hello","stream":false}`, model)))
+						var request struct {
+							Model  string
+							Stream bool
+						}
+						if err := json.Unmarshal(upstream, &request); err != nil {
+							t.Fatal(err)
+						}
+						want := `{"id":"interaction-functional","status":"completed","object":"interaction","model":"` + model + `","steps":[{"type":"model_output","content":[{"type":"text","text":"ordinary grok-4.7 opaque 中文 output"}]}],"finish_reason":"stop"}`
+						if status != 200 || calls != 1 || request.Model != "grok-4.7" || request.Stream || string(raw) != want {
+							t.Fatalf("Interactions nonstream status=%d calls=%d upstream=%s output=%s want=%s", status, calls, upstream, raw, want)
+						}
+						t.Logf("OpenAI-compatible Interactions nonstream model=%s status=%d calls=%d upstream=%s complete=%s", model, status, calls, upstream, raw)
+					})
 				}
 			}
 		})
@@ -1768,46 +1788,87 @@ func TestModelMapperFunctionalBinaryCaptures(t *testing.T) {
 		t.Fatal(err)
 	}
 	var captures []struct {
-		Name, ClientModel, UpstreamModel string
-		Stream                           bool
-		Status                           int
-		Headers                          http.Header
-		Body, Request, UpstreamResponse  []byte
-		RequestHeaders                   http.Header
-		Path                             string
+		Name, Fixture, ClientModel, UpstreamModel string
+		Stream, DataOnly                          bool
+		Status, Count, Calls                      int
+		Headers                                   http.Header
+		Body, Request, UpstreamResponse           []byte
+		RequestHeaders                            http.Header
+		Path                                      string
 	}
 	if err := json.Unmarshal(raw, &captures); err != nil {
 		t.Fatal(err)
 	}
-	if len(captures) != 12 {
-		t.Fatalf("binary captures=%d want=12", len(captures))
+	if len(captures) != 384 {
+		t.Fatalf("binary captures=%d want=384", len(captures))
+	}
+	type expectation struct {
+		fixture         gCPAFieldsFixture
+		model, upstream string
+	}
+	want := make(map[string]expectation)
+	for _, provider := range []string{"xai", "codex"} {
+		for _, control := range []struct{ name, model, upstream string }{
+			{"mapped", "grok-4.6", "grok-4.7"},
+			{"direct", "grok-4.7", "grok-4.7"},
+			{"disabled-grok-4.6", "grok-4.6", "grok-4.6"},
+			{"disabled-grok-4.7", "grok-4.7", "grok-4.7"},
+		} {
+			for _, f := range gCPAFieldsFixtures() {
+				for _, stream := range []bool{false, true} {
+					key := fmt.Sprintf("%s/%s/%s/stream=%v", provider, control.name, f.name, stream)
+					want[key] = expectation{f, control.model, control.upstream}
+				}
+			}
+		}
 	}
 	for _, capture := range captures {
-		t.Run(fmt.Sprintf("%s/stream=%v", capture.Name, capture.Stream), func(t *testing.T) {
-			if capture.Status != 200 {
-				t.Fatalf("binary status=%d body=%q", capture.Status, capture.Body)
+		key := fmt.Sprintf("%s/stream=%v", capture.Name, capture.Stream)
+		expected, ok := want[key]
+		if !ok {
+			t.Fatalf("unexpected or duplicate binary capture=%s", key)
+		}
+		delete(want, key)
+		t.Run(key, func(t *testing.T) {
+			f := expected.fixture
+			if capture.Fixture != f.name || capture.DataOnly != f.dataOnly || capture.Count != f.count || capture.ClientModel != expected.model || capture.UpstreamModel != expected.upstream {
+				t.Fatalf("binary capture identity=%+v want=%+v", capture, expected)
+			}
+			if capture.Status != 200 || capture.Calls != 1 {
+				t.Fatalf("binary status=%d calls=%d body=%q", capture.Status, capture.Calls, capture.Body)
 			}
 			if capture.Stream {
-				gCPARequireEvents(t, capture.Body, gCPAFieldsFixture{count: 9}, capture.ClientModel)
+				if !strings.HasPrefix(capture.Headers.Get("Content-Type"), "text/event-stream") {
+					t.Fatalf("binary Content-Type=%q", capture.Headers.Get("Content-Type"))
+				}
+				gCPARequireEvents(t, capture.Body, f, expected.model)
 			} else {
-				gCPARequireResponse(t, capture.Body, capture.ClientModel)
+				gCPARequireResponse(t, capture.Body, expected.model)
 			}
 			var request struct {
-				Model  string
-				Stream bool
-				Input  []struct{ Content []struct{ Text string } }
+				Model          string
+				Stream         bool
+				Input          json.RawMessage
+				PromptCacheKey string `json:"prompt_cache_key"`
 			}
 			if err := json.Unmarshal(capture.Request, &request); err != nil {
 				t.Fatal(err)
 			}
-			if request.Model != capture.UpstreamModel || !request.Stream || len(request.Input) != 1 || len(request.Input[0].Content) != 1 || request.Input[0].Content[0].Text != "opaque grok-4.6 and grok-4.7" {
+			if request.Model != expected.upstream || !request.Stream || request.PromptCacheKey != "task-g-local" || string(request.Input) != `[{"type":"message","role":"user","content":[{"type":"input_text","text":"say ok"}]}]` {
 				t.Fatalf("upstream request=%s", capture.Request)
 			}
-			if capture.Path != "/v1/responses" || capture.RequestHeaders.Get("Content-Length") != fmt.Sprint(len(capture.Request)) {
+			if capture.Path != "/v1/responses" || capture.RequestHeaders.Get("Content-Length") != fmt.Sprint(len(capture.Request)) || capture.RequestHeaders.Get("Authorization") != "Bearer fake-upstream-key" {
 				t.Fatalf("path=%s headers=%v bytes=%d", capture.Path, capture.RequestHeaders, len(capture.Request))
 			}
-			t.Logf("binary %s stream=%v status=%d client=%s upstream=%s requestBytes=%d responseSHA256=%x headers=%v", capture.Name, capture.Stream, capture.Status, capture.ClientModel, capture.UpstreamModel, len(capture.Request), sha256.Sum256(capture.Body), capture.Headers)
+			_, wire := gCPAFields(f, expected.upstream)
+			if !bytes.Equal(capture.UpstreamResponse, wire) {
+				t.Fatalf("upstream response=%q want=%q", capture.UpstreamResponse, wire)
+			}
+			t.Logf("binary %s status=%d calls=%d client=%s upstream=%s requestBytes=%d responseSHA256=%x headers=%v", key, capture.Status, capture.Calls, capture.ClientModel, capture.UpstreamModel, len(capture.Request), sha256.Sum256(capture.Body), capture.Headers)
 		})
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing binary captures=%v", want)
 	}
 }
 

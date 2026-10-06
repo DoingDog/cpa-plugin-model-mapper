@@ -23,6 +23,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestSmokePluginPathsUseHostPlatform(t *testing.T) {
@@ -784,6 +786,19 @@ func functionalCPAProcess(t *testing.T, repoRoot, cpaBin, upstreamURL, rules, ex
 	if !enabled {
 		config = strings.Replace(config, "plugins:\n  enabled: true\n", "plugins:\n  enabled: false\n", 1)
 	}
+	if extra != "" {
+		var nativeConfig map[string]any
+		if err := yaml.Unmarshal([]byte(config), &nativeConfig); err != nil {
+			t.Fatal(err)
+		}
+		delete(nativeConfig, "openai-compatibility")
+		encoded, err := yaml.Marshal(nativeConfig)
+		if err != nil {
+			t.Fatal(err)
+		}
+		config = string(encoded)
+	}
+	t.Logf("CPA process enabled=%v DLL source=%s copy=%s SHA256=%x config=%s", enabled, source, env.plugin, sha256.Sum256(original), config)
 	if err := writeSmokeConfig(env.config, []byte(config)); err != nil {
 		t.Fatal(err)
 	}
@@ -799,10 +814,10 @@ func functionalCPAProcess(t *testing.T, repoRoot, cpaBin, upstreamURL, rules, ex
 	if err := waitReady(proc, port, localAPIKey); err != nil {
 		t.Fatal(err)
 	}
-	if runtime.GOOS == "windows" && enabled {
+	if runtime.GOOS == "windows" {
 		shadowDir := filepath.Join(env.dir, "tmp", "cliproxy-pluginhost", fmt.Sprintf("pid-%d", proc.cmd.Process.Pid))
 		entries, err := os.ReadDir(shadowDir)
-		if err != nil || len(entries) == 0 {
+		if err != nil && (enabled || !errors.Is(err, os.ErrNotExist)) {
 			t.Fatalf("shadow directory: %v", err)
 		}
 		shadows := 0
@@ -817,9 +832,14 @@ func functionalCPAProcess(t *testing.T, repoRoot, cpaBin, upstreamURL, rules, ex
 			shadows++
 			t.Logf("DLL source=%s copy=%s shadow=%s SHA256=%x", source, env.plugin, entry.Name(), sha256.Sum256(shadow))
 		}
-		if shadows != 1 {
-			t.Fatalf("native DLL shadows=%d want=1", shadows)
+		wantShadows := 0
+		if enabled {
+			wantShadows = 1
 		}
+		if shadows != wantShadows {
+			t.Fatalf("native DLL shadows=%d want=%d", shadows, wantShadows)
+		}
+		t.Logf("CPA process enabled=%v native DLL shadows=%d", enabled, shadows)
 	}
 	return env
 }
@@ -847,6 +867,36 @@ func functionalHTTPRequest(t *testing.T, port int, path string, body []byte) (in
 		t.Logf("HTTP path=%s request=%s status=%d headers=%v response=%s", path, body, resp.StatusCode, resp.Header, raw)
 	}
 	return resp.StatusCode, resp.Header, raw
+}
+
+func requireFunctionalCPARegistration(t *testing.T, env smokeEnv, enabled bool) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/v0/management/plugins", env.port), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Management-Key", "local-integration-management-key")
+	response, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var listing struct {
+		PluginsEnabled bool `json:"plugins_enabled"`
+		Plugins        []struct {
+			ID               string
+			Configured       bool
+			Registered       bool
+			EffectiveEnabled bool `json:"effective_enabled"`
+		}
+	}
+	if err := json.NewDecoder(response.Body).Decode(&listing); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != 200 || listing.PluginsEnabled != enabled || len(listing.Plugins) != 1 || listing.Plugins[0].ID != "model-mapper" || !listing.Plugins[0].Configured || listing.Plugins[0].Registered != enabled || listing.Plugins[0].EffectiveEnabled != enabled {
+		t.Fatalf("registration enabled=%v status=%d listing=%+v", enabled, response.StatusCode, listing)
+	}
+	t.Logf("CPA registration enabled=%v status=%d listing=%+v", enabled, response.StatusCode, listing)
 }
 
 func prepareFunctionalCPAOverlay(t *testing.T, repoRoot string) (string, string) {
@@ -949,6 +999,7 @@ func TestCPAPluginIntegration(t *testing.T) {
 	t.Logf("CPA binary=%s SHA256=%x revision=%s Go=%s", cpaBin, sha256.Sum256(binary), settings["vcs.revision"], info.GoVersion)
 	var calls atomic.Int32
 	var upstreamMode atomic.Int32
+	var duplicateRequest atomic.Bool
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		raw, err := io.ReadAll(r.Body)
@@ -971,11 +1022,15 @@ func TestCPAPluginIntegration(t *testing.T) {
 			http.Error(w, "unexpected upstream request", 400)
 			return
 		}
-		if upstreamMode.Load() == 1 && !request.Stream {
+		if duplicateRequest.Load() {
 			want := `{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"first"}],"messages":[{"role":"user","content":"second"}]}`
 			if string(raw) != want {
 				t.Errorf("duplicate request=%s want=%s", raw, want)
 			}
+		} else if len(request.Messages) != 1 || request.Messages[0].Role != "user" || request.Messages[0].Content != "say ok" {
+			t.Errorf("ordinary upstream messages=%+v want one user message with content=say ok", request.Messages)
+			http.Error(w, "unexpected ordinary upstream messages", http.StatusBadRequest)
+			return
 		}
 		if !request.Stream {
 			w.Header().Set("Content-Type", "application/json")
@@ -1004,29 +1059,7 @@ func TestCPAPluginIntegration(t *testing.T) {
 	defer upstream.Close()
 	env := functionalCPAProcess(t, repoRoot, cpaBin, upstream.URL, "deepseek-v4-pro=>deepseek-v4-flash", "", true)
 	t.Run("registration", func(t *testing.T) {
-		req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/v0/management/plugins", env.port), nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		req.Header.Set("X-Management-Key", "local-integration-management-key")
-		response, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer response.Body.Close()
-		var listing struct {
-			Plugins []struct {
-				ID               string
-				Registered       bool
-				EffectiveEnabled bool `json:"effective_enabled"`
-			}
-		}
-		if err := json.NewDecoder(response.Body).Decode(&listing); err != nil {
-			t.Fatal(err)
-		}
-		if response.StatusCode != 200 || len(listing.Plugins) != 1 || listing.Plugins[0].ID != "model-mapper" || !listing.Plugins[0].Registered || !listing.Plugins[0].EffectiveEnabled {
-			t.Fatalf("registration status=%d listing=%+v", response.StatusCode, listing)
-		}
+		requireFunctionalCPARegistration(t, env, true)
 	})
 	for _, endpoint := range []string{"chat", "completions"} {
 		for _, model := range []string{"deepseek-v4-pro", "deepseek-v4-flash"} {
@@ -1077,6 +1110,8 @@ func TestCPAPluginIntegration(t *testing.T) {
 		}
 	}
 	t.Run("request-duplicate-content", func(t *testing.T) {
+		duplicateRequest.Store(true)
+		defer duplicateRequest.Store(false)
 		upstreamMode.Store(1)
 		calls.Store(0)
 		status, _, _ := functionalHTTPRequest(t, env.port, "/v1/chat/completions", []byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"first"}],"model":"deepseek-v4-pro","messages":[{"role":"user","content":"second"}]}`))
@@ -1113,25 +1148,45 @@ func TestCPAPluginIntegration(t *testing.T) {
 func functionalNativeBinaryCaptures(t *testing.T, repoRoot, cpaBin string) string {
 	t.Helper()
 	const output = `[{"id":"msg-issue8","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ordinary grok-4.7 opaque 中文 output","annotations":[]}]}]`
+	payloads := []string{`{"type":"response.created","response":{"model":"MODEL","status":"in_progress","output":[]}}`, `{"type":"response.in_progress","response":{"model":"MODEL","status":"in_progress","output":[]}}`, `{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}`, `{"type":"response.content_part.added","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}`, `{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"ordinary grok-4.7 opaque 中文 output"}`, `{"type":"response.output_text.done","output_index":0,"content_index":0,"text":"ordinary grok-4.7 opaque 中文 output"}`, `{"type":"response.content_part.done","output_index":0,"content_index":0,"part":{"type":"output_text","text":"ordinary grok-4.7 opaque 中文 output","annotations":[]}}`, `{"type":"response.output_item.done","output_index":0,"item":{"id":"msg-issue8","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ordinary grok-4.7 opaque 中文 output","annotations":[]}]}}`, `{"type":"response.completed","response":{"id":"resp-issue8","object":"response","status":"completed","model":"MODEL","output":` + output + `}}`}
+	type fixture struct {
+		name, eol, contentType string
+		step, count            int
+		dataOnly               bool
+	}
+	var fixtures []fixture
+	for _, dataOnly := range []bool{false, true} {
+		for _, count := range []int{1, 9} {
+			for _, f := range []fixture{
+				{name: "LF-whole", eol: "\n", contentType: "text/event-stream"},
+				{name: "CRLF-whole", eol: "\r\n", contentType: "text/event-stream"},
+				{name: "LF-7bytes", eol: "\n", contentType: "text/event-stream", step: 7},
+				{name: "CRLF-bytewise", eol: "\r\n", contentType: "text/event-stream", step: 1},
+				{name: "LF-charset", eol: "\n", contentType: "text/event-stream; charset=utf-8", step: 11},
+				{name: "CRLF-charset", eol: "\r\n", contentType: "text/event-stream; charset=utf-8", step: 7},
+			} {
+				f.dataOnly, f.count = dataOnly, count
+				f.name = fmt.Sprintf("dataOnly=%v/count=%d/%s", dataOnly, count, f.name)
+				fixtures = append(fixtures, f)
+			}
+		}
+	}
 	type capture struct {
-		Name, ClientModel, UpstreamModel string
-		Stream                           bool
-		Status                           int
-		Headers                          http.Header
-		Body, Request, UpstreamResponse  []byte
-		RequestHeaders                   http.Header
-		Path                             string
+		Name, Fixture, ClientModel, UpstreamModel string
+		Stream, DataOnly                          bool
+		Status, Count, Calls                      int
+		Headers                                   http.Header
+		Body, Request, UpstreamResponse           []byte
+		RequestHeaders                            http.Header
+		Path                                      string
 	}
 	var captures []capture
 	for _, provider := range []string{"xai", "codex"} {
-		var mapped []capture
-		for _, variant := range []string{"mapped", "direct", "disabled"} {
-			t.Run(provider+"/"+variant, func(t *testing.T) {
-				model, enabled := "grok-4.6", variant != "disabled"
-				if variant == "direct" {
-					model = "grok-4.7"
-				}
+		mapped := make(map[string]capture)
+		for _, enabled := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/enabled=%v", provider, enabled), func(t *testing.T) {
 				var mu sync.Mutex
+				var current fixture
 				var records []capture
 				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					body, err := io.ReadAll(r.Body)
@@ -1147,75 +1202,101 @@ func functionalNativeBinaryCaptures(t *testing.T, repoRoot, cpaBin string) strin
 						t.Error(err)
 						return
 					}
-					if r.URL.Path != "/v1/responses" || !req.Stream || r.Header.Get("Authorization") != "Bearer fake-upstream-key" {
+					if r.Method != http.MethodPost || r.URL.Path != "/v1/responses" || !req.Stream || (req.Model != "grok-4.6" && req.Model != "grok-4.7") || r.Header.Get("Authorization") != "Bearer fake-upstream-key" {
 						t.Errorf("native upstream path=%s headers=%v body=%s", r.URL.Path, r.Header, body)
 					}
-					payloads := []string{`{"type":"response.created","response":{"model":"MODEL","status":"in_progress","output":[]}}`, `{"type":"response.in_progress","response":{"model":"MODEL","status":"in_progress","output":[]}}`, `{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}`, `{"type":"response.content_part.added","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}`, `{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"ordinary grok-4.7 opaque 中文 output"}`, `{"type":"response.output_text.done","output_index":0,"content_index":0,"text":"ordinary grok-4.7 opaque 中文 output"}`, `{"type":"response.content_part.done","output_index":0,"content_index":0,"part":{"type":"output_text","text":"ordinary grok-4.7 opaque 中文 output","annotations":[]}}`, `{"type":"response.output_item.done","output_index":0,"item":{"id":"msg-issue8","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ordinary grok-4.7 opaque 中文 output","annotations":[]}]}}`, `{"type":"response.completed","response":{"id":"resp-issue8","object":"response","status":"completed","model":"MODEL","output":` + output + `}}`}
+					mu.Lock()
+					f := current
+					mu.Unlock()
+					values := payloads
+					if f.count == 1 {
+						values = values[len(values)-1:]
+					}
 					var wire strings.Builder
-					for _, payload := range payloads {
+					for _, payload := range values {
 						payload = strings.Replace(payload, `"model":"MODEL"`, `"model":"`+req.Model+`"`, 1)
 						var event struct{ Type string }
 						if err := json.Unmarshal([]byte(payload), &event); err != nil {
 							t.Error(err)
 							return
 						}
-						fmt.Fprintf(&wire, "event: %s\ndata: %s\n\n", event.Type, payload)
+						if !f.dataOnly {
+							fmt.Fprintf(&wire, "event: %s%s", event.Type, f.eol)
+						}
+						fmt.Fprintf(&wire, "data: %s%s%s", payload, f.eol, f.eol)
 					}
 					mu.Lock()
 					records = append(records, capture{UpstreamModel: req.Model, Request: bytes.Clone(body), RequestHeaders: r.Header.Clone(), Path: r.URL.RequestURI(), UpstreamResponse: []byte(wire.String())})
 					mu.Unlock()
-					w.Header().Set("Content-Type", "text/event-stream")
-					_, _ = io.WriteString(w, wire.String())
+					w.Header().Set("Content-Type", f.contentType)
+					step := f.step
+					if step == 0 {
+						step = wire.Len()
+					}
+					for start := 0; start < wire.Len(); start += step {
+						if _, err := io.WriteString(w, wire.String()[start:min(start+step, wire.Len())]); err != nil {
+							t.Error(err)
+							return
+						}
+						w.(http.Flusher).Flush()
+					}
 				}))
 				defer upstream.Close()
 				extra := fmt.Sprintf("%s-api-key:\n  - api-key: fake-upstream-key\n    base-url: %q\n    proxy-url: direct\n    models:\n      - name: grok-4.6\n        alias: grok-4.6\n      - name: grok-4.7\n        alias: grok-4.7\n", provider, upstream.URL+"/v1")
 				env := functionalCPAProcess(t, repoRoot, cpaBin, upstream.URL, "grok-4.6=>grok-4.7", extra, enabled)
-				for _, stream := range []bool{false, true} {
-					mu.Lock()
-					records = nil
-					mu.Unlock()
-					body := []byte(fmt.Sprintf(`{"model":%q,"input":[{"role":"user","content":[{"type":"input_text","text":"opaque grok-4.6 and grok-4.7"}]}],"stream":%v,"prompt_cache_key":"task-e-binary-local"}`, model, stream))
-					status, headers, raw := functionalHTTPRequest(t, env.port, "/v1/responses", body)
-					mu.Lock()
-					got := append([]capture(nil), records...)
-					mu.Unlock()
-					wantUpstream := model
-					if variant == "mapped" {
-						wantUpstream = "grok-4.7"
+				requireFunctionalCPARegistration(t, env, enabled)
+				for _, f := range fixtures {
+					for _, stream := range []bool{false, true} {
+						for _, model := range []string{"grok-4.6", "grok-4.7"} {
+							t.Run(fmt.Sprintf("%s/stream=%v/model=%s", f.name, stream, model), func(t *testing.T) {
+								mu.Lock()
+								current, records = f, nil
+								mu.Unlock()
+								body := []byte(fmt.Sprintf(`{"model":%q,"input":"say ok","stream":%v,"prompt_cache_key":"task-g-local"}`, model, stream))
+								status, headers, raw := functionalHTTPRequest(t, env.port, "/v1/responses", body)
+								mu.Lock()
+								got := append([]capture(nil), records...)
+								mu.Unlock()
+								variant, wantUpstream := "direct", model
+								if !enabled {
+									variant = "disabled-" + model
+								} else if model == "grok-4.6" {
+									variant, wantUpstream = "mapped", "grok-4.7"
+								}
+								if len(got) != 1 || got[0].UpstreamModel != wantUpstream {
+									t.Fatalf("upstream calls=%+v", got)
+								}
+								record := got[0]
+								record.Name, record.Fixture, record.ClientModel = provider+"/"+variant+"/"+f.name, f.name, model
+								record.Stream, record.DataOnly, record.Count, record.Calls = stream, f.dataOnly, f.count, len(got)
+								record.Status, record.Headers, record.Body = status, headers, raw
+								captures = append(captures, record)
+								if status != 200 {
+									t.Errorf("native %s stream=%v status=%d error=%s", record.Name, stream, status, raw)
+								}
+								key := fmt.Sprintf("%s/stream=%v", f.name, stream)
+								if variant == "mapped" {
+									mapped[key] = record
+								} else {
+									control, ok := mapped[key]
+									if !ok {
+										t.Fatalf("mapped capture missing for %s", key)
+									}
+									want := record.Request
+									if !enabled && model == "grok-4.6" {
+										want = bytes.Replace(want, []byte(`"model":"grok-4.6"`), []byte(`"model":"grok-4.7"`), 1)
+									}
+									if !bytes.Equal(want, control.Request) {
+										t.Errorf("non-model upstream bytes changed: mapped=%s control=%s", control.Request, record.Request)
+									}
+									if variant == "direct" && (!reflect.DeepEqual(control.RequestHeaders, record.RequestHeaders) || control.Path != record.Path || !bytes.Equal(control.UpstreamResponse, record.UpstreamResponse)) {
+										t.Errorf("mapped/direct upstream headers, URI or response bytes differ: mapped=%+v direct=%+v", control, record)
+									}
+								}
+								t.Logf("native binary %s stream=%v upstreamRequest=%s requestHeaders=%v upstreamSHA256=%x", record.Name, stream, record.Request, record.RequestHeaders, sha256.Sum256(record.UpstreamResponse))
+							})
+						}
 					}
-					if len(got) != 1 || got[0].UpstreamModel != wantUpstream {
-						t.Fatalf("upstream calls=%+v", got)
-					}
-					record := got[0]
-					record.Name, record.ClientModel, record.Stream, record.Status, record.Headers, record.Body = provider+"/"+variant, model, stream, status, headers, raw
-					captures = append(captures, record)
-					if status != 200 {
-						t.Errorf("native %s stream=%v status=%d error=%s", record.Name, stream, status, raw)
-					}
-					if variant == "mapped" {
-						mapped = append(mapped, record)
-					} else if variant == "direct" {
-						index := 0
-						if stream {
-							index = 1
-						}
-						if len(mapped) != 2 || !bytes.Equal(mapped[index].Request, record.Request) || !reflect.DeepEqual(mapped[index].RequestHeaders, record.RequestHeaders) || mapped[index].Path != record.Path || !bytes.Equal(mapped[index].UpstreamResponse, record.UpstreamResponse) {
-							t.Errorf("mapped/direct upstream bytes or headers differ: mapped=%+v direct=%+v", mapped, record)
-						}
-					} else {
-						index := 0
-						if stream {
-							index = 1
-						}
-						if len(mapped) != 2 {
-							t.Fatalf("mapped captures=%d want=2", len(mapped))
-						}
-						want := bytes.Replace(record.Request, []byte(`"model":"grok-4.6"`), []byte(`"model":"grok-4.7"`), 1)
-						if !bytes.Equal(want, mapped[index].Request) {
-							t.Errorf("disabled non-model request bytes changed: mapped=%s disabled=%s", mapped[index].Request, record.Request)
-						}
-					}
-					t.Logf("native binary %s stream=%v upstreamRequest=%s requestHeaders=%v upstreamSHA256=%x", record.Name, stream, record.Request, record.RequestHeaders, sha256.Sum256(record.UpstreamResponse))
 				}
 			})
 		}
@@ -1224,6 +1305,7 @@ func functionalNativeBinaryCaptures(t *testing.T, repoRoot, cpaBin string) strin
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Logf("binary captures JSON=%s", encoded)
 	path := filepath.Join(t.TempDir(), "native-binary-captures.json")
 	if err := os.WriteFile(path, encoded, 0600); err != nil {
 		t.Fatal(err)
