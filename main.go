@@ -48,7 +48,10 @@ type delimiterlessResponsesEventScanner struct {
 	disabled            bool
 	headerPrefixChecked bool
 	headerComplete      bool
+	headerStart         int
 	headerScan          int
+	nativeHeader        bool
+	metadataEnd         int
 	eventType           string
 	dataStart           int
 	dataPrefixChecked   bool
@@ -201,9 +204,25 @@ func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
 		r.started = true
 	}
 	var out [][]byte
+	if r.logicalEventFormat == "openai-response" && isResponsesMetadataField(p) && bytes.IndexAny(p, "\r\n") < 0 {
+		s := &r.delimiterless
+		fieldBoundary := len(r.buf) == 0 || s.metadataEnd == len(r.buf) || s.headerPrefixChecked &&
+			(!s.headerComplete && s.headerScan == len(r.buf) || s.headerComplete && (s.dataStart == len(r.buf) || s.completeEnd == len(r.buf)))
+		if !s.disabled && fieldBoundary {
+			if s.headerPrefixChecked && !s.headerComplete && s.headerScan == len(r.buf) {
+				// 独立 metadata 确认前一 header 的字段末尾，JSON 仍由原 scanner 验证。
+				r.buf = append(r.buf, '\n')
+				s.nativeHeader = true
+			}
+			r.buf = append(r.buf, p...)
+			r.buf = append(r.buf, '\n')
+			s.metadataEnd = len(r.buf)
+			p = nil
+		}
+	}
 	if r.logicalEventFormat == "openai-response" && bytes.HasPrefix(p, []byte("data:")) {
 		s := &r.delimiterless
-		if !s.disabled && s.completeEnd > 0 && s.completeEnd == len(r.buf) && s.dataStart == 0 {
+		if !s.disabled && s.completeEnd > 0 && (s.completeEnd == len(r.buf) || s.metadataEnd == len(r.buf)) && s.dataStart == s.headerStart {
 			// 下一独立 data 单位到达时，派发此前已验证的完整值。
 			var err error
 			out, err = r.drain(true)
@@ -211,7 +230,7 @@ func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
 				return out, err
 			}
 		} else if !s.disabled && s.headerPrefixChecked && !s.headerComplete && s.headerScan == len(r.buf) {
-			eventType := strings.TrimSpace(string(r.buf[len("event:"):s.headerScan]))
+			eventType := strings.TrimSpace(string(r.buf[s.headerStart+len("event:") : s.headerScan]))
 			if strings.HasPrefix(eventType, "response.") {
 				// dataStart == headerScan 记录 callback 间缺少的 LF；验证后才补写。
 				s.eventType, s.dataStart, s.headerComplete = eventType, s.headerScan, true
@@ -232,7 +251,7 @@ func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
 	if err != nil {
 		return out, err
 	}
-	if len(r.buf)-max(r.delimiterless.completeEnd, r.rawJSONPrefix) > maxPendingStreamBytes {
+	if len(r.buf)-max(r.delimiterless.completeEnd, r.delimiterless.metadataEnd, r.rawJSONPrefix) > maxPendingStreamBytes {
 		// 末尾 CR 可能属于 CRLF，完整 event 等待下一字节或 EOF。
 		if _, delimiterLen, _ := findSSEEventDelimiter(r.buf, r.scanFrom, true); delimiterLen > 0 {
 			return out, nil
@@ -553,6 +572,10 @@ func findSSEEventDelimiter(buf []byte, start int, eof bool) (eventLen, delimLen,
 	}
 }
 
+func isResponsesMetadataField(p []byte) bool {
+	return bytes.HasPrefix(p, []byte("id:")) || bytes.HasPrefix(p, []byte("retry:")) || bytes.HasPrefix(p, []byte(":"))
+}
+
 func (r *sseRewriter) findDelimiterlessResponsesEventEnd(eof bool) (int, bool) {
 	buf := r.buf
 	s := &r.delimiterless
@@ -560,23 +583,36 @@ func (r *sseRewriter) findDelimiterlessResponsesEventEnd(eof bool) (int, bool) {
 		return 0, false
 	}
 	if !s.headerPrefixChecked {
+		if r.logicalEventFormat == "openai-response" {
+			for isResponsesMetadataField(buf[s.headerScan:]) {
+				end, n, _ := sseLineEnding(buf, s.headerScan, eof)
+				if n == 0 {
+					return 0, false
+				}
+				s.headerScan = end + n
+			}
+		}
+		s.headerStart = s.headerScan
 		field := "event:"
-		if r.logicalEventFormat == "openai-response" && len(buf) > 0 && buf[0] == 'd' {
+		if r.logicalEventFormat == "openai-response" && len(buf) > s.headerStart && buf[s.headerStart] == 'd' {
 			field = "data:"
 		}
-		if len(buf) < len(field) {
-			if !bytes.Equal(buf, []byte(field[:len(buf)])) {
+		if len(buf)-s.headerStart < len(field) {
+			if !bytes.Equal(buf[s.headerStart:], []byte(field[:len(buf)-s.headerStart])) {
 				s.disabled = true
 			}
 			return 0, false
 		}
-		if !bytes.HasPrefix(buf, []byte(field)) {
+		if !bytes.HasPrefix(buf[s.headerStart:], []byte(field)) {
 			s.disabled = true
 			return 0, false
 		}
 		s.headerPrefixChecked = true
-		s.headerScan = len(field)
+		s.headerScan += len(field)
 		s.headerComplete = field == "data:"
+		if s.headerComplete {
+			s.dataStart = s.headerStart
+		}
 	}
 	if !s.headerComplete {
 		for s.headerScan < len(buf) {
@@ -595,7 +631,7 @@ func (r *sseRewriter) findDelimiterlessResponsesEventEnd(eof bool) (int, bool) {
 				s.headerScan++
 				continue
 			}
-			s.eventType = strings.TrimSpace(string(buf[len("event:"):s.headerScan]))
+			s.eventType = strings.TrimSpace(string(buf[s.headerStart+len("event:") : s.headerScan]))
 			switch r.logicalEventFormat {
 			case "openai-response":
 				if !strings.HasPrefix(s.eventType, "response.") {
@@ -618,6 +654,15 @@ func (r *sseRewriter) findDelimiterlessResponsesEventEnd(eof bool) (int, bool) {
 		}
 	}
 	if !s.dataPrefixChecked {
+		if r.logicalEventFormat == "openai-response" {
+			for isResponsesMetadataField(buf[s.dataStart:]) {
+				end, n, _ := sseLineEnding(buf, s.dataStart, eof)
+				if n == 0 {
+					return 0, false
+				}
+				s.dataStart = end + n
+			}
+		}
 		const dataField = "data:"
 		if len(buf) < s.dataStart+len(dataField) {
 			return 0, false
@@ -712,7 +757,11 @@ func (r *sseRewriter) findDelimiterlessResponsesEventEnd(eof bool) (int, bool) {
 	}
 	suffix := buf[s.completeEnd:]
 	if len(suffix) == 0 {
-		return s.completeEnd, eof || s.dataStart > 0 && s.dataStart == s.headerScan
+		return s.completeEnd, eof || s.nativeHeader || s.dataStart > 0 && s.dataStart == s.headerScan
+	}
+	if s.metadataEnd == len(buf) && s.metadataEnd > s.completeEnd {
+		// data-only 后的 metadata 留给下一事件，不提前派发前值。
+		return s.completeEnd, eof
 	}
 	if bytes.HasPrefix(suffix, []byte("event:")) {
 		return s.completeEnd, true

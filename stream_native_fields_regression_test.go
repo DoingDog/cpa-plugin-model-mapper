@@ -932,3 +932,415 @@ func TestFunctionalNativeSSEFieldInputOwnership(t *testing.T) {
 		})
 	}
 }
+
+func TestFunctionalNativeSSEFieldOrdinaryMetadataOutputUnits(t *testing.T) {
+	for _, metadata := range [][]string{nil, {"id: event-1"}, {"retry: 100"}, {": heartbeat"}, {"id: event-1", "retry: 100", `: opaque event: response.created data: {"model":"grok-4.7"} 中文`}} {
+		for _, dataOnly := range []bool{false, true} {
+			for _, count := range []int{1, 9} {
+				for _, finish := range []bool{false, true} {
+					t.Run(fmt.Sprintf("metadata=%q/dataOnly=%v/count=%d/finish=%v", metadata, dataOnly, count, finish), func(t *testing.T) {
+						parts, want, types := gNativeFields(dataOnly, count)
+						var prefix []byte
+						var inputs [][]byte
+						for _, field := range metadata {
+							inputs = append(inputs, []byte(field))
+							prefix = append(prefix, []byte(field+"\n")...)
+						}
+						inputs = append(inputs, parts...)
+						want = append(prefix, want...)
+						r := newStreamChunkRewriter("grok-4.6")
+						r.format, r.frameRawJSONAsSSE = "openai-response", true
+						var chunks [][]byte
+						for _, field := range inputs {
+							out, err := r.Write(field)
+							if err != nil {
+								t.Fatal(err)
+							}
+							chunks = append(chunks, out...)
+							for i := range field {
+								field[i] = 'z'
+							}
+						}
+						var out [][]byte
+						var err error
+						if finish {
+							out, err = r.Finish()
+						} else {
+							out, err = r.Flush()
+						}
+						if err != nil {
+							t.Fatal(err)
+						}
+						chunks = append(chunks, out...)
+						got := bytes.Join(chunks, nil)
+						comparable := got
+						if dataOnly && count == 1 {
+							comparable, want = bytes.TrimSuffix(got, []byte("\n\n")), bytes.TrimSuffix(want, []byte("\n\n"))
+						}
+						if !bytes.Equal(comparable, want) {
+							t.Fatalf("metadata output=%q want=%q", got, want)
+						}
+						gRequireNativeFrames(t, got, types, dataOnly)
+						frozen := bytes.Clone(got)
+						if _, err := r.Write([]byte("data: {}\n\n")); err != nil {
+							t.Fatal(err)
+						}
+						if !bytes.Equal(bytes.Join(chunks, nil), frozen) {
+							t.Fatal("previous metadata output changed after future Write")
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestFunctionalNativeSSEFieldOrdinaryMetadataPositions(t *testing.T) {
+	for _, metadata := range [][]string{{"id: event-1"}, {"retry: 100"}, {": heartbeat"}, {"id: event-1", "retry: 100", `: opaque event: response.created data: {"model":"grok-4.7"} 中文`}} {
+		for _, dataOnly := range []bool{false, true} {
+			for _, count := range []int{1, 9} {
+				for _, position := range []string{"before-event", "in-event", "between-events"} {
+					t.Run(fmt.Sprintf("metadata=%q/dataOnly=%v/count=%d/%s", metadata, dataOnly, count, position), func(t *testing.T) {
+						parts, wire, types := gNativeFields(dataOnly, count)
+						units := bytes.SplitAfter(wire, []byte("\n\n"))[:count]
+						var input [][]byte
+						var want []byte
+						stride := 2
+						if dataOnly {
+							stride = 1
+						}
+						for i, unit := range units {
+							prefix := []byte(strings.Join(metadata, "\n") + "\n")
+							if position == "between-events" && i == 0 {
+								prefix = nil
+							}
+							fields := parts[i*stride : (i+1)*stride]
+							if position == "in-event" && !dataOnly {
+								input = append(input, fields[0])
+								for _, field := range metadata {
+									input = append(input, []byte(field))
+								}
+								input = append(input, fields[1])
+								line, rest, ok := bytes.Cut(unit, []byte("\n"))
+								if !ok {
+									t.Fatal("fixture has no event line")
+								}
+								want = append(want, line...)
+								want = append(want, '\n')
+								want = append(want, prefix...)
+								want = append(want, rest...)
+							} else {
+								if len(prefix) > 0 {
+									for _, field := range metadata {
+										input = append(input, []byte(field))
+									}
+								}
+								input = append(input, fields...)
+								want = append(want, prefix...)
+								want = append(want, unit...)
+							}
+						}
+						got := gNativeParts(t, "openai-response", true, input...)
+						comparable := got
+						if dataOnly && count == 1 {
+							comparable, want = bytes.TrimSuffix(got, []byte("\n\n")), bytes.TrimSuffix(want, []byte("\n\n"))
+						}
+						if !bytes.Equal(comparable, want) {
+							t.Fatalf("position output=%q want=%q", got, want)
+						}
+						gRequireNativeFrames(t, got, types, dataOnly)
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestFunctionalNativeSSEFieldOrdinaryMetadataWire(t *testing.T) {
+	for _, eol := range []string{"\n", "\r\n"} {
+		wire := []byte("id: event-1" + eol + "retry: 100" + eol + `: opaque event: response.created data: {"model":"grok-4.7"} 中文` + eol + "event: response.completed" + eol + "data: " + gNativeCompleted + eol + eol)
+		want := bytes.Replace(wire, []byte("data: "+gNativeCompleted), []byte("data: "+gNativeCompletedWant), 1)
+		for split := 0; split <= len(wire); split++ {
+			if got := gNativeParts(t, "claude", true, wire[:split], wire[split:]); !bytes.Equal(got, want) {
+				t.Fatalf("eol=%q split=%d got=%q want=%q", eol, split, got, want)
+			}
+		}
+		parts := make([][]byte, len(wire))
+		for i := range wire {
+			parts[i] = wire[i : i+1]
+		}
+		if got := gNativeParts(t, "claude", true, parts...); !bytes.Equal(got, want) {
+			t.Fatalf("eol=%q bytewise output=%q want=%q", eol, got, want)
+		}
+	}
+}
+
+func TestFunctionalNativeSSEFieldOrdinaryMetadataForwarder(t *testing.T) {
+	for _, metadata := range []string{"id: event-1", "retry: 100", ": heartbeat"} {
+		for _, terminal := range []string{"natural", "done-payload", "in-band-error", "callback-error", "cleanup-errors", "emit-error"} {
+			t.Run(metadata+"/"+terminal, func(t *testing.T) {
+				reads := []pluginapi.HostModelStreamReadResponse{{Payload: []byte(metadata)}, {Payload: []byte("event: response.completed")}, {Payload: []byte("data: " + gNativeCompleted)}, {Done: true}}
+				if terminal == "done-payload" {
+					reads[2].Done = true
+				}
+				if terminal == "in-band-error" || terminal == "cleanup-errors" {
+					reads[2].Error, reads[2].Done = "controlled upstream read error", true
+				}
+				readErr, hostErr, pluginErr, emitErr := errors.New("controlled callback read error"), errors.New("controlled host close error"), errors.New("controlled plugin close error"), errors.New("controlled emit error")
+				var output []byte
+				var order []string
+				var closeText string
+				readCount, hostCloses, pluginCloses := 0, 0, 0
+				stream := &executorStream{pluginStreamID: "metadata-draft", hostStreamID: "metadata-host", originalModel: "grok-4.6", format: "openai-response", frameRawJSONAsSSE: true}
+				stream.call = func(method string, payload any) (json.RawMessage, error) {
+					switch method {
+					case pluginabi.MethodHostModelStreamRead:
+						readCount++
+						if terminal == "callback-error" && readCount == 4 {
+							return nil, readErr
+						}
+						if len(reads) == 0 {
+							return nil, errors.New("unexpected extra read")
+						}
+						next := reads[0]
+						reads = reads[1:]
+						return json.Marshal(next)
+					case pluginabi.MethodHostStreamEmit:
+						order = append(order, "emit")
+						raw, err := json.Marshal(payload)
+						if err != nil {
+							return nil, err
+						}
+						var emit struct{ Payload []byte }
+						if err := json.Unmarshal(raw, &emit); err != nil {
+							return nil, err
+						}
+						output = append(output, emit.Payload...)
+						if terminal == "emit-error" && hasSSEDataField(emit.Payload) {
+							return nil, emitErr
+						}
+					case pluginabi.MethodHostModelStreamClose:
+						hostCloses++
+						order = append(order, "host-close")
+						if terminal == "cleanup-errors" {
+							return nil, hostErr
+						}
+					case pluginabi.MethodHostStreamClose:
+						pluginCloses++
+						order = append(order, "plugin-close")
+						raw, err := json.Marshal(payload)
+						if err != nil {
+							return nil, err
+						}
+						var closed struct{ Error string }
+						if err := json.Unmarshal(raw, &closed); err != nil {
+							return nil, err
+						}
+						closeText = closed.Error
+						if terminal == "cleanup-errors" {
+							return nil, pluginErr
+						}
+					default:
+						return nil, fmt.Errorf("unexpected method %s", method)
+					}
+					return json.RawMessage(`{}`), nil
+				}
+				err := runStreamForward(stream)
+				want := []byte(metadata + "\nevent: response.completed\ndata: " + gNativeCompletedWant + "\n\n")
+				if !bytes.Equal(output, want) {
+					t.Errorf("metadata forwarder=%q want=%q", output, want)
+				}
+				if hostCloses != 1 || len(order) == 0 {
+					t.Fatalf("order=%v host closes=%d", order, hostCloses)
+				}
+				wantCloses := "host-close,plugin-close"
+				if terminal == "callback-error" {
+					wantCloses = "host-close"
+				}
+				var closes []string
+				for _, action := range order {
+					if action != "emit" {
+						closes = append(closes, action)
+					}
+				}
+				if strings.Join(closes, ",") != wantCloses || order[0] != "emit" {
+					t.Errorf("order=%v want emit before %s", order, wantCloses)
+				}
+				switch terminal {
+				case "callback-error":
+					if !errors.Is(err, readErr) || pluginCloses != 0 || readCount != 4 {
+						t.Errorf("error=%v plugin closes=%d reads=%d", err, pluginCloses, readCount)
+					}
+				case "cleanup-errors":
+					if !errors.Is(err, hostErr) || !errors.Is(err, pluginErr) || !strings.Contains(closeText, "controlled upstream read error") || !strings.Contains(closeText, hostErr.Error()) || pluginCloses != 1 || readCount != 3 {
+						t.Errorf("error=%v close=%q plugin closes=%d reads=%d", err, closeText, pluginCloses, readCount)
+					}
+				default:
+					wantError, wantReads := "", 3
+					if terminal == "natural" {
+						wantReads = 4
+					} else if terminal == "in-band-error" {
+						wantError = "controlled upstream read error"
+					} else if terminal == "emit-error" {
+						wantError = "emit stream chunk: " + emitErr.Error()
+					}
+					if err != nil || closeText != wantError || pluginCloses != 1 || readCount != wantReads {
+						t.Errorf("error=%v close=%q plugin closes=%d reads=%d", err, closeText, pluginCloses, readCount)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestFunctionalNativeSSEFieldOrdinaryMetadataDispatch(t *testing.T) {
+	for _, metadata := range [][]string{{"id: event-1"}, {"retry: 100"}, {": heartbeat"}, {"id: event-1", "retry: 100", `: opaque event: response.created data: {"model":"grok-4.7"} 中文`}} {
+		for _, dataOnly := range []bool{false, true} {
+			for _, eol := range []string{"\n", "\r\n"} {
+				t.Run(fmt.Sprintf("metadata=%q/dataOnly=%v/eol=%q", metadata, dataOnly, eol), func(t *testing.T) {
+					r := newStreamChunkRewriter("grok-4.6")
+					r.format, r.frameRawJSONAsSSE = "openai-response", true
+					parts, want, types := gNativeFields(dataOnly, 2)
+					want = append([]byte(strings.Join(metadata, "\n")+"\n"), want...)
+					var got []byte
+					for _, field := range metadata {
+						out, err := r.Write([]byte(field))
+						got = append(got, bytes.Join(out, nil)...)
+						if err != nil || bytes.Contains(got, []byte("\ndata:")) {
+							t.Fatalf("metadata dispatched data=%q error=%v", got, err)
+						}
+					}
+					for i, part := range parts {
+						out, err := r.Write(part)
+						got = append(got, bytes.Join(out, nil)...)
+						frames := (i + 1) / 2
+						if dataOnly {
+							frames = i
+						}
+						if err != nil || bytes.Count(got, []byte("\ndata: ")) != frames {
+							t.Fatalf("callback=%d dataFrames=%d want=%d output=%q error=%v", i+1, bytes.Count(got, []byte("\ndata: ")), frames, got, err)
+						}
+					}
+					out, err := r.Write([]byte(eol + eol))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if dataOnly {
+						got = append(got, bytes.Join(out, nil)...)
+					} else if len(bytes.TrimSpace(bytes.Join(out, nil))) != 0 {
+						t.Fatalf("late delimiter added event=%q", out)
+					}
+					out, err = r.Finish()
+					if dataOnly {
+						got = append(got, bytes.Join(out, nil)...)
+					} else if len(bytes.TrimSpace(bytes.Join(out, nil))) != 0 {
+						t.Fatalf("Finish added event=%q", out)
+					}
+					if err != nil || !bytes.Equal(bytes.ReplaceAll(got, []byte("\r\n"), []byte("\n")), want) {
+						t.Fatalf("late delimiter output=%q error=%v want=%q", got, err, want)
+					}
+					gRequireNativeFrames(t, bytes.ReplaceAll(got, []byte("\r\n"), []byte("\n")), types, dataOnly)
+				})
+			}
+		}
+	}
+}
+
+func gNativeOrdinaryMetadataLargeFixture(size int, dataOnly bool) ([][]byte, []byte) {
+	parts, want := gNativeLargeFixture(size, dataOnly)
+	metadata := [][]byte{[]byte("id: event-1"), []byte("retry: 100"), []byte(`: opaque event: response.created data: {"model":"grok-4.7"} 中文`)}
+	prefix := append(bytes.Join(metadata, []byte("\n")), '\n')
+	return append(metadata, parts...), append(prefix, want...)
+}
+
+func TestFunctionalNativeSSEFieldOrdinaryMetadataContinuation(t *testing.T) {
+	for _, dataOnly := range []bool{false, true} {
+		for _, size := range []int{2 << 20, 8 << 20} {
+			t.Run(fmt.Sprintf("dataOnly=%v/bytes=%d", dataOnly, size), func(t *testing.T) {
+				parts, want := gNativeOrdinaryMetadataLargeFixture(size, dataOnly)
+				chunks, err := gNativeContinue(parts)
+				if err != nil || !bytes.Equal(bytes.TrimSuffix(bytes.Join(chunks, nil), []byte("\n\n")), bytes.TrimSuffix(want, []byte("\n\n"))) {
+					t.Fatalf("continuation error=%v", err)
+				}
+				if size == 2<<20 {
+					allocs := testing.AllocsPerRun(1, func() {
+						out, err := gNativeContinue(parts)
+						if err != nil || !bytes.Equal(bytes.TrimSuffix(bytes.Join(out, nil), []byte("\n\n")), bytes.TrimSuffix(want, []byte("\n\n"))) {
+							panic(fmt.Sprintf("allocation preflight error=%v", err))
+						}
+					})
+					if allocs > 200 {
+						t.Fatalf("allocations=%v want<=200", allocs)
+					}
+				}
+				for _, part := range parts {
+					for i := range part {
+						part[i] = 'z'
+					}
+				}
+				if !bytes.Equal(bytes.TrimSuffix(bytes.Join(chunks, nil), []byte("\n\n")), bytes.TrimSuffix(want, []byte("\n\n"))) {
+					t.Fatal("metadata continuation aliases input")
+				}
+			})
+		}
+	}
+}
+
+func TestFunctionalNativeSSEFieldOrdinaryMetadataPendingLimit(t *testing.T) {
+	for _, dataOnly := range []bool{false, true} {
+		t.Run(fmt.Sprintf("dataOnly=%v", dataOnly), func(t *testing.T) {
+			r := newStreamChunkRewriter("grok-4.6")
+			r.format, r.frameRawJSONAsSSE = "openai-response", true
+			metadata := []byte("id: event-1")
+			if _, err := r.Write(metadata); err != nil {
+				t.Fatal(err)
+			}
+			var header []byte
+			if !dataOnly {
+				header = []byte("event: response.output_text.done")
+				if _, err := r.Write(header); err != nil {
+					t.Fatal(err)
+				}
+			}
+			data := []byte(`data: {"type":"response.output_text.done","text":"` + strings.Repeat("x", maxPendingStreamBytes) + `"}`)
+			cut := maxPendingStreamBytes - len(header)
+			if chunks, err := r.Write(data[:cut]); err != nil || len(chunks) != 0 {
+				t.Fatalf("metadata must not count against incomplete data: chunks=%d error=%v", len(chunks), err)
+			}
+			chunks, err := r.Write(data[cut:])
+			flushed, flushErr := r.Finish()
+			want := append(bytes.Clone(metadata), '\n')
+			if !dataOnly {
+				want = append(want, header...)
+				want = append(want, '\n')
+			}
+			want = append(want, data...)
+			if err != nil || flushErr != nil || !bytes.Equal(bytes.TrimSuffix(bytes.Join(append(chunks, flushed...), nil), []byte("\n\n")), want) {
+				t.Fatalf("complete continuation error=%v flush=%v", err, flushErr)
+			}
+		})
+	}
+}
+
+func BenchmarkStreamChunkRewriterOrdinaryMetadataContinuation(b *testing.B) {
+	for _, dataOnly := range []bool{false, true} {
+		for _, size := range []int{2 << 20, 8 << 20} {
+			b.Run(fmt.Sprintf("dataOnly=%v/bytes=%d/fragment=8192", dataOnly, size), func(b *testing.B) {
+				parts, want := gNativeOrdinaryMetadataLargeFixture(size, dataOnly)
+				chunks, err := gNativeContinue(parts)
+				if err != nil || !bytes.Equal(bytes.TrimSuffix(bytes.Join(chunks, nil), []byte("\n\n")), bytes.TrimSuffix(want, []byte("\n\n"))) {
+					b.Fatalf("byte-exact metadata preflight error=%v", err)
+				}
+				b.ReportAllocs()
+				b.SetBytes(int64(len(want)))
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					chunks, err = gNativeContinue(parts)
+					if err != nil || len(chunks) == 0 {
+						b.Fatalf("continuation=(%d,%v)", len(chunks), err)
+					}
+				}
+			})
+		}
+	}
+}
