@@ -62,10 +62,10 @@ func gCPAPayloads(model string, count int) []string {
 }
 
 type gCPAFieldsFixture struct {
-	name, eol, contentType string
-	step                   int
-	dataOnly               bool
-	count                  int
+	name, eol, contentType, metadata string
+	step                             int
+	dataOnly                         bool
+	count                            int
 }
 
 func gCPAFieldsFixtures() []gCPAFieldsFixture {
@@ -80,9 +80,16 @@ func gCPAFieldsFixtures() []gCPAFieldsFixture {
 				{name: "LF-charset", eol: "\n", contentType: "text/event-stream; charset=utf-8", step: 11},
 				{name: "CRLF-charset", eol: "\r\n", contentType: "text/event-stream; charset=utf-8", step: 7},
 			} {
-				transport.dataOnly, transport.count = dataOnly, count
-				transport.name = fmt.Sprintf("dataOnly=%v/count=%d/%s", dataOnly, count, transport.name)
-				out = append(out, transport)
+				for _, metadata := range []string{"", "id: event-1", "retry: 100", ": heartbeat"} {
+					f := transport
+					f.dataOnly, f.count, f.metadata = dataOnly, count, metadata
+					label := metadata
+					if label == "" {
+						label = "none"
+					}
+					f.name = fmt.Sprintf("dataOnly=%v/count=%d/%s/metadata=%s", dataOnly, count, f.name, label)
+					out = append(out, f)
+				}
 			}
 		}
 	}
@@ -96,6 +103,10 @@ func gCPAFields(f gCPAFieldsFixture, model string) ([]string, []byte) {
 		var event struct{ Type string }
 		if err := json.Unmarshal([]byte(payload), &event); err != nil {
 			panic(err)
+		}
+		if f.metadata != "" {
+			fields = append(fields, f.metadata)
+			fmt.Fprintf(&wire, "%s%s", f.metadata, f.eol)
 		}
 		if !f.dataOnly {
 			fields = append(fields, "event: "+event.Type)
@@ -261,6 +272,12 @@ func gCPARequireResponse(t *testing.T, raw []byte, model string) {
 
 func gCPARequireEvents(t *testing.T, raw []byte, f gCPAFieldsFixture, model string) {
 	t.Helper()
+	if f.metadata != "" {
+		normalized := bytes.ReplaceAll(raw, []byte("\r\n"), []byte("\n"))
+		if got := bytes.Count(append([]byte("\n"), normalized...), []byte("\n"+f.metadata+"\n")); got != f.count {
+			t.Fatalf("metadata count=%d want=%d bytes=%q", got, f.count, raw)
+		}
+	}
 	// 现有 sse.Decode 只识别 LF；仅为该 parser 统一已知 CRLF 行结束，原始 bytes 继续保留。
 	events, err := sse.Decode(bytes.NewReader(bytes.ReplaceAll(raw, []byte("\r\n"), []byte("\n"))))
 	if err != nil {
@@ -393,8 +410,8 @@ func TestModelMapperFunctionalNativeSSEFields(t *testing.T) {
 						parts = append(parts, string(chunk.Payload))
 					}
 					t.Logf("native field input shape=%s output chunks=%q", f.name, parts)
-					if f.dataOnly && f.count == 1 {
-						// 单 terminal output unit 的最终 blank delimiter 由真实 HTTP framer 核验。
+					if f.dataOnly && f.count == 1 && f.metadata == "" {
+						// 无 metadata 的单 terminal output unit 保留无最终 blank delimiter 控制。
 						var event struct {
 							Type     string
 							Response json.RawMessage
@@ -1788,19 +1805,19 @@ func TestModelMapperFunctionalBinaryCaptures(t *testing.T) {
 		t.Fatal(err)
 	}
 	var captures []struct {
-		Name, Fixture, ClientModel, UpstreamModel string
-		Stream, DataOnly                          bool
-		Status, Count, Calls                      int
-		Headers                                   http.Header
-		Body, Request, UpstreamResponse           []byte
-		RequestHeaders                            http.Header
-		Path                                      string
+		Name, Fixture, ClientModel, UpstreamModel, Metadata string
+		Stream, DataOnly                                    bool
+		Status, Count, Calls                                int
+		Headers                                             http.Header
+		Body, Request, UpstreamResponse                     []byte
+		RequestHeaders                                      http.Header
+		Path                                                string
 	}
 	if err := json.Unmarshal(raw, &captures); err != nil {
 		t.Fatal(err)
 	}
-	if len(captures) != 384 {
-		t.Fatalf("binary captures=%d want=384", len(captures))
+	if len(captures) != 1536 {
+		t.Fatalf("binary captures=%d want=1536", len(captures))
 	}
 	type expectation struct {
 		fixture         gCPAFieldsFixture
@@ -1831,7 +1848,7 @@ func TestModelMapperFunctionalBinaryCaptures(t *testing.T) {
 		delete(want, key)
 		t.Run(key, func(t *testing.T) {
 			f := expected.fixture
-			if capture.Fixture != f.name || capture.DataOnly != f.dataOnly || capture.Count != f.count || capture.ClientModel != expected.model || capture.UpstreamModel != expected.upstream {
+			if capture.Metadata != f.metadata || capture.Fixture != f.name || capture.DataOnly != f.dataOnly || capture.Count != f.count || capture.ClientModel != expected.model || capture.UpstreamModel != expected.upstream {
 				t.Fatalf("binary capture identity=%+v want=%+v", capture, expected)
 			}
 			if capture.Status != 200 || capture.Calls != 1 {
@@ -2017,5 +2034,218 @@ func TestModelMapperFunctionalValidatorPrefixLimit(t *testing.T) {
 			}
 			t.Logf("F07 format=%s actual validator bytes=%d originalErrors=%q nativePrefix=%q nativeError=%q", format, len(input), original, raw, errs)
 		})
+	}
+}
+
+func TestModelMapperFunctionalOrdinaryMetadata(t *testing.T) {
+	for _, provider := range []string{"xai", "codex"} {
+		for _, f := range gCPAFieldsFixtures() {
+			t.Run(provider+"/"+f.name, func(t *testing.T) {
+				p := gCPANewLocalProducer(t, provider)
+				p.setFixture(f)
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				defer cancel()
+				gCPARequireFields(t, gCPACoreFields(t, p, ctx), f, "grok-4.7")
+				gCPARequireFields(t, gCPAHostFields(t, p, ctx), f, "grok-4.7")
+				server := eResponsesServer(t, p.base)
+				t.Run("direct", func(t *testing.T) {
+					status, _, raw := eHTTP(t, server, "/v1/responses", gCPARequest("grok-4.7", true))
+					if status != 200 {
+						t.Fatalf("direct HTTP=%d body=%q", status, raw)
+					}
+					gCPARequireEvents(t, raw, f, "grok-4.7")
+					ws, err := eWS(t, server, "grok-4.7")
+					if err != nil || !reflect.DeepEqual(ws, gCPAPayloads("grok-4.7", f.count)) {
+						t.Fatalf("direct WS=%q error=%v", ws, err)
+					}
+				})
+				host := gCPALoadNative(t, p, true)
+				canonical := f
+				canonical.eol = "\n"
+				_, want := gCPAFields(canonical, "grok-4.6")
+				t.Run("mapped-native", func(t *testing.T) {
+					result, err := host.activeRecords()[0].plugin.Capabilities.Executor.ExecuteStream(ctx, eNativeRequest("grok-4.6", "openai-response", true))
+					if err != nil {
+						t.Fatal(err)
+					}
+					raw, errs := eNativeDrain(t, result.Chunks)
+					t.Logf("native=%q errors=%q", raw, errs)
+					comparable, expected := raw, want
+					if f.dataOnly && f.count == 1 {
+						comparable, expected = bytes.TrimSuffix(raw, []byte("\n\n")), bytes.TrimSuffix(want, []byte("\n\n"))
+					}
+					if len(errs) != 0 || !bytes.Equal(comparable, expected) {
+						t.Errorf("mapped native bytes=%q errors=%q want=%q", raw, errs, expected)
+					}
+					gCPARequireEvents(t, raw, f, "grok-4.6")
+				})
+				p.base.SetPluginHost(host)
+				p.base.SetModelRouterHost(host)
+				t.Run("mapped-http", func(t *testing.T) {
+					status, _, raw := eHTTP(t, server, "/v1/responses", gCPARequest("grok-4.6", true))
+					t.Logf("mapped HTTP=%d body=%q", status, raw)
+					if status != 200 {
+						t.Fatalf("mapped HTTP=%d want=200", status)
+					}
+					gCPARequireEvents(t, raw, f, "grok-4.6")
+					if !bytes.Equal(raw, append(bytes.Clone(want), '\n')) {
+						t.Fatalf("mapped HTTP bytes=%q want=%q", raw, append(bytes.Clone(want), '\n'))
+					}
+				})
+				t.Run("mapped-ws", func(t *testing.T) {
+					ws, err := eWS(t, server, "grok-4.6")
+					t.Logf("mapped WS=%q error=%v", ws, err)
+					if err != nil || !reflect.DeepEqual(ws, gCPAPayloads("grok-4.6", f.count)) {
+						t.Fatalf("mapped WS=%q error=%v", ws, err)
+					}
+				})
+			})
+		}
+	}
+}
+
+func TestModelMapperFunctionalOrdinaryMetadataDisabledWS(t *testing.T) {
+	for _, provider := range []string{"xai", "codex"} {
+		p := gCPANewLocalProducer(t, provider)
+		host := gCPALoadNative(t, p, false)
+		p.base.SetPluginHost(host)
+		p.base.SetModelRouterHost(host)
+		server := eResponsesServer(t, p.base)
+		for _, f := range gCPAFieldsFixtures() {
+			for _, model := range []string{"grok-4.6", "grok-4.7"} {
+				t.Run(provider+"/"+f.name+"/"+model, func(t *testing.T) {
+					p.setFixture(f)
+					ws, err := eWS(t, server, model)
+					if err != nil || !reflect.DeepEqual(ws, gCPAPayloads(model, f.count)) {
+						t.Fatalf("disabled WS=%q error=%v", ws, err)
+					}
+					p.mu.Lock()
+					calls := append([]gCPAUpstreamRecord(nil), p.records...)
+					p.mu.Unlock()
+					if len(calls) != 1 || calls[0].model != model {
+						t.Fatalf("disabled calls=%+v", calls)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestModelMapperFunctionalOrdinaryMetadataConsumerControls(t *testing.T) {
+	for _, provider := range []string{"xai", "codex"} {
+		for _, dataOnly := range []bool{false, true} {
+			for _, count := range []int{1, 9} {
+				for _, metadata := range [][]string{{"id: event-1"}, {"retry: 100"}, {": heartbeat"}, {"id: event-1", "retry: 100", `: opaque event: response.created data: {"model":"grok-4.7"} 中文`}} {
+					for _, position := range []string{"before-event", "in-event", "between-events"} {
+						t.Run(fmt.Sprintf("%s/dataOnly=%v/count=%d/metadata=%q/%s", provider, dataOnly, count, metadata, position), func(t *testing.T) {
+							p := gCPANewLocalProducer(t, provider)
+							f := gCPAFieldsFixture{count: count, dataOnly: dataOnly, contentType: "text/event-stream", eol: "\n"}
+							p.fixture = f
+							var fields []string
+							var wire, expectedWire strings.Builder
+							original, _ := gCPAFields(gCPAFieldsFixture{count: count, dataOnly: false, eol: "\n"}, "grok-4.7")
+							expectedPayloads := gCPAPayloads("grok-4.6", count)
+							for i, payload := range gCPAPayloads("grok-4.7", count) {
+								name := original[i*2]
+								add := func(value string) {
+									fields = append(fields, value)
+									wire.WriteString(value + "\n")
+									expectedWire.WriteString(value + "\n")
+								}
+								if position == "before-event" || position == "between-events" && i > 0 {
+									for _, field := range metadata {
+										add(field)
+									}
+								}
+								if !dataOnly {
+									add(name)
+								}
+								if position == "in-event" {
+									for _, field := range metadata {
+										add(field)
+									}
+								}
+								fields = append(fields, "data: "+payload)
+								wire.WriteString("data: " + payload + "\n\n")
+								expectedWire.WriteString("data: " + expectedPayloads[i] + "\n\n")
+							}
+							p.wire = []byte(wire.String())
+							want := []byte(expectedWire.String())
+							requireMetadata := func(t *testing.T, raw []byte) {
+								t.Helper()
+								for _, field := range metadata {
+									expected := count
+									if position == "between-events" {
+										expected = count - 1
+									}
+									if got := bytes.Count(append([]byte("\n"), raw...), []byte("\n"+field+"\n")); got != expected {
+										t.Fatalf("metadata %q count=%d want=%d bytes=%q", field, got, expected, raw)
+									}
+								}
+							}
+							ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+							defer cancel()
+							if got := gCPACoreFields(t, p, ctx); !reflect.DeepEqual(got, fields) {
+								t.Fatalf("core=%q want=%q", got, fields)
+							}
+							if got := gCPAHostFields(t, p, ctx); !reflect.DeepEqual(got, fields) {
+								t.Fatalf("host=%q want=%q", got, fields)
+							}
+							server := eResponsesServer(t, p.base)
+							status, _, raw := eHTTP(t, server, "/v1/responses", gCPARequest("grok-4.7", true))
+							if status != 200 {
+								t.Fatalf("direct HTTP=%d body=%q", status, raw)
+							}
+							gCPARequireEvents(t, raw, f, "grok-4.7")
+							requireMetadata(t, raw)
+							ws, err := eWS(t, server, "grok-4.7")
+							if err != nil || !reflect.DeepEqual(ws, gCPAPayloads("grok-4.7", count)) {
+								t.Fatalf("direct WS=%q error=%v", ws, err)
+							}
+							t.Logf("original consumer position=%s HTTP=%q WS=%q", position, raw, ws)
+							host := gCPALoadNative(t, p, true)
+							t.Run("mapped-native", func(t *testing.T) {
+								result, err := host.activeRecords()[0].plugin.Capabilities.Executor.ExecuteStream(ctx, eNativeRequest("grok-4.6", "openai-response", true))
+								if err != nil {
+									t.Fatal(err)
+								}
+								native, errs := eNativeDrain(t, result.Chunks)
+								if len(errs) != 0 {
+									t.Fatalf("native errors=%q", errs)
+								}
+								eRequireData(t, native, expectedPayloads)
+								requireMetadata(t, native)
+								comparable, expected := native, want
+								if dataOnly && count == 1 {
+									comparable, expected = bytes.TrimSuffix(native, []byte("\n\n")), bytes.TrimSuffix(want, []byte("\n\n"))
+								}
+								if !bytes.Equal(comparable, expected) {
+									t.Fatalf("mapped position native bytes=%q want=%q", native, expected)
+								}
+							})
+							p.base.SetPluginHost(host)
+							p.base.SetModelRouterHost(host)
+							t.Run("mapped-http", func(t *testing.T) {
+								status, _, mapped := eHTTP(t, server, "/v1/responses", gCPARequest("grok-4.6", true))
+								if status != 200 {
+									t.Fatalf("mapped position HTTP=%d body=%q", status, mapped)
+								}
+								gCPARequireEvents(t, mapped, f, "grok-4.6")
+								requireMetadata(t, mapped)
+								if !bytes.Equal(mapped, append(bytes.Clone(want), '\n')) {
+									t.Fatalf("mapped position HTTP bytes=%q want=%q", mapped, append(bytes.Clone(want), '\n'))
+								}
+							})
+							t.Run("mapped-ws", func(t *testing.T) {
+								wsMapped, err := eWS(t, server, "grok-4.6")
+								if err != nil || !reflect.DeepEqual(wsMapped, gCPAPayloads("grok-4.6", count)) {
+									t.Fatalf("mapped position WS=%q error=%v", wsMapped, err)
+								}
+							})
+						})
+					}
+				}
+			}
+		}
 	}
 }

@@ -961,9 +961,9 @@ func prepareFunctionalCPAOverlay(t *testing.T, repoRoot string) (string, string)
 func runFunctionalCPAOverlay(t *testing.T, repoRoot string, env []string) {
 	t.Helper()
 	checkout, overlay := prepareFunctionalCPAOverlay(t, repoRoot)
-	ctx, cancel := context.WithTimeout(context.Background(), 210*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 660*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "-C", checkout, "test", "-mod=readonly", "-overlay", overlay, "-count=1", "-v", "./internal/pluginhost", "-run", "^TestModelMapperFunctional|^TestStreamBridge(CloseUnblocksPendingEmit|ClosePreservesTerminalErrorWhenBufferIsFull)$", "-timeout", "180s")
+	cmd := exec.CommandContext(ctx, "go", "-C", checkout, "test", "-mod=readonly", "-overlay", overlay, "-count=1", "-v", "./internal/pluginhost", "-run", "^TestModelMapperFunctional|^TestStreamBridge(CloseUnblocksPendingEmit|ClosePreservesTerminalErrorWhenBufferIsFull)$", "-timeout", "600s")
 	cmd.Dir, cmd.Env = repoRoot, append(append(os.Environ(), "GOWORK=off"), env...)
 	output, err := cmd.CombinedOutput()
 	t.Logf("CPA overlay command=%v\n%s", cmd.Args, output)
@@ -1150,9 +1150,9 @@ func functionalNativeBinaryCaptures(t *testing.T, repoRoot, cpaBin string) strin
 	const output = `[{"id":"msg-issue8","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ordinary grok-4.7 opaque 中文 output","annotations":[]}]}]`
 	payloads := []string{`{"type":"response.created","response":{"model":"MODEL","status":"in_progress","output":[]}}`, `{"type":"response.in_progress","response":{"model":"MODEL","status":"in_progress","output":[]}}`, `{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}`, `{"type":"response.content_part.added","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}`, `{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"ordinary grok-4.7 opaque 中文 output"}`, `{"type":"response.output_text.done","output_index":0,"content_index":0,"text":"ordinary grok-4.7 opaque 中文 output"}`, `{"type":"response.content_part.done","output_index":0,"content_index":0,"part":{"type":"output_text","text":"ordinary grok-4.7 opaque 中文 output","annotations":[]}}`, `{"type":"response.output_item.done","output_index":0,"item":{"id":"msg-issue8","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ordinary grok-4.7 opaque 中文 output","annotations":[]}]}}`, `{"type":"response.completed","response":{"id":"resp-issue8","object":"response","status":"completed","model":"MODEL","output":` + output + `}}`}
 	type fixture struct {
-		name, eol, contentType string
-		step, count            int
-		dataOnly               bool
+		name, eol, contentType, metadata string
+		step, count                      int
+		dataOnly                         bool
 	}
 	var fixtures []fixture
 	for _, dataOnly := range []bool{false, true} {
@@ -1165,20 +1165,27 @@ func functionalNativeBinaryCaptures(t *testing.T, repoRoot, cpaBin string) strin
 				{name: "LF-charset", eol: "\n", contentType: "text/event-stream; charset=utf-8", step: 11},
 				{name: "CRLF-charset", eol: "\r\n", contentType: "text/event-stream; charset=utf-8", step: 7},
 			} {
-				f.dataOnly, f.count = dataOnly, count
-				f.name = fmt.Sprintf("dataOnly=%v/count=%d/%s", dataOnly, count, f.name)
-				fixtures = append(fixtures, f)
+				for _, metadata := range []string{"", "id: event-1", "retry: 100", ": heartbeat"} {
+					variant := f
+					variant.dataOnly, variant.count, variant.metadata = dataOnly, count, metadata
+					label := metadata
+					if label == "" {
+						label = "none"
+					}
+					variant.name = fmt.Sprintf("dataOnly=%v/count=%d/%s/metadata=%s", dataOnly, count, f.name, label)
+					fixtures = append(fixtures, variant)
+				}
 			}
 		}
 	}
 	type capture struct {
-		Name, Fixture, ClientModel, UpstreamModel string
-		Stream, DataOnly                          bool
-		Status, Count, Calls                      int
-		Headers                                   http.Header
-		Body, Request, UpstreamResponse           []byte
-		RequestHeaders                            http.Header
-		Path                                      string
+		Name, Fixture, ClientModel, UpstreamModel, Metadata string
+		Stream, DataOnly                                    bool
+		Status, Count, Calls                                int
+		Headers                                             http.Header
+		Body, Request, UpstreamResponse                     []byte
+		RequestHeaders                                      http.Header
+		Path                                                string
 	}
 	var captures []capture
 	for _, provider := range []string{"xai", "codex"} {
@@ -1219,6 +1226,9 @@ func functionalNativeBinaryCaptures(t *testing.T, repoRoot, cpaBin string) strin
 						if err := json.Unmarshal([]byte(payload), &event); err != nil {
 							t.Error(err)
 							return
+						}
+						if f.metadata != "" {
+							fmt.Fprintf(&wire, "%s%s", f.metadata, f.eol)
 						}
 						if !f.dataOnly {
 							fmt.Fprintf(&wire, "event: %s%s", event.Type, f.eol)
@@ -1268,6 +1278,7 @@ func functionalNativeBinaryCaptures(t *testing.T, repoRoot, cpaBin string) strin
 								}
 								record := got[0]
 								record.Name, record.Fixture, record.ClientModel = provider+"/"+variant+"/"+f.name, f.name, model
+								record.Metadata = f.metadata
 								record.Stream, record.DataOnly, record.Count, record.Calls = stream, f.dataOnly, f.count, len(got)
 								record.Status, record.Headers, record.Body = status, headers, raw
 								captures = append(captures, record)
