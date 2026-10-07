@@ -258,6 +258,34 @@ E 完成唯一入口/fixture 的 baseline RED 与 fixed GREEN。F15 baseline 固
 
 PR7 相关新提交 body 注明 `Related-PR: #7`、`PR-Author: @leolmq`；issue8 使用 `Refs: #8`，发版前不自动关闭。最终评论和版本在实际 Release 成功及资产核验后填写；不预填候选版本为修复版本，不改写旧提交署名。
 
+## H，mixed-shape Responses ordinary metadata 修正
+
+本节是当前 H 任务的完整规格，保留前面的 F01..F15、G/G-M/E/E-M 原要求和历史证据。固定起点为 `9f84a8135982f3c0097aba58e804ccf8fd38b5ba`。独立完成的 `M1-F15-MIXED-METADATA-01` 已确认 native/WS 缺陷，正式报告 SHA256 为 `7bcca60febf3868a64e8cc12af18538bbe671534e88c09dc94322e213029b58a`，协调核验 SHA256 为 `985c4fec85e133177b7cb8e1864880504d3bff0bb4748f5195d419f4877aef27`。这些报告属于旧 HEAD，不能作为 H 最终产品的审批。
+
+### 当前输入和消费者边界
+
+真实 XAI/Codex producer/host 接受 data-only `response.created`、ordinary metadata、field-pair `response.completed` 的独立无 LF/CR output units。9f84 把 created JSON、metadata、event/data 拼接为无效 data 行，两个 `response.model` 未恢复；同层 mapped metadata WS 96 项无 JSON，close 1006 unexpected EOF。direct/disabled WS 360 项、mapped none WS 24 项和 480 项非流正常。根回归与真实 native 验证必须重现该失败后修正。
+
+共享 scanner 按已核验的 output-unit 边界处理 data-only -> field-pair、field-pair -> data-only 和多次交替。ordinary `id: event-1`、`retry: 100`、`: heartbeat` 以及连续 opaque metadata 的原文字节、顺序、before-event/in-event/between-events 位置保持。仅恢复原六项响应白名单，完整 delta、completed output、tool/opaque 字节保持。沿用现有 scanner、增量游标、JSON parser、framing、batching 和错误消费接口，不新增 provider 分支、配置、依赖、ABI 字段或第二 parser。
+
+先前完整 data-only 单位在下一已核验的 event/data 单位到达时派发；metadata 本身不增加 data 帧。前值派发后 metadata 留给下一事件，不能作为 JSON suffix 使 scanner disabled。field-pair 在完整匹配 data 到达时派发；末 data-only 由 Flush/Finish 派发。保持原 none、同形状、迟到 LF/CRLF delimiter、ordinary metadata 和所有正常反证。
+
+direct/disabled mixed HTTP stream 自身缺少 completed，无 metadata 时也存在。H 对这条既存消费者限制记录准确 payload 和完成边界，HTTP 200 不能冒充正常完成；不修 CPA，不把该限制记为插件破坏正常 direct HTTP 的证据。正常 native 与 WS 必须完整通过。XAI 独立 WS 的 `prompt_cache_key`/`X-Grok-Conv-Id` 存在 60 项会话差异，保留完整捕获和严格 equality 的失败事实，精确检查差异范围；不能删除字段或声称严格 equality。Codex WS、两种 HTTP 的 mapped/direct request/header/URI/response equality 保持。
+
+### 必需验证和所有权
+
+H 的唯一 coding owner 在实际分配的 isolation worktree 连续完成文档、TDD、最小 shared 修正、完整验证、自审、修正和提交。只修改 `main.go` 的相关 shared scanner/rewriter、`stream_native_fields_regression_test.go`、唯一 `.github/scripts/testdata/cpa-functional-regression_test.go` 和两份 tracked spec/plan；确需固定 binary 交接时精确修改 `.github/scripts/smoke-local_test.go`。必要 benchmark 保存在现有 native/performance 文件。其他产品、CPA/cache、依赖、Makefile、CI、配置和其他 worktree 均不改。
+
+根 tests 覆盖三种 metadata、连续 opaque metadata、none、两个方向/多次交替、三种位置、Flush/Finish、dispatch、所有权/增量游标、2 MiB/8 MiB 续写、16 MiB incomplete/完整前缀+error/累计完整流量。generic LF/CR/CRLF、BOM、任意合法 splits、四其他 formats、raw framing 和 C/G/G-M 原控制保持。真实永久验收只使用原唯一 smoke 入口和 CPA fixture，完整核对 producer/host/native/WS 及 fixed binary，保存上游 raw body、headers、URI、response 和最终 DLL 身份。
+
+原 binary `2 providers × 2 shapes × 2 counts × 6 transports × 4 routes × 2 stream modes × 4 metadata = 1536` 矩阵逐项不变，其中 none384 保持。新增 mixed 组合单独命名并生成完整 expected-map，unknown/duplicate/missing 失败，每项有准确消费者预期。不得在原 matrix 数量下冒称新增维度，不过滤旧断言或新失败。
+
+最终当前源码必须通过 `go test ./... -count=1`、`go vet ./...`、`go test ./... -race -count=1 -timeout=1800s`、三个显式 scripts、版本注入/注册/schema、全部 59 个原 benchmark 的 1x byte-exact preflight（含已新增 metadata 共 60 个旧 preflight）及本次必要新增 preflight。实际 CPA 唯一入口在新产品/永久 tests 上完整 GREEN，loader/reconfigure/reload/首次 unload17 drain/bridge 原控制保持。根 race 与 native DLL/实际 binary 分层报告。
+
+性能使用相同已验证 policy，9f84 source 与新 fixed 受影响 benchmarks 顺序 foreground `-count=5 -benchmem`，保存全部样本、中位数和比较。旧五版本数据保留历史，9f84 错误 mixed 输出不计正常性能基线；新增 mixed benchmark仅报告 fixed 测量。保留 allocation 门槛和游标/ownership，记录实际性能成本，不宣称 CPU 独占或未经测量的复杂度。Windows/Linux c-shared、source identity、packaging/compatibility/zip/checksum按现有 parser 完成，Linux GLIBC <=2.17；linked-worktree GoVCS、Go1.26.5/GCC16.1.0/Zig0.17.0 与 CI Zig0.16.0 的限制保留，七平台 runtime/CI/Release 留给 F。
+
+全部稳定证据在 owner ROOT 的 ignored `dist/task-H-mixed-metadata/`，完整报告为 `task-H-report.json`。保留真实命令/exit、修正过程，未公开数字为 null，guard 拒绝为 processStarted=false，不伪造成功。最终提交 body 包含 `Refs: #8`、`Related-PR: #7`、`PR-Author: @leolmq`；累计 packages 覆盖固定 9f84..最终 HEAD、原 7855..最终 HEAD、3dce8db..最终 HEAD。owner 自审不代替两门独立审批，控制 workflow 在完成后分派；确认缺陷或缺口修正并重验后才可继续 F。H 不推送、tag、Release、评论或关闭。
+
 ## 实施分工和依赖
 
 | 任务 | 产品函数所有权 | 新测试与其他文件 | 依赖与完成条件 |

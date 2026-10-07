@@ -3509,6 +3509,47 @@ git -C "$E" log -1 --format='%H%n%B'
 - [ ] 将开始时记录的固定 E-M taskBASE..全部最终 HEAD 的完整 diff、spec/plan、原始日志和 layer/性能／构建结果交独立 reviewer；所有确认问题由 E-M 在同一 worktree 修正，重跑受影响控制和完整终验，再对相同累计范围复审。完成后主动回报真实 commit/BASE/HEAD/worktree、报告与限制。保留稳定 ignored 证据，清理自己 OS 临时副本和进程，不删除用户已有内容。
 - [ ] G-M/E-M 修改经累计独立审查后，根据共享 scanner 与永久 integration 的实际影响重跑全分支必要复审并逐项核对全部范围，确认无覆盖遗漏且规格／质量审查通过后才进入 F。原真实用户发布授权、七平台 CI/Release、下载资产／runtime 来源核验和 issue8/PR7 评论要求保持；本节不执行 push/tag/Release/公开评论，不预填修复版本，不关闭 issue。
 
+## Task H：mixed-shape Responses ordinary metadata
+
+本任务绑定 spec 的 H 节及已完成的 `M1-F15-MIXED-METADATA-01` 交接。固定 review/taskBASE=`9f84a8135982f3c0097aba58e804ccf8fd38b5ba`；原累计 reviewBASE=`7855e55904f9a208ef915aa7878b77db8577a294`，metadata 累计 BASE=`3dce8db7373d2da6cfd792a30e2c323e0525bdc5`。全部步骤在 H 实际 isolation worktree 连续执行。当前唯一 coding owner 完成自审，最终两门独立 reviewer 由控制 workflow 分派。
+
+### H1：事实核对、当前规格与文档提交
+
+- [ ] 普通 Get-Location/pwd、git rev-parse HEAD、branch/status 核对实际 ROOT。HEAD 应为固定9f84；不同时在自身 ROOT 用普通 `git switch -c` 创建唯一 H 分支指向9f84。不 EnterWorktree，不跨工作区 git，不派代理，不改变权限。
+- [ ] 读取只读交接、已结束正式报告和相关 stable helper；核对正式 SHA256、固定 CPA binary revision/version/SHA256。只读取插件直接相关 CPA 依赖，不改 CPA/cache、来源或旧报告。
+- [ ] 有限追踪 shared Write/drain/scanner/reset、全部调用者、batching/chunks+error。根因假设由真实 units 和 trace 核对：仅下一 data 触发 data-only drain，metadata suffix 遇 event 使 scanner disabled。原 C/G/G-M 行为保持。
+- [ ] 在两份 tracked 文档加入完整 H 规格与本计划，逐项自审范围、HTTP限制、XAI WS会话差异、原1536/none384、新mixed expected-map、全部验证和后续 F 边界。`git diff --check` 后单独提交 docs，body 为 `Refs: #8`、`Related-PR: #7`、`PR-Author: @leolmq`。检查提交只含两份文档。
+
+### H2：永久测试和真实9f84 RED
+
+- [ ] 阅读 `writing-good-tests.md`。说明每个新 test 检测的真实缺陷，expected bytes 不调用产品逻辑生成。复用 native fixture/helpers。
+- [ ] 在 `stream_native_fields_regression_test.go` 新增 mixed 回归：data-only -> field-pair、反向、多次交替、none/id/retry/comment/连续 opaque、三种位置、Flush/Finish 和逐次派发；精确检查完整 payload/六白名单/opaque。覆盖2MiB/8MiB续写、完整跨16MiB、incomplete超限、完整前缀+error/读错误、累计流量、input/output ownership和游标；复用原边界tests，不删旧断言。
+- [ ] 在唯一 CPA fixture 增加真实 producer/host/native/WS 同层验收，保留 mapped/direct/disabled `.6/.7` 对照。fixed binary 交接确需时仅扩展原 smoke入口。新增 mixed matrix单独命名，完整 expected-map 检查 unknown/duplicate/missing；原1536和none384轴/fixture/断言不变。
+- [ ] 使用固定9f84 DLL运行新 focused根tests和永久实际CPA，观察目标内容 RED：模型未恢复、无效 native data、mapped WS close1006；none/direct/disabled WS和非流是正常反证。HTTP direct/disabled缺completed单独准确记录，禁止把HTTP200或消费者限制当TDD RED。
+- [ ] 保存真实源码、DLL/header、命令/exit、producer/host units、raw请求/headers/URI/response、native/消费者bytes与日志。保留XAI60项独立WS会话字段严格equality失败，检查确实仅该已确认差异；不忽略或伪造 equality。
+
+### H3：最小 shared 修正及 focused GREEN
+
+- [ ] 只在共享 output-unit/scanner 根因位置修改，复用既有 format/state/json恢复器。完整 data-only 遇下一已核验 event或data单位时先派发前值；metadata保持给后续单位，不污染JSON或关闭scanner。不增加provider、mode、parser、配置或fallback。
+- [ ] focused新test GREEN后执行原 `TestFunctionalNativeSSEField`、所有`TestFunctional`及协议/forwarder/terminal/allocation/游标控制。generic wire LF/CR/CRLF、BOM、所有splits、四其他formats、raw单值/序列/array和opaque保持。
+- [ ] 出现意外失败按实际证据修正，保存失败日志和重验；新增内容精确改动，不降低旧门槛、不跳过旧assertion。完整前缀+error仍由既有调用者发送后报错。
+
+### H4：最终源码完整验证及真实性能
+
+- [ ] `go test ./... -count=1`、`go vet ./...`、`go test ./... -race -count=1 -timeout=1800s`，完整保存 stdout/stderr和实际exit。根平台skip单列。
+- [ ] 三个显式入口分别运行 package-release、check-compatibility、smoke-local 的 `.go`与`_test.go`组合，禁止目录级scripts测试。注入 `-X main.pluginVersion=0.5.12` 的注册/schema控制，默认版本仍为dev，不声称发布。
+- [ ] 全部原59 benchmark 及原 metadata新增后的60组入口执行 `go test . -run '^$' -bench . -benchtime=1x -count=1 -benchmem`，精确检查原preflight全集和新增mixed。保留全部byte-exact/长度/ownership/allocation条件。
+- [ ] 用9f84独立无Git source archive和fixed当前源码，按相同policy顺序foreground运行受影响benchmarks `-count=5 -benchmem`，先各自1x preflight。原样本、中位数、比较和真实成本完整保存。9f84错误mixed无计时基线；新增mixed只测fixed。旧五版本数字不改写、不机械重跑未受影响版本。
+- [ ] 构建最终native DLL，唯一 `TestCPAPluginIntegration` 运行原1536/none384、全部原functional/bridge/lifecycle/schema/reconfigure/reload/unload17及完整新增mixed。真实producer/host/native/WS必需GREEN；HTTP既存限制按每项准确payload记录。全部captures与expected-map逐项核对，不用总数量代替。
+
+### H5：build/package、最终自审、提交与交接
+
+- [ ] Windows/Linux c-shared使用当前源与注入版本构建；现有compatibility/packager检查通过，Linux GLIBC<=2.17。保存source archive、Git blobs/canonical LF/raw identity manifest、DLL/header、zip/checksum和receipt；linked-worktree GoVCS不作为源码身份。保留Go1.26.5/GCC16.1.0/Zig0.17.0与CI Zig0.16.0、原C RED和历史清理限制；七平台CI/runtime/Release未运行。
+- [ ] 单独完整自审核对9f84..当前全部修改与原7855..当前累计内容，核对所有新assertions、旧controls、调用者与所有权，无扩展功能/依赖/配置。发现confirmed/gap连续修正、重验，直到完成条件满足。
+- [ ] 普通git提交全部owned产品/tests，body保留三个Refs字段。检查最终HEAD覆盖docs及产品提交，status干净。生成9f84..最终HEAD、7855..最终HEAD、3dce8db..最终HEAD完整累计packages，不能只给最后commit。
+- [ ] 所有稳定证据/日志/captures/源归档/DLL/header/manifest/receipts/样本/自审及 `task-H-report.json` 在自身 ROOT/dist/task-H-mixed-metadata。报告列实际root/head/branch/commits/source/hash/owned路径、完整RED-GREEN、commands/exit、matrix/controls/performance、清理和限制。未公开exit=null，guard拒绝processStarted=false，保留真实Exit1/2与修正过程；不覆盖旧artifact，不删除用户文件。
+- [ ] 主动SendMessage main报告阶段性事实及最终报告/hash，正式StructuredOutput。owner self-review不代替独立审批，controller完成两门审查/修正/复审/整合及新HEAD共享协议与全范围终审后继续F。H不启动reviewer，不推送/tag/Release/评论/关闭。
+
 ## Task F：合并、授权核对和 patch 发布
 
 **Files:** 不新增产品文件。仅合并已完成提交；版本通过现有 build flags 注入。
