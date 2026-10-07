@@ -3541,6 +3541,7 @@ git -C "$E" log -1 --format='%H%n%B'
 - [ ] 全部原59 benchmark 及原 metadata新增后的60组入口执行 `go test . -run '^$' -bench . -benchtime=1x -count=1 -benchmem`，精确检查原preflight全集和新增mixed。保留全部byte-exact/长度/ownership/allocation条件。
 - [ ] 用9f84独立无Git source archive和fixed当前源码，按相同policy顺序foreground运行受影响benchmarks `-count=5 -benchmem`，先各自1x preflight。原样本、中位数、比较和真实成本完整保存。9f84错误mixed无计时基线；新增mixed只测fixed。旧五版本数字不改写、不机械重跑未受影响版本。
 - [ ] 构建最终native DLL，唯一 `TestCPAPluginIntegration` 运行原1536/none384、全部原functional/bridge/lifecycle/schema/reconfigure/reload/unload17及完整新增mixed。真实producer/host/native/WS必需GREEN；HTTP既存限制按每项准确payload记录。全部captures与expected-map逐项核对，不用总数量代替。
+- [ ] 保留 CPA 源副本时使用 `cpa-` 加16个hex字符的目录名，并保留目录已存在即失败的检查和完整module/source身份核验。Windows 实测完整hash目录下的深层依赖启动 vet 返回 `The directory name is invalid`；新增 focused 路径回归观察 RED 后缩短目录组件，不改变系统设置、不跳过 vet。审计与单独注入版本验收的 Go 输入放在本任务 `.inputs/` 中，避免被根 `./...` 当成额外package；不增加依赖文件。Git archive导出bytes、Git blob/canonical LF和ROOT raw源文件分别核对，CRLF规范化必须由真实Git blob hash验证。
 
 ### H5：build/package、最终自审、提交与交接
 

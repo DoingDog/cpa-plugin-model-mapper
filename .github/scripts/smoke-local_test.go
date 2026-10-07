@@ -918,7 +918,8 @@ func prepareFunctionalCPAOverlay(t *testing.T, repoRoot string) (string, string)
 	}
 	work := t.TempDir()
 	if evidence := os.Getenv("CPA_FUNCTIONAL_EVIDENCE"); evidence != "" {
-		work = filepath.Join(evidence, fmt.Sprintf("cpa-overlay-%x", sha256.Sum256([]byte(t.Name()))))
+		nameHash := sha256.Sum256([]byte(t.Name()))
+		work = filepath.Join(evidence, fmt.Sprintf("cpa-%x", nameHash[:8]))
 		if err := os.Mkdir(work, 0700); err != nil {
 			t.Fatal(err)
 		}
@@ -962,6 +963,22 @@ func prepareFunctionalCPAOverlay(t *testing.T, repoRoot string) (string, string)
 	}
 	t.Logf("CPA version=%s Sum=%s source=%s copy=%s overlay=%s", module.Version, module.Sum, module.Dir, checkout, overlay)
 	return checkout, overlay
+}
+
+func TestPrepareFunctionalCPAOverlayEvidencePath(t *testing.T) {
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CPA_FUNCTIONAL_EVIDENCE", t.TempDir())
+	checkout, overlay := prepareFunctionalCPAOverlay(t, repoRoot)
+	component := filepath.Base(filepath.Dir(checkout))
+	if len(component) > 32 {
+		t.Fatalf("CPA source directory component has %d bytes, want <=32: %s", len(component), component)
+	}
+	if info, err := os.Stat(overlay); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("overlay: %v", err)
+	}
 }
 
 func runFunctionalCPAOverlay(t *testing.T, repoRoot string, env []string) {
