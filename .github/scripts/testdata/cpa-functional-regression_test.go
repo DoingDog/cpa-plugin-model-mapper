@@ -121,6 +121,7 @@ func gCPAFields(f gCPAFieldsFixture, model string) ([]string, []byte) {
 type gCPAUpstreamRecord struct {
 	body, response []byte
 	model, path    string
+	headers        http.Header
 }
 
 type gCPALocalProducer struct {
@@ -168,7 +169,7 @@ func gCPANewLocalProducer(t *testing.T, name string) *gCPALocalProducer {
 			wire = customWire
 		}
 		p.mu.Lock()
-		p.records = append(p.records, gCPAUpstreamRecord{body: bytes.Clone(body), response: bytes.Clone(wire), model: request.Model, path: r.URL.Path})
+		p.records = append(p.records, gCPAUpstreamRecord{body: bytes.Clone(body), response: bytes.Clone(wire), model: request.Model, path: r.URL.RequestURI(), headers: r.Header.Clone()})
 		p.mu.Unlock()
 		w.Header().Set("Content-Type", f.contentType)
 		step := f.step
@@ -2247,5 +2248,609 @@ func TestModelMapperFunctionalOrdinaryMetadataConsumerControls(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+type hCPAMixedFixture struct {
+	name, eol, contentType, metadata string
+	count, step                      int
+}
+
+func hCPAMixedFixtures() []hCPAMixedFixture {
+	var fixtures []hCPAMixedFixture
+	for _, count := range []int{2, 9} {
+		for _, metadata := range []struct{ label, fields string }{{"none", ""}, {"id", "id: event-1"}, {"retry", "retry: 100"}, {"heartbeat", ": heartbeat"}, {"combined", "id: event-1\nretry: 100\n: heartbeat"}} {
+			for _, transport := range []hCPAMixedFixture{{name: "LF-whole", eol: "\n", contentType: "text/event-stream"}, {name: "CRLF-whole", eol: "\r\n", contentType: "text/event-stream"}, {name: "LF-7bytes", eol: "\n", contentType: "text/event-stream", step: 7}, {name: "CRLF-bytewise", eol: "\r\n", contentType: "text/event-stream", step: 1}, {name: "LF-charset", eol: "\n", contentType: "text/event-stream; charset=utf-8", step: 11}, {name: "CRLF-charset", eol: "\r\n", contentType: "text/event-stream; charset=utf-8", step: 7}} {
+				f := transport
+				f.name = fmt.Sprintf("mixed/count=%d/metadata=%s/%s", count, metadata.label, transport.name)
+				f.count = count
+				f.metadata = metadata.fields
+				fixtures = append(fixtures, f)
+			}
+		}
+	}
+	return fixtures
+}
+
+func hCPAMixedPayloads(model string, count int) []string {
+	values := gCPAPayloads(model, 9)
+	if count == 2 {
+		return []string{values[0], values[8]}
+	}
+	return values
+}
+
+func hCPAMixedFields(f hCPAMixedFixture, model string) ([]string, []byte) {
+	var fields []string
+	var wire strings.Builder
+	for i, payload := range hCPAMixedPayloads(model, f.count) {
+		if i == 1 && f.metadata != "" {
+			for _, field := range strings.Split(f.metadata, "\n") {
+				fields = append(fields, field)
+				wire.WriteString(field + f.eol)
+			}
+		}
+		var value struct{ Type string }
+		if err := json.Unmarshal([]byte(payload), &value); err != nil {
+			panic(err)
+		}
+		if i > 0 {
+			fields = append(fields, "event: "+value.Type)
+			wire.WriteString("event: " + value.Type + f.eol)
+		}
+		fields = append(fields, "data: "+payload)
+		wire.WriteString("data: " + payload + f.eol + f.eol)
+	}
+	return fields, []byte(wire.String())
+}
+
+// 固定 CPA 的 direct mixed HTTP 会把下一 event 名称附在前一 data 上，末 completed 不派发。
+func hCPADirectHTTPWire(f hCPAMixedFixture, model string) []byte {
+	values := hCPAMixedPayloads(model, f.count)
+	var wire strings.Builder
+	for i := 0; i < len(values)-1; i++ {
+		wire.WriteString("data: " + values[i] + "\n")
+		if i == 0 && f.metadata != "" {
+			wire.WriteString(f.metadata + "\n")
+		}
+		var next struct{ Type string }
+		if err := json.Unmarshal([]byte(values[i+1]), &next); err != nil {
+			panic(err)
+		}
+		wire.WriteString("event: " + next.Type + "\n\n")
+	}
+	wire.WriteByte('\n')
+	return []byte(wire.String())
+}
+
+func hCPARequireMixedEvents(t *testing.T, raw []byte, f hCPAMixedFixture, model string) {
+	t.Helper()
+	normalized := bytes.ReplaceAll(raw, []byte("\r\n"), []byte("\n"))
+	if f.metadata != "" {
+		for _, field := range strings.Split(f.metadata, "\n") {
+			if bytes.Count(append([]byte("\n"), normalized...), []byte("\n"+field+"\n")) != 1 {
+				t.Errorf("metadata field=%q bytes=%q", field, raw)
+			}
+		}
+	}
+	events, err := sse.Decode(bytes.NewReader(normalized))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payloads []string
+	for _, event := range events {
+		payload, ok := event.Data.(string)
+		if !ok || payload == "" {
+			continue
+		}
+		var value struct{ Type string }
+		if err := json.Unmarshal([]byte(payload), &value); err != nil {
+			t.Errorf("mixed invalid JSON: %v payload=%q", err, payload)
+			continue
+		}
+		name := value.Type
+		if len(payloads) == 0 {
+			name = "message"
+		}
+		if event.Event != name {
+			t.Errorf("mixed event=%q want=%q", event.Event, name)
+		}
+		payloads = append(payloads, payload)
+	}
+	if !reflect.DeepEqual(payloads, hCPAMixedPayloads(model, f.count)) {
+		t.Errorf("mixed payloads=%q want=%q", payloads, hCPAMixedPayloads(model, f.count))
+	}
+}
+
+type hCPACapture struct {
+	Name, Fixture, ClientModel, UpstreamModel, Metadata, Kind string
+	Stream, DataOnly                                          bool
+	Status, Count, Calls                                      int
+	Headers, RequestHeaders                                   http.Header
+	Body, Request, UpstreamResponse                           []byte
+	Path                                                      string
+	WS, Errors, Fields                                        []string
+}
+
+func hCPASaveEvidence(t *testing.T, name string, value any) {
+	t.Helper()
+	if dir := os.Getenv("CPA_FUNCTIONAL_EVIDENCE"); dir != "" {
+		raw, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, name)
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("evidence already exists: %s %v", path, err)
+		}
+		if err := os.WriteFile(path, raw, 0600); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("evidence=%s SHA256=%x", path, sha256.Sum256(raw))
+	}
+}
+
+func TestModelMapperFunctionalMixedMetadata(t *testing.T) {
+	fixtures := hCPAMixedFixtures()
+	var captures []hCPACapture
+	defer func() { hCPASaveEvidence(t, "mixed-native-captures.json", captures) }()
+	want := make(map[string]bool)
+	for _, provider := range []string{"xai", "codex"} {
+		for _, f := range fixtures {
+			for _, route := range []string{"core", "host", "mapped", "direct", "disabled-grok-4.6", "disabled-grok-4.7"} {
+				kinds := []string{"http-stream", "http-nonstream", "ws"}
+				if route == "core" || route == "host" {
+					kinds = []string{"fields"}
+				}
+				if route == "mapped" {
+					kinds = append(kinds, "native")
+				}
+				for _, kind := range kinds {
+					want[provider+"/"+route+"/"+f.name+"/"+kind] = true
+				}
+			}
+		}
+	}
+	for _, provider := range []string{"xai", "codex"} {
+		t.Run(provider, func(t *testing.T) {
+			p := gCPANewLocalProducer(t, provider)
+			enabled := gCPALoadNative(t, p, true)
+			disabled := gCPALoadNative(t, p, false)
+			server := eResponsesServer(t, p.base)
+			for _, f := range fixtures {
+				for _, route := range []string{"core", "host", "mapped", "direct", "disabled-grok-4.6", "disabled-grok-4.7"} {
+					kinds := []string{"http-stream", "http-nonstream", "ws"}
+					if route == "core" || route == "host" {
+						kinds = []string{"fields"}
+					}
+					if route == "mapped" {
+						kinds = append(kinds, "native")
+					}
+					for _, kind := range kinds {
+						t.Run(route+"/"+f.name+"/"+kind, func(t *testing.T) {
+							model, upstream := "grok-4.7", "grok-4.7"
+							p.base.SetPluginHost(nil)
+							p.base.SetModelRouterHost(nil)
+							if route == "mapped" {
+								model = "grok-4.6"
+								if kind != "native" {
+									p.base.SetPluginHost(enabled)
+									p.base.SetModelRouterHost(enabled)
+								}
+							} else if strings.HasPrefix(route, "disabled-") {
+								model = strings.TrimPrefix(route, "disabled-")
+								upstream = model
+								p.base.SetPluginHost(disabled)
+								p.base.SetModelRouterHost(disabled)
+							}
+							fields, wire := hCPAMixedFields(f, upstream)
+							p.mu.Lock()
+							p.fixture = gCPAFieldsFixture{contentType: f.contentType, eol: f.eol, step: f.step, count: f.count}
+							p.wire = wire
+							p.records = nil
+							p.mu.Unlock()
+							ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+							defer cancel()
+							c := hCPACapture{Name: provider + "/" + route + "/" + f.name + "/" + kind, Fixture: f.name, ClientModel: model, UpstreamModel: upstream, Metadata: f.metadata, Kind: kind, Count: f.count}
+							if !want[c.Name] {
+								t.Fatalf("unknown/duplicate mixed capture=%s", c.Name)
+							}
+							delete(want, c.Name)
+							switch kind {
+							case "fields":
+								if route == "core" {
+									c.Fields = gCPACoreFields(t, p, ctx)
+								} else {
+									c.Fields = gCPAHostFields(t, p, ctx)
+								}
+								if !reflect.DeepEqual(c.Fields, fields) {
+									t.Errorf("fields=%q want=%q", c.Fields, fields)
+								}
+							case "native":
+								result, err := enabled.activeRecords()[0].plugin.Capabilities.Executor.ExecuteStream(ctx, eNativeRequest(model, "openai-response", true))
+								if err != nil {
+									t.Fatal(err)
+								}
+								c.Body, c.Errors = eNativeDrain(t, result.Chunks)
+								canonical := f
+								canonical.eol = "\n"
+								_, expected := hCPAMixedFields(canonical, model)
+								if len(c.Errors) != 0 || !bytes.Equal(c.Body, expected) {
+									t.Errorf("mixed native=%q errors=%q want=%q", c.Body, c.Errors, expected)
+								}
+								hCPARequireMixedEvents(t, c.Body, f, model)
+							case "ws":
+								var err error
+								c.WS, err = eWS(t, server, model)
+								if err != nil {
+									c.Errors = []string{err.Error()}
+									t.Error(err)
+								}
+								if !reflect.DeepEqual(c.WS, hCPAMixedPayloads(model, f.count)) {
+									t.Errorf("mixed WS=%q want=%q", c.WS, hCPAMixedPayloads(model, f.count))
+								}
+							default:
+								c.Stream = kind == "http-stream"
+								c.Status, c.Headers, c.Body = eHTTP(t, server, "/v1/responses", gCPARequest(model, c.Stream))
+								if c.Status != 200 {
+									t.Errorf("mixed HTTP status=%d body=%q", c.Status, c.Body)
+								}
+								if !c.Stream {
+									gCPARequireResponse(t, c.Body, model)
+								} else if route == "mapped" {
+									hCPARequireMixedEvents(t, c.Body, f, model)
+								} else {
+									if !bytes.Equal(c.Body, hCPADirectHTTPWire(f, model)) {
+										t.Errorf("existing direct HTTP boundary changed: bytes=%q want=%q", c.Body, hCPADirectHTTPWire(f, model))
+									}
+									t.Logf("existing direct/disabled HTTP limitation: completed absent; payloads=%d/%d body=%q", f.count-1, f.count, c.Body)
+								}
+							}
+							p.mu.Lock()
+							records := append([]gCPAUpstreamRecord(nil), p.records...)
+							p.mu.Unlock()
+							c.Calls = len(records)
+							if len(records) != 1 || records[0].model != upstream {
+								t.Errorf("mixed upstream calls=%+v", records)
+							} else {
+								c.Request, c.UpstreamResponse, c.RequestHeaders, c.Path = records[0].body, records[0].response, records[0].headers, records[0].path
+								if !bytes.Equal(c.UpstreamResponse, wire) || c.Path != "/v1/responses" {
+									t.Error("mixed upstream identity changed")
+								}
+							}
+							captures = append(captures, c)
+							t.Logf("mixed %s body=%q WS=%q fields=%q errors=%q upstream=%s", c.Name, c.Body, c.WS, c.Fields, c.Errors, c.Request)
+						})
+					}
+				}
+			}
+		})
+	}
+	if len(want) != 0 {
+		t.Errorf("missing mixed captures=%v", want)
+	}
+}
+
+func TestModelMapperFunctionalMixedBinaryCaptures(t *testing.T) {
+	if url := os.Getenv("CPA_FUNCTIONAL_MIXED_CLIENT_URL"); url != "" {
+		values, err := hCPAMixedBinaryWS(t, url, os.Getenv("CPA_FUNCTIONAL_MIXED_CLIENT_MODEL"), os.Getenv("CPA_FUNCTIONAL_MIXED_CLIENT_KEY"))
+		result := struct {
+			Values []string
+			Error  string
+		}{Values: values}
+		if err != nil {
+			result.Error = err.Error()
+		}
+		raw, err := json.Marshal(result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(os.Getenv("CPA_FUNCTIONAL_MIXED_CLIENT_RESULT"), raw, 0600); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	path := os.Getenv("CPA_FUNCTIONAL_MIXED_CAPTURES")
+	if path == "" {
+		t.Fatal("mixed binary captures required")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var captures []hCPACapture
+	if err := json.Unmarshal(raw, &captures); err != nil {
+		t.Fatal(err)
+	}
+	type expected struct {
+		f                                hCPAMixedFixture
+		model, upstream, provider, route string
+	}
+	want := make(map[string]expected)
+	mapped := make(map[string]hCPACapture)
+	for _, provider := range []string{"xai", "codex"} {
+		for _, f := range hCPAMixedFixtures() {
+			for _, route := range []struct{ name, model, upstream string }{{"mapped", "grok-4.6", "grok-4.7"}, {"direct", "grok-4.7", "grok-4.7"}, {"disabled-grok-4.6", "grok-4.6", "grok-4.6"}, {"disabled-grok-4.7", "grok-4.7", "grok-4.7"}} {
+				for _, kind := range []string{"http-nonstream", "http-stream", "ws"} {
+					want[provider+"/"+route.name+"/"+f.name+"/"+kind] = expected{f, route.model, route.upstream, provider, route.name}
+				}
+			}
+		}
+	}
+	sessionDifferences := 0
+	for _, c := range captures {
+		key := c.Name + "/" + c.Kind
+		ex, ok := want[key]
+		if !ok {
+			t.Fatalf("unknown/duplicate mixed binary capture=%s", key)
+		}
+		delete(want, key)
+		t.Run(key, func(t *testing.T) {
+			if c.Fixture != ex.f.name || c.ClientModel != ex.model || c.UpstreamModel != ex.upstream || c.Metadata != ex.f.metadata || c.Count != ex.f.count || c.Calls != 1 || len(c.Errors) != 0 {
+				t.Errorf("mixed binary identity/error=%+v", c)
+			}
+			_, wire := hCPAMixedFields(ex.f, ex.upstream)
+			if !bytes.Equal(c.UpstreamResponse, wire) || c.Path != "/v1/responses" || c.RequestHeaders.Get("Content-Length") != fmt.Sprint(len(c.Request)) || c.RequestHeaders.Get("Authorization") != "Bearer fake-upstream-key" {
+				t.Error("mixed binary upstream bytes/URI/headers differ")
+			}
+			switch c.Kind {
+			case "ws":
+				if !reflect.DeepEqual(c.WS, hCPAMixedPayloads(ex.model, ex.f.count)) {
+					t.Errorf("mixed binary WS=%q want=%q", c.WS, hCPAMixedPayloads(ex.model, ex.f.count))
+				}
+			case "http-nonstream":
+				if c.Status != 200 {
+					t.Errorf("status=%d", c.Status)
+				}
+				gCPARequireResponse(t, c.Body, ex.model)
+			case "http-stream":
+				if c.Status != 200 {
+					t.Errorf("status=%d bytes=%q", c.Status, c.Body)
+				}
+				if ex.route == "mapped" {
+					hCPARequireMixedEvents(t, c.Body, ex.f, ex.model)
+				} else {
+					if !bytes.Equal(c.Body, hCPADirectHTTPWire(ex.f, ex.model)) {
+						t.Errorf("direct HTTP boundary changed: body=%q want=%q", c.Body, hCPADirectHTTPWire(ex.f, ex.model))
+					}
+					t.Logf("existing mixed HTTP limitation: HTTP200, completed absent, payloads=%d/%d", ex.f.count-1, ex.f.count)
+				}
+			}
+			pairKey := ex.provider + "/" + ex.f.name + "/" + c.Kind
+			if ex.route == "mapped" {
+				mapped[pairKey] = c
+			} else if ex.route == "direct" {
+				control, ok := mapped[pairKey]
+				if !ok {
+					t.Fatal("mapped pair absent")
+				}
+				strictBody := bytes.Equal(c.Request, control.Request)
+				strictHeaders := reflect.DeepEqual(c.RequestHeaders, control.RequestHeaders)
+				if !bytes.Equal(c.UpstreamResponse, control.UpstreamResponse) || c.Path != control.Path {
+					t.Error("mapped/direct response or URI differs")
+				}
+				if ex.provider == "xai" && c.Kind == "ws" {
+					var a, b map[string]json.RawMessage
+					if err := json.Unmarshal(c.Request, &a); err != nil {
+						t.Fatal(err)
+					}
+					if err := json.Unmarshal(control.Request, &b); err != nil {
+						t.Fatal(err)
+					}
+					var aID, bID string
+					if err := json.Unmarshal(a["prompt_cache_key"], &aID); err != nil {
+						t.Fatal(err)
+					}
+					if err := json.Unmarshal(b["prompt_cache_key"], &bID); err != nil {
+						t.Fatal(err)
+					}
+					if strictBody || strictHeaders || aID == bID || aID == "" || bID == "" || c.RequestHeaders.Get("X-Grok-Conv-Id") != aID || control.RequestHeaders.Get("X-Grok-Conv-Id") != bID {
+						t.Error("expected real XAI independent WS session difference absent or inconsistent")
+					}
+					delete(a, "prompt_cache_key")
+					delete(b, "prompt_cache_key")
+					ah, bh := c.RequestHeaders.Clone(), control.RequestHeaders.Clone()
+					ah.Del("X-Grok-Conv-Id")
+					bh.Del("X-Grok-Conv-Id")
+					if !reflect.DeepEqual(a, b) || !reflect.DeepEqual(ah, bh) {
+						t.Error("XAI WS has differences beyond confirmed session fields")
+					}
+					sessionDifferences++
+					t.Logf("strict mapped/direct request equality=false, header equality=false, session IDs=%s/%s; response/URI equality=true", bID, aID)
+				} else if !strictBody || !strictHeaders {
+					t.Errorf("strict mapped/direct upstream equality failed: mapped=%s/%v direct=%s/%v", control.Request, control.RequestHeaders, c.Request, c.RequestHeaders)
+				}
+			}
+		})
+	}
+	if len(want) != 0 {
+		t.Errorf("missing mixed binary captures=%v", want)
+	}
+	if sessionDifferences != 60 {
+		t.Errorf("XAI WS session differences=%d want=60", sessionDifferences)
+	}
+}
+
+func hCPAMixedBinaryWS(t *testing.T, url, model, key string) ([]string, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, url, http.Header{"Authorization": {"Bearer " + key}})
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return nil, err
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.create","model":%q,"input":[],"prompt_cache_key":"task-g-local"}`, model))); err != nil {
+		return nil, err
+	}
+	var values []string
+	for {
+		kind, raw, err := conn.ReadMessage()
+		if err != nil {
+			return values, err
+		}
+		if kind != websocket.TextMessage || !json.Valid(raw) {
+			return values, fmt.Errorf("WS kind=%d payload=%q", kind, raw)
+		}
+		values = append(values, string(raw))
+		var event struct{ Type string }
+		if err := json.Unmarshal(raw, &event); err != nil {
+			return values, err
+		}
+		if event.Type == "response.completed" || event.Type == "error" || event.Type == "response.failed" {
+			return values, nil
+		}
+	}
+}
+
+func TestModelMapperFunctionalMixedShapeControls(t *testing.T) {
+	var captures []hCPACapture
+	defer func() { hCPASaveEvidence(t, "mixed-shape-controls.json", captures) }()
+	expected := make(map[string]bool)
+	for _, provider := range []string{"xai", "codex"} {
+		for _, shape := range []string{"data-to-pair", "pair-to-data", "alternating-data", "alternating-pair"} {
+			for _, count := range []int{2, 9} {
+				for _, metadata := range [][]string{nil, {"id: event-1"}, {"retry: 100"}, {": heartbeat"}, {"id: event-1", "retry: 100", `: opaque event: response.created data: {"model":"grok-4.7"} 中文`}} {
+					for _, position := range []string{"before-event", "in-event", "between-events"} {
+						for _, kind := range []string{"core", "host", "direct-ws", "disabled-.6-ws", "disabled-.7-ws", "mapped-native", "mapped-ws"} {
+							expected[fmt.Sprintf("%s/%s/count=%d/metadata=%q/%s/%s", provider, shape, count, metadata, position, kind)] = true
+						}
+					}
+				}
+			}
+		}
+	}
+	for _, provider := range []string{"xai", "codex"} {
+		t.Run(provider, func(t *testing.T) {
+			p := gCPANewLocalProducer(t, provider)
+			enabled := gCPALoadNative(t, p, true)
+			disabled := gCPALoadNative(t, p, false)
+			server := eResponsesServer(t, p.base)
+			for _, shape := range []string{"data-to-pair", "pair-to-data", "alternating-data", "alternating-pair"} {
+				for _, count := range []int{2, 9} {
+					for _, metadata := range [][]string{nil, {"id: event-1"}, {"retry: 100"}, {": heartbeat"}, {"id: event-1", "retry: 100", `: opaque event: response.created data: {"model":"grok-4.7"} 中文`}} {
+						for _, position := range []string{"before-event", "in-event", "between-events"} {
+							t.Run(fmt.Sprintf("%s/count=%d/metadata=%q/%s", shape, count, metadata, position), func(t *testing.T) {
+								build := func(model string) ([]string, []byte) {
+									var fields []string
+									var wire strings.Builder
+									for i, payload := range hCPAMixedPayloads(model, count) {
+										add := func(field string) { fields = append(fields, field); wire.WriteString(field + "\n") }
+										if position == "before-event" || position == "between-events" && i > 0 {
+											for _, field := range metadata {
+												add(field)
+											}
+										}
+										dataOnly := shape == "data-to-pair" && i == 0 || shape == "pair-to-data" && i > 0 || shape == "alternating-data" && i%2 == 0 || shape == "alternating-pair" && i%2 == 1
+										var value struct{ Type string }
+										if err := json.Unmarshal([]byte(payload), &value); err != nil {
+											panic(err)
+										}
+										if !dataOnly {
+											add("event: " + value.Type)
+										}
+										if position == "in-event" {
+											for _, field := range metadata {
+												add(field)
+											}
+										}
+										add("data: " + payload)
+										wire.WriteByte('\n')
+									}
+									return fields, []byte(wire.String())
+								}
+								set := func(model string) {
+									_, wire := build(model)
+									p.mu.Lock()
+									p.fixture = gCPAFieldsFixture{contentType: "text/event-stream", eol: "\n", count: count}
+									p.wire = wire
+									p.records = nil
+									p.mu.Unlock()
+								}
+								ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+								defer cancel()
+								for _, kind := range []string{"core", "host", "direct-ws", "disabled-.6-ws", "disabled-.7-ws", "mapped-native", "mapped-ws"} {
+									t.Run(kind, func(t *testing.T) {
+										p.base.SetPluginHost(nil)
+										p.base.SetModelRouterHost(nil)
+										model, upstream := "grok-4.7", "grok-4.7"
+										if strings.HasPrefix(kind, "mapped") {
+											model = "grok-4.6"
+											if kind == "mapped-ws" {
+												p.base.SetPluginHost(enabled)
+												p.base.SetModelRouterHost(enabled)
+											}
+										} else if strings.HasPrefix(kind, "disabled") {
+											if kind == "disabled-.6-ws" {
+												model = "grok-4.6"
+											}
+											upstream = model
+											p.base.SetPluginHost(disabled)
+											p.base.SetModelRouterHost(disabled)
+										}
+										set(upstream)
+										fields, _ := build(upstream)
+										_, want := build(model)
+										c := hCPACapture{Name: fmt.Sprintf("%s/%s/count=%d/metadata=%q/%s/%s", provider, shape, count, metadata, position, kind), Kind: kind, ClientModel: model, UpstreamModel: upstream, Count: count}
+										if !expected[c.Name] {
+											t.Fatalf("unknown/duplicate shape control=%s", c.Name)
+										}
+										delete(expected, c.Name)
+										switch kind {
+										case "core":
+											c.Fields = gCPACoreFields(t, p, ctx)
+											if !reflect.DeepEqual(c.Fields, fields) {
+												t.Errorf("shape core=%q want=%q", c.Fields, fields)
+											}
+										case "host":
+											c.Fields = gCPAHostFields(t, p, ctx)
+											if !reflect.DeepEqual(c.Fields, fields) {
+												t.Errorf("shape host=%q want=%q", c.Fields, fields)
+											}
+										case "mapped-native":
+											result, err := enabled.activeRecords()[0].plugin.Capabilities.Executor.ExecuteStream(ctx, eNativeRequest(model, "openai-response", true))
+											if err != nil {
+												t.Fatal(err)
+											}
+											c.Body, c.Errors = eNativeDrain(t, result.Chunks)
+											if len(c.Errors) != 0 || !bytes.Equal(c.Body, want) {
+												t.Errorf("shape native=%q errors=%q want=%q", c.Body, c.Errors, want)
+											}
+										default:
+											var err error
+											c.WS, err = eWS(t, server, model)
+											if err != nil {
+												c.Errors = []string{err.Error()}
+												t.Error(err)
+											}
+											if !reflect.DeepEqual(c.WS, hCPAMixedPayloads(model, count)) {
+												t.Errorf("shape WS=%q want=%q", c.WS, hCPAMixedPayloads(model, count))
+											}
+										}
+										p.mu.Lock()
+										records := append([]gCPAUpstreamRecord(nil), p.records...)
+										p.mu.Unlock()
+										c.Calls = len(records)
+										if len(records) != 1 || records[0].model != upstream {
+											t.Errorf("shape calls=%+v", records)
+										} else {
+											c.Request, c.UpstreamResponse, c.RequestHeaders, c.Path = records[0].body, records[0].response, records[0].headers, records[0].path
+										}
+										captures = append(captures, c)
+										t.Logf("shape %s fields=%q bytes=%q WS=%q errors=%q", c.Name, c.Fields, c.Body, c.WS, c.Errors)
+									})
+								}
+							})
+						}
+					}
+				}
+			}
+		})
+	}
+	if len(expected) != 0 {
+		t.Errorf("missing shape controls=%v", expected)
 	}
 }

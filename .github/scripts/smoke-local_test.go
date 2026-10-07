@@ -917,6 +917,12 @@ func prepareFunctionalCPAOverlay(t *testing.T, repoRoot string) (string, string)
 		t.Fatalf("unexpected CPA module: %+v", module)
 	}
 	work := t.TempDir()
+	if evidence := os.Getenv("CPA_FUNCTIONAL_EVIDENCE"); evidence != "" {
+		work = filepath.Join(evidence, fmt.Sprintf("cpa-overlay-%x", sha256.Sum256([]byte(t.Name()))))
+		if err := os.Mkdir(work, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
 	checkout := filepath.Join(work, "cpa-v7.2.152")
 	err = filepath.WalkDir(module.Dir, func(source string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -966,6 +972,7 @@ func runFunctionalCPAOverlay(t *testing.T, repoRoot string, env []string) {
 	cmd := exec.CommandContext(ctx, "go", "-C", checkout, "test", "-mod=readonly", "-overlay", overlay, "-count=1", "-v", "./internal/pluginhost", "-run", "^TestModelMapperFunctional|^TestStreamBridge(CloseUnblocksPendingEmit|ClosePreservesTerminalErrorWhenBufferIsFull)$", "-timeout", "600s")
 	cmd.Dir, cmd.Env = repoRoot, append(append(os.Environ(), "GOWORK=off"), env...)
 	output, err := cmd.CombinedOutput()
+	functionalSaveEvidence(t, "cpa-overlay.log", output)
 	t.Logf("CPA overlay command=%v\n%s", cmd.Args, output)
 	if err != nil {
 		t.Fatalf("CPA overlay: %v", err)
@@ -1139,14 +1146,30 @@ func TestCPAPluginIntegration(t *testing.T) {
 			}
 		}
 	})
-	binaryCaptures := functionalNativeBinaryCaptures(t, repoRoot, cpaBin)
+	binaryCaptures := functionalNativeBinaryCaptures(t, repoRoot, cpaBin, false)
+	mixedCaptures := functionalNativeBinaryCaptures(t, repoRoot, cpaBin, true)
 	t.Run("native-host-and-responses-ws", func(t *testing.T) {
-		runFunctionalCPAOverlay(t, repoRoot, []string{"CPA_SMOKE_PLUGIN=" + env.plugin, fmt.Sprintf("CPA_FUNCTIONAL_WS_URL=ws://127.0.0.1:%d/v1/responses", env.port), "CPA_FUNCTIONAL_LOCAL_KEY=" + localAPIKey, "CPA_FUNCTIONAL_BINARY_CAPTURES=" + binaryCaptures})
+		runFunctionalCPAOverlay(t, repoRoot, []string{"CPA_SMOKE_PLUGIN=" + env.plugin, fmt.Sprintf("CPA_FUNCTIONAL_WS_URL=ws://127.0.0.1:%d/v1/responses", env.port), "CPA_FUNCTIONAL_LOCAL_KEY=" + localAPIKey, "CPA_FUNCTIONAL_BINARY_CAPTURES=" + binaryCaptures, "CPA_FUNCTIONAL_MIXED_CAPTURES=" + mixedCaptures})
 	})
 }
 
-func functionalNativeBinaryCaptures(t *testing.T, repoRoot, cpaBin string) string {
+func functionalNativeBinaryCaptures(t *testing.T, repoRoot, cpaBin string, mixed bool) string {
 	t.Helper()
+	wsClient := filepath.Join(t.TempDir(), "mixed-ws-client.exe")
+	if mixed {
+		t.Run("mixed-ws-client-build", func(t *testing.T) {
+			checkout, overlay := prepareFunctionalCPAOverlay(t, repoRoot)
+			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, "go", "-C", checkout, "test", "-mod=readonly", "-overlay", overlay, "-c", "-o", wsClient, "./internal/pluginhost")
+			cmd.Env = append(os.Environ(), "GOWORK=off")
+			raw, err := cmd.CombinedOutput()
+			functionalSaveEvidence(t, "mixed-ws-client-build.log", raw)
+			if err != nil {
+				t.Fatalf("CPA WS client build: %v\n%s", err, raw)
+			}
+		})
+	}
 	const output = `[{"id":"msg-issue8","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ordinary grok-4.7 opaque 中文 output","annotations":[]}]}]`
 	payloads := []string{`{"type":"response.created","response":{"model":"MODEL","status":"in_progress","output":[]}}`, `{"type":"response.in_progress","response":{"model":"MODEL","status":"in_progress","output":[]}}`, `{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}`, `{"type":"response.content_part.added","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}`, `{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"ordinary grok-4.7 opaque 中文 output"}`, `{"type":"response.output_text.done","output_index":0,"content_index":0,"text":"ordinary grok-4.7 opaque 中文 output"}`, `{"type":"response.content_part.done","output_index":0,"content_index":0,"part":{"type":"output_text","text":"ordinary grok-4.7 opaque 中文 output","annotations":[]}}`, `{"type":"response.output_item.done","output_index":0,"item":{"id":"msg-issue8","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ordinary grok-4.7 opaque 中文 output","annotations":[]}]}}`, `{"type":"response.completed","response":{"id":"resp-issue8","object":"response","status":"completed","model":"MODEL","output":` + output + `}}`}
 	type fixture struct {
@@ -1165,7 +1188,14 @@ func functionalNativeBinaryCaptures(t *testing.T, repoRoot, cpaBin string) strin
 				{name: "LF-charset", eol: "\n", contentType: "text/event-stream; charset=utf-8", step: 11},
 				{name: "CRLF-charset", eol: "\r\n", contentType: "text/event-stream; charset=utf-8", step: 7},
 			} {
-				for _, metadata := range []string{"", "id: event-1", "retry: 100", ": heartbeat"} {
+				metadataValues := []string{"", "id: event-1", "retry: 100", ": heartbeat"}
+				if mixed {
+					if !dataOnly {
+						continue
+					}
+					metadataValues = append(metadataValues, "id: event-1\nretry: 100\n: heartbeat")
+				}
+				for _, metadata := range metadataValues {
 					variant := f
 					variant.dataOnly, variant.count, variant.metadata = dataOnly, count, metadata
 					label := metadata
@@ -1173,6 +1203,13 @@ func functionalNativeBinaryCaptures(t *testing.T, repoRoot, cpaBin string) strin
 						label = "none"
 					}
 					variant.name = fmt.Sprintf("dataOnly=%v/count=%d/%s/metadata=%s", dataOnly, count, f.name, label)
+					if mixed {
+						if count == 1 {
+							variant.count = 2
+						}
+						labels := map[string]string{"": "none", "id: event-1": "id", "retry: 100": "retry", ": heartbeat": "heartbeat", "id: event-1\nretry: 100\n: heartbeat": "combined"}
+						variant.name = fmt.Sprintf("mixed/count=%d/metadata=%s/%s", variant.count, labels[metadata], f.name)
+					}
 					fixtures = append(fixtures, variant)
 				}
 			}
@@ -1180,6 +1217,8 @@ func functionalNativeBinaryCaptures(t *testing.T, repoRoot, cpaBin string) strin
 	}
 	type capture struct {
 		Name, Fixture, ClientModel, UpstreamModel, Metadata string
+		Kind                                                string
+		WS, Errors                                          []string
 		Stream, DataOnly                                    bool
 		Status, Count, Calls                                int
 		Headers                                             http.Header
@@ -1218,19 +1257,21 @@ func functionalNativeBinaryCaptures(t *testing.T, repoRoot, cpaBin string) strin
 					values := payloads
 					if f.count == 1 {
 						values = values[len(values)-1:]
+					} else if f.count == 2 {
+						values = []string{values[0], values[len(values)-1]}
 					}
 					var wire strings.Builder
-					for _, payload := range values {
+					for i, payload := range values {
 						payload = strings.Replace(payload, `"model":"MODEL"`, `"model":"`+req.Model+`"`, 1)
 						var event struct{ Type string }
 						if err := json.Unmarshal([]byte(payload), &event); err != nil {
 							t.Error(err)
 							return
 						}
-						if f.metadata != "" {
-							fmt.Fprintf(&wire, "%s%s", f.metadata, f.eol)
+						if f.metadata != "" && (!mixed || i == 1) {
+							fmt.Fprintf(&wire, "%s%s", strings.ReplaceAll(f.metadata, "\n", f.eol), f.eol)
 						}
-						if !f.dataOnly {
+						if !f.dataOnly || mixed && i > 0 {
 							fmt.Fprintf(&wire, "event: %s%s", event.Type, f.eol)
 						}
 						fmt.Fprintf(&wire, "data: %s%s%s", payload, f.eol, f.eol)
@@ -1255,15 +1296,30 @@ func functionalNativeBinaryCaptures(t *testing.T, repoRoot, cpaBin string) strin
 				extra := fmt.Sprintf("%s-api-key:\n  - api-key: fake-upstream-key\n    base-url: %q\n    proxy-url: direct\n    models:\n      - name: grok-4.6\n        alias: grok-4.6\n      - name: grok-4.7\n        alias: grok-4.7\n", provider, upstream.URL+"/v1")
 				env := functionalCPAProcess(t, repoRoot, cpaBin, upstream.URL, "grok-4.6=>grok-4.7", extra, enabled)
 				requireFunctionalCPARegistration(t, env, enabled)
+				t.Cleanup(func() { functionalSaveProcessEvidence(t, env) })
 				for _, f := range fixtures {
-					for _, stream := range []bool{false, true} {
+					kinds := []string{"http-nonstream", "http-stream"}
+					if mixed {
+						kinds = append(kinds, "ws")
+					}
+					for _, kind := range kinds {
+						stream := kind != "http-nonstream"
 						for _, model := range []string{"grok-4.6", "grok-4.7"} {
-							t.Run(fmt.Sprintf("%s/stream=%v/model=%s", f.name, stream, model), func(t *testing.T) {
+							t.Run(fmt.Sprintf("%s/kind=%s/model=%s", f.name, kind, model), func(t *testing.T) {
 								mu.Lock()
 								current, records = f, nil
 								mu.Unlock()
 								body := []byte(fmt.Sprintf(`{"model":%q,"input":"say ok","stream":%v,"prompt_cache_key":"task-g-local"}`, model, stream))
-								status, headers, raw := functionalHTTPRequest(t, env.port, "/v1/responses", body)
+								var status int
+								var headers http.Header
+								var raw []byte
+								var ws []string
+								var wsErr error
+								if kind == "ws" {
+									ws, wsErr = functionalMixedBinaryWS(t, wsClient, env.port, model)
+								} else {
+									status, headers, raw = functionalHTTPRequest(t, env.port, "/v1/responses", body)
+								}
 								mu.Lock()
 								got := append([]capture(nil), records...)
 								mu.Unlock()
@@ -1281,12 +1337,23 @@ func functionalNativeBinaryCaptures(t *testing.T, repoRoot, cpaBin string) strin
 								record.Metadata = f.metadata
 								record.Stream, record.DataOnly, record.Count, record.Calls = stream, f.dataOnly, f.count, len(got)
 								record.Status, record.Headers, record.Body = status, headers, raw
+								record.Kind, record.WS = kind, ws
+								if wsErr != nil {
+									record.Errors = []string{wsErr.Error()}
+									t.Error(wsErr)
+								}
 								captures = append(captures, record)
-								if status != 200 {
+								if kind != "ws" && status != 200 {
 									t.Errorf("native %s stream=%v status=%d error=%s", record.Name, stream, status, raw)
 								}
 								key := fmt.Sprintf("%s/stream=%v", f.name, stream)
-								if variant == "mapped" {
+								if mixed {
+									key = f.name + "/" + kind
+								}
+								if mixed && kind == "ws" {
+									// 独立 WS 的真实会话字段由永久 CPA fixture 精确核对，保留原始 bytes。
+									t.Logf("mixed binary WS %s payloads=%q errors=%q upstreamRequest=%s headers=%v", record.Name, record.WS, record.Errors, record.Request, record.RequestHeaders)
+								} else if variant == "mapped" {
 									mapped[key] = record
 								} else {
 									control, ok := mapped[key]
@@ -1317,9 +1384,89 @@ func functionalNativeBinaryCaptures(t *testing.T, repoRoot, cpaBin string) strin
 		t.Fatal(err)
 	}
 	t.Logf("binary captures JSON=%s", encoded)
-	path := filepath.Join(t.TempDir(), "native-binary-captures.json")
+	name := "native-binary-captures.json"
+	if mixed {
+		name = "mixed-binary-captures.json"
+	}
+	functionalSaveEvidence(t, name, encoded)
+	path := filepath.Join(t.TempDir(), name)
 	if err := os.WriteFile(path, encoded, 0600); err != nil {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func functionalMixedBinaryWS(t *testing.T, client string, port int, model string) ([]string, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	path := filepath.Join(t.TempDir(), "ws-result.json")
+	cmd := exec.CommandContext(ctx, client, "-test.run=^TestModelMapperFunctionalMixedBinaryCaptures$", "-test.timeout=12s")
+	cmd.Env = append(os.Environ(), fmt.Sprintf("CPA_FUNCTIONAL_MIXED_CLIENT_URL=ws://127.0.0.1:%d/v1/responses", port), "CPA_FUNCTIONAL_MIXED_CLIENT_MODEL="+model, "CPA_FUNCTIONAL_MIXED_CLIENT_KEY="+localAPIKey, "CPA_FUNCTIONAL_MIXED_CLIENT_RESULT="+path)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("CPA WS client: %w: %s", err, output)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var result struct {
+		Values []string
+		Error  string
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, err
+	}
+	if result.Error != "" {
+		return result.Values, errors.New(result.Error)
+	}
+	return result.Values, nil
+}
+
+// CPA_FUNCTIONAL_EVIDENCE 只控制测试证据的保留位置，不参与产品配置。
+func functionalSaveEvidence(t *testing.T, name string, raw []byte) {
+	t.Helper()
+	if dir := os.Getenv("CPA_FUNCTIONAL_EVIDENCE"); dir != "" {
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("evidence already exists: %s %v", path, err)
+		}
+		if err := os.WriteFile(path, raw, 0600); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("evidence=%s SHA256=%x", path, sha256.Sum256(raw))
+	}
+}
+
+func functionalSaveProcessEvidence(t *testing.T, env smokeEnv) {
+	t.Helper()
+	if os.Getenv("CPA_FUNCTIONAL_EVIDENCE") == "" {
+		return
+	}
+	label := fmt.Sprintf("process-%x", sha256.Sum256([]byte(t.Name())))
+	for name, source := range map[string]string{"config.yaml": env.config, "cpa.log": env.logFile, "loaded-copy.dll": env.plugin} {
+		raw, err := os.ReadFile(source)
+		if err != nil {
+			t.Error(err)
+			continue
+		}
+		functionalSaveEvidence(t, filepath.Join(label, name), raw)
+	}
+	if runtime.GOOS == "windows" {
+		matches, err := filepath.Glob(filepath.Join(env.dir, "tmp", "cliproxy-pluginhost", "pid-*", "*.dll"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, source := range matches {
+			raw, err := os.ReadFile(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			functionalSaveEvidence(t, filepath.Join(label, fmt.Sprintf("shadow-%d.dll", i)), raw)
+		}
+	}
 }

@@ -1344,3 +1344,375 @@ func BenchmarkStreamChunkRewriterOrdinaryMetadataContinuation(b *testing.B) {
 		}
 	}
 }
+
+// 移除 mixed 单位的边界派发或把 metadata 拼进 JSON，会使这些真实 output-unit 回归失败。
+func hNativeMixedFields(count int, firstDataOnly bool, metadata []string, position string) ([][]byte, []byte) {
+	names, payloads := gNativeSequence()
+	indices := []int{0, 8}
+	if count == 9 {
+		indices = []int{0, 1, 2, 3, 4, 5, 6, 7, 8}
+	}
+	var parts [][]byte
+	var want bytes.Buffer
+	for n, i := range indices {
+		dataOnly := firstDataOnly != (n%2 != 0)
+		addMetadata := func() {
+			for _, field := range metadata {
+				parts = append(parts, []byte(field))
+				fmt.Fprintln(&want, field)
+			}
+		}
+		if position == "before-event" || position == "between-events" && n > 0 {
+			addMetadata()
+		}
+		if !dataOnly {
+			parts = append(parts, []byte("event: "+names[i]))
+			fmt.Fprintln(&want, "event: "+names[i])
+		}
+		if position == "in-event" {
+			addMetadata()
+		}
+		parts = append(parts, []byte("data: "+payloads[i]))
+		restored := payloads[i]
+		if i < 2 || i == 8 {
+			restored = strings.Replace(restored, `"model":"grok-4.7"`, `"model":"grok-4.6"`, 1)
+		}
+		fmt.Fprint(&want, "data: "+restored+"\n\n")
+	}
+	return parts, want.Bytes()
+}
+
+func TestFunctionalNativeSSEFieldMixedMetadata(t *testing.T) {
+	for _, metadata := range [][]string{nil, {"id: event-1"}, {"retry: 100"}, {": heartbeat"}, {"id: event-1", "retry: 100", `: opaque event: response.created data: {"model":"grok-4.7"} 中文`}} {
+		for _, firstDataOnly := range []bool{true, false} {
+			for _, count := range []int{2, 9} {
+				for _, position := range []string{"before-event", "in-event", "between-events"} {
+					for _, finish := range []bool{false, true} {
+						t.Run(fmt.Sprintf("metadata=%q/firstDataOnly=%v/count=%d/%s/finish=%v", metadata, firstDataOnly, count, position, finish), func(t *testing.T) {
+							parts, want := hNativeMixedFields(count, firstDataOnly, metadata, position)
+							got := gNativeParts(t, "openai-response", finish, parts...)
+							if !bytes.Equal(got, want) {
+								t.Fatalf("mixed output=%q want=%q", got, want)
+							}
+							requireValidResponsesSSE(t, got, count)
+						})
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestFunctionalNativeSSEFieldMixedMetadataDispatch(t *testing.T) {
+	for _, metadata := range [][]string{{"id: event-1"}, {"retry: 100"}, {": heartbeat"}, {"id: event-1", "retry: 100", `: opaque data: {"model":"grok-4.7"} 中文`}} {
+		for _, eol := range []string{"\n", "\r\n"} {
+			t.Run(fmt.Sprintf("metadata=%q/eol=%q", metadata, eol), func(t *testing.T) {
+				parts, want := hNativeMixedFields(2, true, metadata, "between-events")
+				first, _, ok := bytes.Cut(want, []byte("\n\n"))
+				if !ok {
+					t.Fatal("fixture has no first event")
+				}
+				first = append(bytes.Clone(first), '\n', '\n')
+				r := newStreamChunkRewriter("grok-4.6")
+				r.format, r.frameRawJSONAsSSE = "openai-response", true
+				var chunks [][]byte
+				for i, part := range parts {
+					out, err := r.Write(part)
+					if err != nil {
+						t.Fatal(err)
+					}
+					chunks = append(chunks, out...)
+					got := bytes.Join(chunks, nil)
+					switch {
+					case i <= len(metadata):
+						if len(got) != 0 {
+							t.Fatalf("metadata dispatched data at %d: %q", i, got)
+						}
+					case i == len(metadata)+1:
+						if !bytes.Equal(got, first) {
+							t.Fatalf("event callback output=%q want=%q", got, first)
+						}
+					default:
+						if !bytes.Equal(got, want) {
+							t.Fatalf("data callback output=%q want=%q", got, want)
+						}
+					}
+					for j := range part {
+						part[j] = 'z'
+					}
+				}
+				frozen := bytes.Clone(bytes.Join(chunks, nil))
+				out, err := r.Write([]byte(eol + eol))
+				if err != nil || len(bytes.TrimSpace(bytes.Join(out, nil))) != 0 {
+					t.Fatalf("late delimiter=(%q,%v)", out, err)
+				}
+				out, err = r.Finish()
+				if err != nil || len(bytes.TrimSpace(bytes.Join(out, nil))) != 0 {
+					t.Fatalf("finish=(%q,%v)", out, err)
+				}
+				if _, err := r.Write([]byte("data: {}\n\n")); err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(bytes.Join(chunks, nil), frozen) || !bytes.Equal(frozen, want) {
+					t.Fatal("mixed output aliases input or future buffer")
+				}
+			})
+		}
+	}
+}
+
+func TestFunctionalNativeSSEFieldMixedMetadataWireControls(t *testing.T) {
+	metadata := []string{"id: event-1", "retry: 100", `: opaque event: response.created data: {"model":"grok-4.7"} 中文`}
+	for _, firstDataOnly := range []bool{true, false} {
+		parts, want := hNativeMixedFields(2, firstDataOnly, metadata, "between-events")
+		for _, format := range []string{"openai", "claude", "gemini", "interactions"} {
+			if got := gNativeParts(t, format, true, parts...); !bytes.Equal(got, bytes.Join(parts, nil)) {
+				t.Fatalf("inactive format=%s changed mixed units", format)
+			}
+		}
+		wire := bytes.ReplaceAll(want, []byte(`"model":"grok-4.6"`), []byte(`"model":"grok-4.7"`))
+		for _, eol := range []string{"\n", "\r", "\r\n"} {
+			input := bytes.ReplaceAll(wire, []byte("\n"), []byte(eol))
+			expected := bytes.ReplaceAll(want, []byte("\n"), []byte(eol))
+			for _, bom := range []bool{false, true} {
+				if bom {
+					input = append([]byte{0xef, 0xbb, 0xbf}, input...)
+				}
+				for split := 0; split <= len(input); split++ {
+					got := gNativeParts(t, "claude", true, input[:split], input[split:])
+					if !bytes.Equal(got, expected) {
+						t.Fatalf("generic eol=%q bom=%v split=%d got=%q want=%q", eol, bom, split, got, expected)
+					}
+				}
+				var bytewise [][]byte
+				for i := range input {
+					bytewise = append(bytewise, input[i:i+1])
+				}
+				if got := gNativeParts(t, "claude", true, bytewise...); !bytes.Equal(got, expected) {
+					t.Fatal("generic bytewise differs")
+				}
+			}
+		}
+	}
+}
+
+func hNativeMixedLargeFixture(size int) ([][]byte, []byte) {
+	parts, want := hNativeMixedFields(2, true, []string{"id: event-1", "retry: 100", ": heartbeat"}, "between-events")
+	large, largeWant := gNativeLargeFixture(size, false)
+	// 小 created 与 metadata 后续写大 field-pair，沿用单个大单位的 allocation 条件。
+	prefixEnd := bytes.Index(want, []byte("event: response.completed"))
+	return append(parts[:len(parts)-2], large...), append(want[:prefixEnd:prefixEnd], largeWant...)
+}
+
+func TestFunctionalNativeSSEFieldMixedMetadataContinuation(t *testing.T) {
+	for _, size := range []int{2 << 20, 8 << 20, maxPendingStreamBytes} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			parts, want := hNativeMixedLargeFixture(size)
+			if size == maxPendingStreamBytes {
+				// 最后一次 Write 补完仍在限额内的 pending，不先提交越界的 incomplete 单位。
+				data := bytes.Join(parts[5:], nil)
+				cut := maxPendingStreamBytes - len(parts[4])
+				parts = append(parts[:5:5], data[:cut], data[cut:])
+			}
+			chunks, err := gNativeContinue(parts)
+			if err != nil || !bytes.Equal(bytes.Join(chunks, nil), want) {
+				t.Fatalf("mixed large bytes=%d want=%d error=%v", len(bytes.Join(chunks, nil)), len(want), err)
+			}
+			if size == 2<<20 {
+				allocs := testing.AllocsPerRun(1, func() {
+					out, err := gNativeContinue(parts)
+					if err != nil || !bytes.Equal(bytes.Join(out, nil), want) {
+						panic(fmt.Sprint(err))
+					}
+				})
+				if allocs > 200 {
+					t.Fatalf("mixed allocations=%v want<=200", allocs)
+				}
+			}
+			for _, part := range parts {
+				for i := range part {
+					part[i] = 'z'
+				}
+			}
+			if !bytes.Equal(bytes.Join(chunks, nil), want) {
+				t.Fatal("mixed large output aliases input")
+			}
+		})
+	}
+}
+
+func TestFunctionalNativeSSEFieldMixedMetadataPrefixBeforeError(t *testing.T) {
+	parts, want := hNativeMixedFields(2, true, []string{"id: event-1"}, "between-events")
+	r := newStreamChunkRewriter("grok-4.6")
+	r.format, r.frameRawJSONAsSSE = "openai-response", true
+	var out []byte
+	for _, part := range parts {
+		chunks, err := r.Write(part)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, bytes.Join(chunks, nil)...)
+	}
+	chunks, err := r.Write([]byte(`data: {"type":"response.output_text.done","text":"` + strings.Repeat("x", maxPendingStreamBytes)))
+	out = append(out, bytes.Join(chunks, nil)...)
+	if err == nil || !strings.Contains(err.Error(), "stream pending data exceeds") || !bytes.Equal(out, want) {
+		t.Fatalf("prefix bytes=%d error=%v want=%d", len(out), err, len(want))
+	}
+	chunks, err = r.Flush()
+	if err != nil || len(chunks) != 0 {
+		t.Fatalf("cleared tail flush=(%q,%v)", chunks, err)
+	}
+}
+
+func BenchmarkStreamChunkRewriterMixedMetadataContinuation(b *testing.B) {
+	for _, size := range []int{2 << 20, 8 << 20} {
+		b.Run(fmt.Sprintf("bytes=%d/fragment=8192", size), func(b *testing.B) {
+			parts, want := hNativeMixedLargeFixture(size)
+			chunks, err := gNativeContinue(parts)
+			if err != nil || !bytes.Equal(bytes.Join(chunks, nil), want) {
+				b.Fatalf("byte-exact mixed preflight error=%v", err)
+			}
+			b.ReportAllocs()
+			b.SetBytes(int64(len(want)))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				chunks, err = gNativeContinue(parts)
+				if err != nil || len(chunks) == 0 {
+					b.Fatalf("mixed continuation=(%d,%v)", len(chunks), err)
+				}
+			}
+		})
+	}
+}
+
+func TestFunctionalNativeSSEFieldMixedMetadataLargeFirstControl(t *testing.T) {
+	parts, want := hNativeMixedFields(2, true, []string{"id: event-1", "retry: 100", ": heartbeat"}, "between-events")
+	large, largeWant := gNativeLargeFixture(2<<20, true)
+	parts = append(large, parts[1:]...)
+	want = append(largeWant, want[bytes.Index(want, []byte("\n\n"))+2:]...)
+	got := gNativeParts(t, "openai-response", true, parts...)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("large first mixed bytes=%d want=%d", len(got), len(want))
+	}
+}
+
+func TestFunctionalNativeSSEFieldMixedMetadataCursorAndTraffic(t *testing.T) {
+	parts, want := hNativeMixedLargeFixture(2 << 20)
+	r := newStreamChunkRewriter("grok-4.6")
+	r.format, r.frameRawJSONAsSSE = "openai-response", true
+	for repeat := 0; repeat < 9; repeat++ {
+		var output []byte
+		previous := 0
+		for i, part := range parts {
+			out, err := r.Write(part)
+			if err != nil {
+				t.Fatal(err)
+			}
+			output = append(output, bytes.Join(out, nil)...)
+			if i >= 5 && len(r.sse.buf) > 0 {
+				s := r.sse.delimiterless
+				if s.disabled || s.jsonScan != len(r.sse.buf) || s.jsonScan <= previous || s.headerScan >= s.jsonScan {
+					t.Fatalf("continuation cursor=%+v previous=%d bytes=%d", s, previous, len(r.sse.buf))
+				}
+				previous = s.jsonScan
+			}
+		}
+		out, err := r.Flush()
+		output = append(output, bytes.Join(out, nil)...)
+		if err != nil || !bytes.Equal(output, want) {
+			t.Fatalf("complete cumulative traffic repeat=%d bytes=%d error=%v", repeat, len(output), err)
+		}
+	}
+}
+
+func TestFunctionalNativeSSEFieldMixedMetadataWhitelist(t *testing.T) {
+	created := `{"type":"response.created","model":"grok-4.7","modelVersion":"grok-4.7","response":{"model":"grok-4.7","modelVersion":"grok-4.7"},"message":{"model":"grok-4.7"},"interaction":{"model":"grok-4.7"},"opaque":{"model":"grok-4.7","text":"event: data: grok-4.7 中文"}}`
+	wantCreated := `{"type":"response.created","model":"grok-4.6","modelVersion":"grok-4.6","response":{"model":"grok-4.6","modelVersion":"grok-4.6"},"message":{"model":"grok-4.6"},"interaction":{"model":"grok-4.6"},"opaque":{"model":"grok-4.7","text":"event: data: grok-4.7 中文"}}`
+	got := gNativeParts(t, "openai-response", true, []byte("data: "+created), []byte("id: event-1"), []byte("event: response.completed"), []byte("data: "+gNativeCompleted))
+	want := []byte("data: " + wantCreated + "\n\nid: event-1\nevent: response.completed\ndata: " + gNativeCompletedWant + "\n\n")
+	if !bytes.Equal(got, want) {
+		t.Fatalf("mixed whitelist=%q want=%q", got, want)
+	}
+}
+
+func TestFunctionalNativeSSEFieldMixedMetadataForwarder(t *testing.T) {
+	for _, terminal := range []string{"natural", "done-payload", "in-band-error", "callback-error"} {
+		t.Run(terminal, func(t *testing.T) {
+			parts, want := hNativeMixedFields(2, true, []string{"id: event-1"}, "between-events")
+			var reads []pluginapi.HostModelStreamReadResponse
+			for _, p := range parts {
+				reads = append(reads, pluginapi.HostModelStreamReadResponse{Payload: p})
+			}
+			reads = append(reads, pluginapi.HostModelStreamReadResponse{Done: true})
+			if terminal == "done-payload" {
+				reads[len(reads)-2].Done = true
+			}
+			if terminal == "in-band-error" {
+				reads[len(reads)-2].Error = "controlled mixed read error"
+				reads[len(reads)-2].Done = true
+			}
+			var output []byte
+			var closeText string
+			hostCloses, pluginCloses := 0, 0
+			readErr := errors.New("controlled mixed callback error")
+			stream := &executorStream{pluginStreamID: "mixed-forwarder", hostStreamID: "mixed-host", originalModel: "grok-4.6", format: "openai-response", frameRawJSONAsSSE: true}
+			stream.call = func(method string, payload any) (json.RawMessage, error) {
+				switch method {
+				case pluginabi.MethodHostModelStreamRead:
+					if terminal == "callback-error" && len(reads) == 1 {
+						return nil, readErr
+					}
+					if len(reads) == 0 {
+						return nil, errors.New("unexpected extra mixed read")
+					}
+					read := reads[0]
+					reads = reads[1:]
+					return json.Marshal(read)
+				case pluginabi.MethodHostStreamEmit:
+					raw, err := json.Marshal(payload)
+					if err != nil {
+						return nil, err
+					}
+					var emit struct{ Payload []byte }
+					if err := json.Unmarshal(raw, &emit); err != nil {
+						return nil, err
+					}
+					output = append(output, emit.Payload...)
+				case pluginabi.MethodHostModelStreamClose:
+					hostCloses++
+				case pluginabi.MethodHostStreamClose:
+					pluginCloses++
+					raw, err := json.Marshal(payload)
+					if err != nil {
+						return nil, err
+					}
+					var value struct{ Error string }
+					if err := json.Unmarshal(raw, &value); err != nil {
+						return nil, err
+					}
+					closeText = value.Error
+				default:
+					return nil, fmt.Errorf("unexpected method %s", method)
+				}
+				return json.RawMessage(`{}`), nil
+			}
+			err := runStreamForward(stream)
+			if !bytes.Equal(output, want) || hostCloses != 1 {
+				t.Fatalf("mixed forwarder output=%q hostCloses=%d want=%q", output, hostCloses, want)
+			}
+			if terminal == "callback-error" {
+				if !errors.Is(err, readErr) || pluginCloses != 0 {
+					t.Fatalf("callback error=%v pluginCloses=%d", err, pluginCloses)
+				}
+			} else {
+				expected := ""
+				if terminal == "in-band-error" {
+					expected = "controlled mixed read error"
+				}
+				if err != nil || pluginCloses != 1 || closeText != expected {
+					t.Fatalf("terminal error=%v closes=%d closeText=%q", err, pluginCloses, closeText)
+				}
+			}
+		})
+	}
+}

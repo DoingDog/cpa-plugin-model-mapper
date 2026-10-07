@@ -220,16 +220,20 @@ func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
 			p = nil
 		}
 	}
-	if r.logicalEventFormat == "openai-response" && bytes.HasPrefix(p, []byte("data:")) {
+	if r.logicalEventFormat == "openai-response" && (bytes.HasPrefix(p, []byte("data:")) || bytes.HasPrefix(p, []byte("event:"))) {
 		s := &r.delimiterless
 		if !s.disabled && s.completeEnd > 0 && (s.completeEnd == len(r.buf) || s.metadataEnd == len(r.buf)) && s.dataStart == s.headerStart {
-			// 下一独立 data 单位到达时，派发此前已验证的完整值。
+			// 下一独立 event/data 单位确认前值边界，metadata 保留给下一事件。
+			nextFields := r.buf[s.completeEnd:]
+			r.buf = r.buf[:s.completeEnd]
 			var err error
 			out, err = r.drain(true)
 			if err != nil {
 				return out, err
 			}
-		} else if !s.disabled && s.headerPrefixChecked && !s.headerComplete && s.headerScan == len(r.buf) {
+			r.buf = nextFields
+			r.delimiterless.metadataEnd = len(nextFields)
+		} else if bytes.HasPrefix(p, []byte("data:")) && !s.disabled && s.headerPrefixChecked && !s.headerComplete && s.headerScan == len(r.buf) {
 			eventType := strings.TrimSpace(string(r.buf[s.headerStart+len("event:") : s.headerScan]))
 			if strings.HasPrefix(eventType, "response.") {
 				// dataStart == headerScan 记录 callback 间缺少的 LF；验证后才补写。
