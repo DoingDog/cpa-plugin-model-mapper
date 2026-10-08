@@ -326,21 +326,18 @@ func gCPALoadNative(t *testing.T, p *gCPALocalProducer, enabled bool) *Host {
 	if plugin == "" {
 		t.Fatal("CPA_SMOKE_PLUGIN is required")
 	}
+	plugin, err := filepath.Abs(plugin)
+	if err != nil {
+		t.Fatal(err)
+	}
 	library, err := os.ReadFile(plugin)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pluginDir := filepath.Join(t.TempDir(), "plugins")
-	target := filepath.Join(pluginDir, runtime.GOOS, runtime.GOARCH, "model-mapper"+filepath.Ext(plugin))
-	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(target, library, 0600); err != nil {
-		t.Fatal(err)
-	}
-	copied, err := os.ReadFile(target)
-	if err != nil || sha256.Sum256(copied) != sha256.Sum256(library) {
-		t.Fatalf("DLL copy error=%v", err)
+	// parent 提供的文件存活到整个 overlay 结束；顺序 owner 只读取同一动态库。
+	pluginDir := filepath.Dir(filepath.Dir(filepath.Dir(plugin)))
+	if plugin != filepath.Join(pluginDir, runtime.GOOS, runtime.GOARCH, "model-mapper"+filepath.Ext(plugin)) {
+		t.Fatalf("unexpected native library path: %s", plugin)
 	}
 	data := fmt.Sprintf("plugins:\n  enabled: %v\n  dir: %q\n  configs:\n    model-mapper:\n      enabled: true\n      priority: 1\n      global_rules: 'grok-4.6=>grok-4.7'\n", enabled, filepath.ToSlash(pluginDir))
 	var cfg config.Config
@@ -363,7 +360,7 @@ func gCPALoadNative(t *testing.T, p *gCPALocalProducer, enabled bool) *Host {
 	} else if len(active) != 0 {
 		t.Fatal("disabled control unexpectedly has an active plugin")
 	}
-	t.Logf("native enabled=%v source=%s copied=%s SHA256=%x", enabled, plugin, target, sha256.Sum256(library))
+	t.Logf("native enabled=%v canonical=%s SHA256=%x", enabled, plugin, sha256.Sum256(library))
 	return host
 }
 
@@ -1444,6 +1441,48 @@ func TestModelMapperFunctionalProtocolHTTP(t *testing.T) {
 }
 
 func TestModelMapperFunctionalReconfigureReload(t *testing.T) {
+	t.Run("canonical-lifetime", func(t *testing.T) {
+		plugin := os.Getenv("CPA_SMOKE_PLUGIN")
+		original, err := os.Stat(plugin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		library, err := os.ReadFile(plugin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range []string{"first-owner", "next-owner"} {
+			t.Run(name, func(t *testing.T) {
+				calls := 0
+				executor := &fakeHostModelExecutor{executeModel: func(_ context.Context, req handlers.ModelExecutionRequest) (handlers.ModelExecutionResponse, *interfaces.ErrorMessage) {
+					calls++
+					if req.Model != "grok-4.7" || string(req.Body) != `{"model":"grok-4.7","stream":false}` {
+						t.Errorf("current owner upstream model=%s body=%s", req.Model, req.Body)
+					}
+					return handlers.ModelExecutionResponse{StatusCode: 200, Body: []byte(fmt.Sprintf(`{"model":"grok-4.7","content":"%s opaque grok-4.7"}`, name))}, nil
+				}}
+				host := eNativeHost(t, executor)
+				response, err := host.activeRecords()[0].plugin.Capabilities.Executor.Execute(context.Background(), eNativeRequest("grok-4.6", "openai", false))
+				want := fmt.Sprintf(`{"model":"grok-4.6","content":"%s opaque grok-4.7"}`, name)
+				if err != nil || calls != 1 || string(response.Payload) != want {
+					t.Fatalf("current owner response=%s want=%s calls=%d error=%v", response.Payload, want, calls, err)
+				}
+				loaded, err := os.Stat(host.activeRecords()[0].path)
+				if err != nil || !os.SameFile(original, loaded) {
+					t.Fatalf("native library identity differs from parent: path=%s parent=%s error=%v", host.activeRecords()[0].path, plugin, err)
+				}
+			})
+			// 子测试的 native cleanup 完成后，parent 文件仍须保持原身份和内容。
+			current, err := os.Stat(plugin)
+			if err != nil || !os.SameFile(original, current) {
+				t.Fatalf("parent library identity changed after %s cleanup: %v", name, err)
+			}
+			currentBytes, err := os.ReadFile(plugin)
+			if err != nil || sha256.Sum256(currentBytes) != sha256.Sum256(library) {
+				t.Fatalf("parent library content changed after %s cleanup: %v", name, err)
+			}
+		}
+	})
 	executor := &fakeHostModelExecutor{executeModelStream: func(_ context.Context, req handlers.ModelExecutionRequest) (handlers.ModelExecutionStream, *interfaces.ErrorMessage) {
 		chunks := make(chan handlers.ModelExecutionChunk, 1)
 		chunks <- handlers.ModelExecutionChunk{Payload: []byte(fmt.Sprintf(`{"model":%q,"modelVersion":%q,"text":"opaque grok-4.7"}`, req.Model, req.Model))}
