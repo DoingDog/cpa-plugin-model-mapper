@@ -20,6 +20,7 @@ import (
 
 	pluginabi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	pluginapi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/tidwall/gjson"
 	"gopkg.in/yaml.v3"
 )
 
@@ -1714,10 +1715,7 @@ type modelRouteRPCRequest struct {
 }
 
 func interactionsUsesAgent(body []byte) bool {
-	var request struct {
-		Agent string `json:"agent"`
-	}
-	return json.Unmarshal(body, &request) == nil && request.Agent != ""
+	return gjson.ValidBytes(body) && strings.TrimSpace(gjson.GetBytes(body, "agent").String()) != ""
 }
 
 func canonicalizeHeaders(headers http.Header) {

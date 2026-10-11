@@ -34,6 +34,7 @@ import (
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/tidwall/gjson"
 	"gopkg.in/yaml.v3"
 )
 
@@ -1947,18 +1948,16 @@ func TestModelMapperFunctionalInteractionsAgent(t *testing.T) {
 					return
 				}
 				requestBody = raw
-				var req struct {
-					Agent, Model string
-					Stream       bool
-				}
-				if err := json.Unmarshal(raw, &req); err != nil {
-					t.Error(err)
+				if !gjson.ValidBytes(raw) {
+					t.Errorf("invalid agent upstream JSON=%s", raw)
 					return
 				}
-				if req.Agent != "research-agent" || req.Model != "" || r.URL.Path != "/v1beta/interactions" || r.Header.Get("X-Goog-Api-Key") != "fake-upstream-key" {
+				stream := gjson.GetBytes(raw, "stream").Bool()
+				wantRequest := fmt.Sprintf(`{"agent":"research-agent","input":"hello","stream":%v}`, stream)
+				if string(raw) != wantRequest || strings.TrimSpace(gjson.GetBytes(raw, "agent").String()) != "research-agent" || gjson.GetBytes(raw, "model").String() != "" || r.URL.Path != "/v1beta/interactions" || r.Header.Get("X-Goog-Api-Key") != "fake-upstream-key" {
 					t.Errorf("agent upstream path=%s headers=%v body=%s", r.URL.Path, r.Header, raw)
 				}
-				if req.Stream {
+				if stream {
 					w.Header().Set("Content-Type", "text/event-stream")
 					_, _ = io.WriteString(w, wire)
 				} else {
@@ -2021,6 +2020,201 @@ func TestModelMapperFunctionalInteractionsAgent(t *testing.T) {
 					t.Fatalf("agent enabled/disabled bytes differ=%q want=%q", raw, controls[i])
 				}
 				t.Logf("native Interactions agent stream=%v mappingEnabled=%v upstream=%s output=%q", stream, enabled, requestBody, raw)
+			}
+		})
+	}
+
+	for _, control := range []string{"direct", "disabled", "enabled-unmapped", "mapped"} {
+		t.Run(control, func(t *testing.T) {
+			var mu sync.Mutex
+			var records []gCPAUpstreamRecord
+			modelResponse := func(model string) (string, string, string) {
+				body := fmt.Sprintf(`{"id":"interaction-model","model":%q,"status":"completed","outputs":[{"text":"opaque grok-4.6/grok-4.7 中文"}]}`, model)
+				start := fmt.Sprintf(`{"event_type":"interaction.created","interaction":{"model":%q,"status":"in_progress"}}`, model)
+				completed := fmt.Sprintf(`{"event_type":"interaction.completed","interaction":{"model":%q,"status":"completed","outputs":[{"text":"opaque grok-4.6/grok-4.7 中文"}]}}`, model)
+				return body, start, completed
+			}
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				raw, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if !gjson.ValidBytes(raw) {
+					t.Errorf("invalid upstream JSON=%s", raw)
+					return
+				}
+				model := strings.TrimSpace(gjson.GetBytes(raw, "model").String())
+				agent := strings.TrimSpace(gjson.GetBytes(raw, "agent").String())
+				response, created, terminal := body, start, completed
+				if agent == "" {
+					response, created, terminal = modelResponse(model)
+				}
+				stream := gjson.GetBytes(raw, "stream").Bool()
+				if stream {
+					response = "event: interaction.created\ndata: " + created + "\n\nevent: interaction.completed\ndata: " + terminal + "\n\nevent: done\ndata: [DONE]\n\n"
+					w.Header().Set("Content-Type", "text/event-stream")
+				} else {
+					w.Header().Set("Content-Type", "application/json")
+				}
+				mu.Lock()
+				records = append(records, gCPAUpstreamRecord{body: bytes.Clone(raw), response: []byte(response), model: model, path: r.URL.RequestURI(), headers: r.Header.Clone()})
+				mu.Unlock()
+				_, _ = io.WriteString(w, response)
+			}))
+			t.Cleanup(upstream.Close)
+			cfg := &config.Config{}
+			provider := runtimeexecutor.NewGeminiInteractionsExecutor(cfg)
+			manager := coreauth.NewManager(nil, nil, nil)
+			manager.SetConfig(cfg)
+			manager.RegisterExecutor(provider)
+			auth := &coreauth.Auth{ID: "functional-agent-classification-auth", Provider: provider.Identifier(), Status: coreauth.StatusActive, Attributes: map[string]string{"api_key": "fake-upstream-key", "base_url": upstream.URL, "proxy_url": "direct"}}
+			if _, err := manager.Register(context.Background(), auth); err != nil {
+				t.Fatal(err)
+			}
+			registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "gemini-2.5-flash"}, {ID: "grok-4.6"}, {ID: "grok-4.7"}})
+			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+			base := handlers.NewBaseAPIHandlers(&cfg.SDKConfig, manager)
+			var host *Host
+			if control != "direct" {
+				host = gCPALoadNative(t, &gCPALocalProducer{base: base}, control != "disabled")
+				if control == "enabled-unmapped" {
+					dir := filepath.Dir(filepath.Dir(filepath.Dir(os.Getenv("CPA_SMOKE_PLUGIN"))))
+					data := fmt.Sprintf("plugins:\n  enabled: true\n  dir: %q\n  configs:\n    model-mapper:\n      enabled: true\n      global_rules: 'other=>grok-4.7'\n", filepath.ToSlash(dir))
+					var unmapped config.Config
+					if err := yaml.Unmarshal([]byte(data), &unmapped); err != nil {
+						t.Fatal(err)
+					}
+					host.ApplyConfig(context.Background(), &unmapped)
+					if len(host.activeRecords()) != 1 {
+						t.Fatal("unmapped native reconfigure failed")
+					}
+				}
+				base.SetPluginHost(host)
+				base.SetModelRouterHost(host)
+			}
+			router := gin.New()
+			router.POST("/v1beta/interactions", geminihandlers.NewGeminiAPIHandler(base).Interactions)
+			server := httptest.NewServer(router)
+			t.Cleanup(server.Close)
+			for _, tt := range []struct {
+				name, members string
+				native        bool
+				badRequest    string
+			}{
+				{name: "ASCII-tab", members: `"agent":"\t","model":"grok-4.6"`},
+				{name: "empty", members: `"agent":"","model":"grok-4.6"`, native: false, badRequest: ""},
+				{name: "ASCII-space", members: `"agent":" ","model":"grok-4.6"`, native: false, badRequest: ""},
+				{name: "ASCII-newline", members: `"agent":"\n","model":"grok-4.6"`, native: false, badRequest: ""},
+				{name: "NBSP", members: `"agent":" ","model":"grok-4.6"`, native: false, badRequest: ""},
+				{name: "Em-Space", members: `"agent":" ","model":"grok-4.6"`, native: false, badRequest: ""},
+				{name: "Ideographic-Space", members: `"agent":"　","model":"grok-4.6"`, native: false, badRequest: ""},
+				{name: "mixed-whitespace", members: `"agent":" \t　","model":"grok-4.6"`, native: false, badRequest: ""},
+				{name: "null", members: `"agent":null,"model":"grok-4.6"`, native: false, badRequest: ""},
+				{name: "Agent", members: `"Agent":"grok-4.6","model":"grok-4.6"`, native: false, badRequest: ""},
+				{name: "AGENT", members: `"AGENT":"grok-4.6","model":"grok-4.6"`, native: false, badRequest: ""},
+				{name: "escaped-uppercase", members: `"\u0041gent":"grok-4.6","model":"grok-4.6"`, native: false, badRequest: ""},
+				{name: "empty-first", members: `"agent":"","agent":"grok-4.6","model":"grok-4.6"`, native: false, badRequest: ""},
+				{name: "null-first", members: `"agent":null,"agent":"grok-4.6","model":"grok-4.6"`, native: false, badRequest: ""},
+				{name: "whitespace-first", members: `"agent":" \t　","agent":"grok-4.6","model":"grok-4.6"`, native: false, badRequest: ""},
+				{name: "escaped-lowercase", members: `"\u0061gent":"grok-4.6"`, native: true, badRequest: ""},
+				{name: "normal-native", members: `"agent":"grok-4.6"`, native: true, badRequest: ""},
+				{name: "trimmed-native", members: `"agent":" \tgrok-4.6　"`, native: true, badRequest: ""},
+				{name: "native-then-agent-empty", members: `"agent":"grok-4.6","agent":""`, native: true, badRequest: ""},
+				{name: "native-then-agent-null", members: `"agent":"grok-4.6","agent":null`, native: true, badRequest: ""},
+				{name: "native-then-agent-true", members: `"agent":"grok-4.6","agent":true`, native: true, badRequest: ""},
+				{name: "native-then-agent-false", members: `"agent":"grok-4.6","agent":false`, native: true, badRequest: ""},
+				{name: "native-then-agent-number", members: `"agent":"grok-4.6","agent":17`, native: true, badRequest: ""},
+				{name: "native-then-agent-object", members: `"agent":"grok-4.6","agent":{"text":"opaque"}`, native: true, badRequest: ""},
+				{name: "native-then-agent-array", members: `"agent":"grok-4.6","agent":["opaque"]`, native: true, badRequest: ""},
+				{name: "native-then-Agent-empty", members: `"agent":"grok-4.6","Agent":""`, native: true, badRequest: ""},
+				{name: "native-then-Agent-null", members: `"agent":"grok-4.6","Agent":null`, native: true, badRequest: ""},
+				{name: "native-then-Agent-true", members: `"agent":"grok-4.6","Agent":true`, native: true, badRequest: ""},
+				{name: "native-then-Agent-false", members: `"agent":"grok-4.6","Agent":false`, native: true, badRequest: ""},
+				{name: "native-then-Agent-number", members: `"agent":"grok-4.6","Agent":17`, native: true, badRequest: ""},
+				{name: "native-then-Agent-object", members: `"agent":"grok-4.6","Agent":{"text":"opaque"}`, native: true, badRequest: ""},
+				{name: "native-then-Agent-array", members: `"agent":"grok-4.6","Agent":["opaque"]`, native: true, badRequest: ""},
+				{name: "native-then-AGENT-empty", members: `"agent":"grok-4.6","AGENT":""`, native: true, badRequest: ""},
+				{name: "native-then-AGENT-null", members: `"agent":"grok-4.6","AGENT":null`, native: true, badRequest: ""},
+				{name: "native-then-AGENT-true", members: `"agent":"grok-4.6","AGENT":true`, native: true, badRequest: ""},
+				{name: "native-then-AGENT-false", members: `"agent":"grok-4.6","AGENT":false`, native: true, badRequest: ""},
+				{name: "native-then-AGENT-number", members: `"agent":"grok-4.6","AGENT":17`, native: true, badRequest: ""},
+				{name: "native-then-AGENT-object", members: `"agent":"grok-4.6","AGENT":{"text":"opaque"}`, native: true, badRequest: ""},
+				{name: "native-then-AGENT-array", members: `"agent":"grok-4.6","AGENT":["opaque"]`, native: true, badRequest: ""},
+				{name: "nonstring-true-with-model", members: `"agent":true,"model":"grok-4.6"`, native: false, badRequest: "request requires exactly one of model or agent"},
+				{name: "nonstring-false-with-model", members: `"agent":false,"model":"grok-4.6"`, native: false, badRequest: "request requires exactly one of model or agent"},
+				{name: "nonstring-zero-with-model", members: `"agent":0,"model":"grok-4.6"`, native: false, badRequest: "request requires exactly one of model or agent"},
+				{name: "nonstring-number-with-model", members: `"agent":17,"model":"grok-4.6"`, native: false, badRequest: "request requires exactly one of model or agent"},
+				{name: "nonstring-object-with-model", members: `"agent":{"text":"opaque"},"model":"grok-4.6"`, native: false, badRequest: "request requires exactly one of model or agent"},
+				{name: "nonstring-array-with-model", members: `"agent":["opaque"],"model":"grok-4.6"`, native: false, badRequest: "request requires exactly one of model or agent"},
+				{name: "invalid-json", members: `"agent":"grok-4.6","model":`, native: false, badRequest: "invalid JSON body"},
+				{name: "missing", members: `"model":"grok-4.6"`, native: false, badRequest: ""},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					for _, stream := range []bool{false, true} {
+						t.Run(fmt.Sprintf("stream=%v", stream), func(t *testing.T) {
+							request := []byte(fmt.Sprintf(`{%s,"input":"hello","stream":%v}`, tt.members, stream))
+							wantRequest := string(request)
+							upstreamModel := "grok-4.6"
+							mapped := control == "mapped" && !tt.native && tt.badRequest == ""
+							if mapped {
+								wantRequest = strings.Replace(wantRequest, `"model":"grok-4.6"`, `"model":"grok-4.7"`, 1)
+								upstreamModel = "grok-4.7"
+							}
+							var route pluginapi.ModelRouteResponse
+							var routeHandled bool
+							if host != nil && tt.badRequest == "" {
+								route, routeHandled = host.RouteModel(context.Background(), pluginapi.ModelRouteRequest{SourceFormat: "interactions", RequestedModel: "grok-4.6", Stream: stream, Body: request})
+							}
+							mu.Lock()
+							records = nil
+							mu.Unlock()
+							status, headers, raw := eHTTP(t, server, "/v1beta/interactions", request)
+							mu.Lock()
+							observed := append([]gCPAUpstreamRecord(nil), records...)
+							mu.Unlock()
+							t.Logf("Interactions HTTP control=%s request=%s route=%+v routeHandled=%v status=%d calls=%d headers=%v response=%q", control, request, route, routeHandled, status, len(observed), headers, raw)
+							if tt.badRequest != "" {
+								want := fmt.Sprintf(`{"error":{"message":%q,"type":"invalid_request_error"}}`, tt.badRequest)
+								if status != 400 || len(observed) != 0 || string(raw) != want {
+									t.Fatalf("entry control status=%d calls=%d body=%q want=%q", status, len(observed), raw, want)
+								}
+								t.Logf("Interactions entry control=%s request=%s status=%d calls=%d body=%q", control, request, status, len(observed), raw)
+								return
+							}
+							if status != 200 || len(observed) != 1 {
+								t.Fatalf("Interactions status=%d calls=%d body=%q", status, len(observed), raw)
+							}
+							if host != nil && (routeHandled != mapped || route.Handled != mapped || (mapped && (route.TargetKind != pluginapi.ModelRouteTargetSelf || route.TargetModel != ""))) {
+								t.Errorf("agent route=%+v handled=%v want=%v body=%s", route, routeHandled, mapped, request)
+							}
+							record := observed[0]
+							wantModel := upstreamModel
+							if tt.native {
+								wantModel = ""
+							}
+							if string(record.body) != wantRequest || record.model != wantModel || record.path != "/v1beta/interactions" || record.headers.Get("X-Goog-Api-Key") != "fake-upstream-key" || record.headers.Get("Content-Type") != "application/json" || record.headers.Get("Api-Revision") != "2026-05-20" || record.headers.Get("Content-Length") != fmt.Sprint(len(record.body)) {
+								t.Fatalf("upstream identity/body=%+v raw=%s want=%s", record, record.body, wantRequest)
+							}
+							wantBody, wantStart, wantCompleted := body, start, completed
+							upstreamBody, upstreamStart, upstreamCompleted := body, start, completed
+							if !tt.native {
+								wantBody, wantStart, wantCompleted = modelResponse("grok-4.6")
+								upstreamBody, upstreamStart, upstreamCompleted = modelResponse(upstreamModel)
+							}
+							contentType := "application/json"
+							if stream {
+								wantBody = "event: interaction.created\ndata: " + wantStart + "\n\nevent: interaction.completed\ndata: " + wantCompleted + "\n\nevent: done\ndata: [DONE]\n\n"
+								upstreamBody = "event: interaction.created\ndata: " + upstreamStart + "\n\nevent: interaction.completed\ndata: " + upstreamCompleted + "\n\nevent: done\ndata: [DONE]\n\n"
+								contentType = "text/event-stream"
+							}
+							if string(raw) != wantBody || string(record.response) != upstreamBody || !strings.HasPrefix(headers.Get("Content-Type"), contentType) {
+								t.Fatalf("Interactions response=%q want=%q upstream=%q wantUpstream=%q headers=%v", raw, wantBody, record.response, upstreamBody, headers)
+							}
+							t.Logf("Interactions control=%s native=%v provider=%s auth=%s request=%s upstream=%s upstreamHeaders=%v uri=%s calls=%d response=%q upstreamResponse=%q headers=%v", control, tt.native, provider.Identifier(), auth.ID, request, record.body, record.headers, record.path, len(observed), raw, record.response, headers)
+						})
+					}
+				})
 			}
 		})
 	}

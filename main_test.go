@@ -1826,7 +1826,7 @@ func TestHandleModelRouteLeavesInteractionsAgentsNative(t *testing.T) {
 		handled bool
 	}{
 		{name: "agent", body: `{"agent":"client"}`, handled: false},
-		{name: "whitespace agent", body: `{"agent":" ","model":"client"}`, handled: false},
+		{name: "whitespace agent", body: `{"agent":" ","model":"client"}`, handled: true},
 		{name: "empty agent with model", body: `{"agent":"","model":"client"}`, handled: true},
 		{name: "model", body: `{"model":"client"}`, handled: true},
 	} {
