@@ -9,9 +9,9 @@ baseline: 7f5e50aa444d31298e3086b0435552bc0ebb9747
 
 ## 目标和范围
 
-修复 mapped Responses 对非 `response.*` 逻辑事件（error、keepalive）的边界识别、Codex 完成别名和 Interactions agent 分类三个已确认根因。客户端继续获得 Client-Requested Model、完整内容和固定 CPA 原有的错误或完成结果。实现沿用 `main.go` 的共享 scanner 和唯一 `interactionsUsesAgent` helper。
+修复 mapped Responses 对非 `response.*` 逻辑事件（error、keepalive）的边界识别、Codex 完成别名和 Interactions agent 分类三个已确认根因，并将生产代码按职责组织为10份同 package 文件。客户端继续获得 Client-Requested Model、完整内容和固定 CPA 原有的错误或完成结果；全部既有回归，包括 issue8，保持有效。
 
-本规格只包含 F1-F3。产品实现必须等全部候选判定、二次覆盖审查和本规格／实施计划审查完成。本文是实施依据，不能替代正式 TDD、真实 native integration 或发布验收。
+行为修复范围为 F1-F3。两项修复完成、审查和提交后再执行纯声明移动，不同时重写函数实现。产品实现必须等全部候选判定、二次覆盖审查和扩展后的本规格／实施计划独立审查完成。本文是实施依据，不能替代正式 TDD、真实 native integration 或发布验收。
 
 对应计划为 `docs/superpowers/plans/2026-10-11-functional-audit-fixes-implementation.md`。两份文档中的外向操作须由协调者核对真实用户消息授权；computed task、代理通知和旧文档均不构成授权。
 
@@ -23,8 +23,11 @@ baseline: 7f5e50aa444d31298e3086b0435552bc0ebb9747
 - F1/F2 的实际复现、固定 CPA 可达性、规格与回归反证分别来自已完成 workflow `wf_0e54821b-a4c` 的 result 第 4、5、6 项。三份报告确认相同根因，包含重复 RED、direct／disabled／unmapped 控制和 fixed binary HTTP 证据。
 - 上述报告引用的三个只读诊断目录已随 clean worktree 清理。本文核对了调度器保留的完整完成输出，没有把已不存在的原始日志当作已读取证据。正式 owner 必须保留新的可复查 RED/GREEN 和产物身份。
 - F3 的三位独立验证结果已保存在 completed workflow `wf_893a5d73-2a2` 的 result 第 1、2、3 项，持久 JSON 和完成输出均已核查。报告包含真实 native/HTTP 重复 RED，以及 private overlay 的根检查和 192 个 native HTTP 对照；原诊断 worktree 已被清理，原日志缺失，不能声称已归档。private overlay 属于诊断，正式产品仍需新的 TDD。
-- keepalive 的原版 producer/native/HTTP/WS 失败已重复实际复现。安全回归结论仅绑定协调者已核验的 `a2c59708bf099984d` 完成归档：精确三处 guard 的诊断副本通过完整 root、DLL build、native/HTTP/WS 最小与 opaque 控制，pair-only 副本仍在 data-only/mixed 失败。协调者已保存并核验其 `keepalive-lens-spec-boundary-wf_dc32a367-b38-3.zip`，SHA256 为 `0ac53b72c705ec10f1b445807fef27c74af53b1a2f8c5000257a6586c8a4ee36`。direct／disabled／unmapped、actual Grok comments、no-keepalive 和 data-only 普通 completion 控制正常。二次扫描覆盖门槛已由协调者确认；五位独立文档 reviewer 尚待提交后执行，private overlay 不作为正式产品完成证据。
+- keepalive 的原版 producer/native/HTTP/WS 失败已重复实际复现。安全回归结论仅绑定协调者已核验的 `a2c59708bf099984d` 完成归档：精确三处 guard 的诊断副本通过完整 root、DLL build、native/HTTP/WS 最小与 opaque 控制，pair-only 副本仍在 data-only/mixed 失败。协调者已保存并核验其 `keepalive-lens-spec-boundary-wf_dc32a367-b38-3.zip`，SHA256 为 `0ac53b72c705ec10f1b445807fef27c74af53b1a2f8c5000257a6586c8a4ee36`。direct／disabled／unmapped、actual Grok comments、no-keepalive 和 data-only 普通 completion 控制正常。二次扫描覆盖门槛已由协调者确认。原文档提交 `93d99213bb6a8fe45af2770d92faf95ea1f4e2a9` 的五位独立 reviewer 均返回 `findings=[]`；该结果只覆盖原 F1-F3 文档，扩展后的模块化和完整回归要求仍须独立审查。private overlay 不作为正式产品完成证据。
 - 已核查当前产品、唯一永久 CPA fixture、固定 CPA 的相关 parser／producer／translator 源码，以及 `CONCEPTS.md`、`docs/solutions/workflow-issues/model-mapper-release-automation-alignment.md`。旧功能修复和 canonical library 规格用于保持现有边界，不沿用其历史未完成状态或候选版本。
+- 本次扩展全文读取已完成任务 `wa2mmgu21.output` 的三份模块设计、`wttct1sv9.output` 的 issue8／完整回归报告和 `wa7ayrae9.output` 的原文档及五份独立审查结果。模块方案采用第三份报告的10文件划分，并用另两份报告核对初始化、CGo 和构建边界。调查 worktree 的中间清单可能已清理；正式 module owner 必须从实际 post-fix HEAD 重新取得 AST，不能依赖旧行号或缺失文件。
+- 本次文档 worktree 从 clean BASE 通过 fast-forward 接入上述完整文档提交链，未重写旧提交。当前 `main.go`、`abi_cgo.go` 全文及 Makefile／workflow、canonical lifetime spec／plan 已重新核查；本次仅扩展两文档，未运行产品 tests/build。
+- issue8 四项产品修复 `4bc47fe0c3718a2194658c90e28775be284336b9`、`e9c005b4000628a62da0897f87869a85b5d48031`、`8fe51c134e327a21e56e4fb3205d0cdf50e0847a`、`cf39f6e5575a6a5d8de36e707687399eeadbae68` 均已用 Git 核对为 BASE ancestors；本地 `v0.5.13` tag 指向 BASE。完成报告确认它是首次正式发布这些修复的 Release。原 terminal-order 提交 `8b7bd9a0d135251878792b3740bc06a7da7ede00` 早于 issue8，单列为历史控制。
 
 | 编号 | 已观察结果 | 根因和实际入口 | 本次修复归属 |
 | --- | --- | --- | --- |
@@ -40,7 +43,7 @@ error-only direct WS 本来就 close 1006，当前固定 CPA 不返回正常 err
 
 - R1. 固定 Responses output units 的 `error` 和 `keepalive` 完整逻辑单位必须恢复字段和事件边界，覆盖独立 event/data pair 与连续 data-only。error 保留原 `code`、`message`、`param` 和其他 JSON 字节，单 error 与 created 后 error 的 HTTP 保持 direct 原错误；keepalive 后的完整 completion 在 mapped HTTP/WS 正常到达。白名单外内容不变，不生成缺失数据引起的 generic/premature-terminal error。
 - R2. 接受 `event: response.done`／`type: response.completed` 这一方向的实际 alias，保留原 header 和 data.type。mapped HTTP 和 WS 必须获得完整 completed output，现有白名单内的 model 恢复为 Client-Requested Model。
-- R3. 新增 allowlist 仅为精确 `error`、`keepalive`，event/data pair 仍要求同名 type，F2 仅允许 R2 的方向；data-only 仍必须是完整合法且 type 被认可的 JSON。保留原 exact-match 和真正 mismatch，不接受任意 unknown event/type 或反方向 alias，不改写 discriminator、opaque metadata、unknown fields 或工具文本。
+- R3. 新增 allowlist 仅为精确 `error`、`keepalive`，event/data pair 仍要求同名 type，F2 仅允许 R2 的方向；data-only 仍必须是完整合法且 type 被认可的 JSON。保留原 exact-match 和真正 mismatch，不接受任意 unknown event/type 或反方向 alias，不改写 discriminator、opaque metadata、unknown fields 或工具文本。event/type 配对要求只约束无标准 delimiter 的 output-unit 边界；generic 标准 SSE 的 error／keepalive 和 header/type mismatch 继续按既有白名单恢复模型。
 - R4. 保留当前 output-unit 的顺序与派发时点，generic SSE wire 的 LF／CR／CRLF、BOM、合法分片、迟到 delimiter 和 metadata 保字节行为不变。HTTP 网络分段经过真实 producer Scanner，不能直接当作 plugin callback 的字段边界。
 
 ### Interactions 路径选择
@@ -59,6 +62,13 @@ error-only direct WS 本来就 close 1006，当前固定 CPA 不返回正常 err
 - R13. `pluginVersion` 默认 `0.0.0-dev` 不变。下一 patch 候选为 `v0.5.14`，在 VERSION 注入 build/package 前及最终发布前两次核实 local/remote tag 和 Release 未占用；实际最终版本、SHA、CI 和 Release 仅在完成后记录。
 - R14. 完成审查及终验后，按真实用户授权退出协调 worktree、合并本地 `main`、push `main` 和 tag，核验最终 SHA 的七平台 CI、Release 全部 ZIP、checksum、根 `LICENSE` 和注册 Version。不创建 PR，不修改 CPA，不处理本机既有删除故障，不删除或改写其他 worktree／`.claude`／配置。
 
+### 生产代码模块化与完整回归
+
+- R15. 生产代码采用下文的10文件布局，保持同一个 `package main`、Go module 和现有构建入口。只移动完整声明、分配各文件 imports、作必要排版并拆分原混合 var group；不新增 package、interface、wrapper、配置、build tag 或平台文件名后缀。
+- R16. 模块化相对已合并且 GREEN 的 F1-F3 源码保持全部声明、receiver、signature、body、type fields/tags、initializer、const block、directive、共享状态和 ABI 等价。`abi_cgo.go`、tests、benchmark 和 fixture 相对模块化起点逐字不变；纯移动采用前后验收，不制造虚假 RED。当前架构说明只精确更新 `CLAUDE.md` 和 README 的必要源码布局。
+- R17. 完整保留 BASE 的323个 root Tests、60个显式 scripts Tests、24个 CPA fixture Tests及29个 Benchmark声明，并保留全部展开的 subtests/table cases、expected keys、断言、数据规模和内部时限。唯一已确认的旧 oracle 纠正是 whitespace agent 的 `Handled=false` 改为 true；Agent fixture 的必需 oracle 修改只限原 Agent 函数及同版 GJSON import。新增 cases 单列，不删除、skip、放宽或替换原控制。新增回归以现有输出行为、model_route RPC、forwarder 和真实 producer/native/HTTP/WS 入口为测试边界，不新增依赖 helper 实现或私有 scanner 状态的断言。
+- R18. post-fix、post-modularization 和 final 三阶段分别取得完整本地验收及源码／产物身份，使用默认 `0.0.0-dev` 动态库执行真实 integration；候选版本 build/package 和真实 ABI registration Version 使用独立产物。最终 SHA 的 Ubuntu `make integration` 和七平台 CI／Release 必须实际成功，平台构建与实际 runtime 验证分别报告。
+
 ## 设计
 
 ### Shared Responses scanner
@@ -73,11 +83,70 @@ F1/F2 共用 scanner、回归文件和 fixture，因此由同一个 stream owner
 
 ### Shared Interactions helper
 
-最小完整修改是将 `interactionsUsesAgent` 的 Go struct 判定替换为同版 GJSON 的 validity、exact key lookup、`String()` 和 trim 判定。GJSON 直接 import、直接 require；`go.sum` 由正常 Go module 流程生成，并核对没有无关依赖升级。现有 `strings` import 可以复用。
+最小完整修改是将 `interactionsUsesAgent` 的 Go struct 判定替换为同版 GJSON 的 `ValidBytes`、`GetBytes(body, "agent").String()` 和 `strings.TrimSpace` 判定。GJSON 直接 import、直接 require；`go.sum` 由正常 Go module 流程生成，并核对没有无关依赖升级。现有 `strings` import 可以复用。
 
 CPA handler 的 `parseInteractionsRequestTarget` 先验证 JSON，再读取精确的 model/agent；产品 helper 只负责是否应绕过 mapper。不要复制 CPA 的整个请求验证器。当前只有 `handleModelRoute` 调用该 helper；`handleExecutorExecute` 和 `prepareExecutorStream` 通过路由结果间接受影响，不增加第二份 agent 判断。
 
 正式 RED 阶段将 `TestHandleModelRouteLeavesInteractionsAgentsNative` 的 `whitespace agent` 预期改成 `Handled=true`，保持原输入和其他断言。新增独立 root regression 覆盖 R5-R7，不将错误的旧预期保留到 GREEN 阶段。
+
+### 生产模块和完整声明归属
+
+R15 采用10文件布局，包含现有 `main.go`／`abi_cgo.go` 和8份新文件。下面清单绑定 BASE 的188个命名声明（main179、ABI9）；169个非 import 顶层 declarations 和174条另一分组记录属于不同统计单位，不混用、不固定最终函数数量。U6 从实际 post-fix HEAD 重新清点全部声明、唯一分配新增 helper 并核验 R16，不能按 BASE 行号复制旧实现。
+
+| 文件 | 职责 | BASE 命名声明数 |
+| --- | --- | ---: |
+| `main.go` | entry、pluginVersion、registration、RPC、host callback、structured error/envelope | 25 |
+| `abi_cgo.go` | 原 CGo ABI、C preamble、exports、长度校验和 buffer ownership | 9 |
+| `config.go` | Config、JSON/YAML lifecycle 解码、编译、配置快照／发布 | 17 |
+| `model_router.go` | rule selection、model route、F3 helper、authenticated caller／cache | 20 |
+| `rules.go` | DSL token/rule、解析、ASCII case、caller 条件和顺序 replacement | 18 |
+| `executor.go` | 共用 executor request/payload、headers、非流执行 | 5 |
+| `executor_stream.go` | setup/admission、worker、forwarding、terminal／close／shutdown | 24 |
+| `json_model.go` | 请求顶层 model、响应白名单、JSON byte edits、marker 和现有 JSON helpers | 21 |
+| `sse_rewriter.go` | SSE 状态、BOM、metadata、delimiterless scanner、data 恢复／framing | 30 |
+| `stream_rewriter.go` | chunk 分类、raw JSON scanner、pending、array/value、Flush/Finish | 19 |
+
+完整 BASE 声明归属如下，方法按 receiver 区分，现有 `ForTest` helpers 和 wrappers 均保留。
+
+- `main.go`：const `pluginRPCSchemaVersion`；types `registration`、`registrationCapabilities`、`hostCallback`、`hostCaller`、`structuredPluginError`；vars `pluginVersion`、`hostAPIMu`、`hostCallbackFn`；functions `main`、`pluginRegistration`、`handlePluginRegister`、`handlePluginReconfigure`、`handleExecutorIdentifier`、`newStructuredPluginError`、`structuredError`、`wrapEnvelope`、`marshalErrorEnvelope`、`errorEnvelope`、`handleMethod`、`callHost`、`setHostCallbackForTest`、`setHostCallback`；`*structuredPluginError` methods `Error`、`Unwrap`。
+- `abi_cgo.go`：const block `maxCIntLength`、`maxPluginResponseBytes`；functions `cIntLength`、`copyPluginRequest`、`pluginResponseLength`、`cliproxy_plugin_init`、`cliproxyPluginCall`、`cliproxyPluginFree`、`cliproxyPluginShutdown`。整个文件逐字保留，包括8个 C typedef、3个前向声明、3个 static helpers、C includes、`import "C"`、`//go:build cgo`、四个 `//export` 及字段顺序／casts。
+- `config.go`：完整 const block `rulesStackModeOff`、`rulesStackModeSpecificFirst`、`rulesStackModeGlobalFirst`；types `Config`、`lifecycleYAMLConfig`；vars `loadedConfigMu`、`loadedCfg`；functions `decodeConfig`、`compileConfig`、`compileRuleSet`、`loadedConfig`、`publishLoadedConfig`、`setLoadedConfigForTest`、`applyLifecycleConfig`、`yamlStringConfigField`、`decodeLifecycleConfig`、`defaultConfig`。
+- `model_router.go`：const `callerPatternCacheGenerationSize`，完整 const block `callerScopeMetadataKey`、`callerScopeDomain`；types `callerPatternCacheKey`、`callerPatternCacheState`、`routeDecision`、`ruleSelection`、`modelRouteRPCRequest`；vars `callerPatternCacheMu`、`callerPatternCache`；functions `resetCallerPatternCache`、`selectRules`、`callerAPIKeyForSelectedRules`、`interactionsUsesAgent`、`handleModelRoute`、`routeModel`、`callerScope`、`callerScopeFromMetadata`、`callerAPIKey`、`callerPatternMatch`。F3 的最终 helper 和 GJSON import 一起移动。
+- `rules.go`：types `token`、`caseOperation`、`rule`；完整 iota block `caseOperationNone`、`caseOperationLower`、`caseOperationUpper`；functions `parseRules`、`splitRuleEntries`、`hasUnescapedCommentMarker`、`findRuleSeparator`、`splitEscaped`、`parseFind`、`parseReplace`、`applyASCIIModelCase`、`callerMatchesRule`、`applyRules`、`matchTokens`、`buildReplacement`。
+- `executor.go`：types `executorRPCRequest`、`hostModelExecutePayload`；functions `canonicalizeHeaders`、`removeChangedBodyHeaders`、`handleExecutorExecute`。
+- `executor_stream.go`：type `executorStream`；vars `errExecutorStreamShutdown`、`executorStreamLifecycle`；functions `isEventStreamContentType`、`releaseExecutorStreamSetup`、`emitRewritten`、`handleExecutorExecuteStream`、`resetExecutorStreamLifecycle`、`beginExecutorStreamPreparation`、`finishExecutorStreamPreparation`、`admitExecutorStream`、`unregisterExecutorStream`、`shutdownExecutorStreams`、`prepareExecutorStream`、`startExecutorStream`、`joinStreamErrors`、`runStreamForward`；`*executorStream` methods `closeHost`、`closePlugin`、`emit`、`processPayload`、`flushAndEmit`、`selectTerminal`、`finish`。
+- `json_model.go`：types `jsonByteEdit`、`responseModelMarkerScanner`；functions `rewriteRequestModel`、`restoreResponseModel`、`rewriteTopLevelModel`、`applyJSONByteEdits`、`rewriteTopLevelModelCanonical`、`findTopLevelModelValue`、`topLevelModelKey`、`skipTopLevelModelJSONSpace`、`skipTopLevelModelJSONString`、`skipTopLevelModelJSONValue`、`hexNibble`、`escapedResponseModelKey`、`mightContainResponseModelField`、`rewriteResponseModelFields`、`rewriteResponseModelFieldsWithReplacement`、`rewriteResponseModelFieldsWithReplacementChecked`、`collectResponseModelEdits`、`responseModelStringEqual`；`*responseModelMarkerScanner` method `feed`。
+- `sse_rewriter.go`：types `sseRewriter`、`delimiterlessResponsesEventScanner`；var `utf8SSEBOM`；functions `newSSERewriter`、`sseFieldValue`、`splitSSELine`、`hasSSEDataField`、`appendUnchangedSSEEvent`、`sseLineEnding`、`findSSEEventDelimiter`、`isResponsesMetadataField`、`sseEventDelimiter`、`isColonlessSSEChunk`、`completeSSEEvents`、`sseContainsEscapedModelField`、`hasSSEDoneEvent`、`frameSSEData`、`frameSSEEvent`；`*sseRewriter` methods `resetDelimiterlessResponsesEventScanner`、`consumeLeadingBOM`、`flushLeadingBOM`、`restoreResponseModelCandidate`、`restoreResponseModel`、`Write`、`Flush`、`drain`、`rewritePendingEvent`、`rewriteMultiDataEvent`、`rewriteEvent`、`findDelimiterlessResponsesEventEnd`。F1/F2 实际新增的 SSE 识别声明也归此文件。
+- `stream_rewriter.go`：const `maxPendingStreamBytes`；types `streamChunkRewriter`、`rawJSONScan`；functions `newStreamChunkRewriter`、`splitJSONValues`、`hasSSEFieldPrefix`、`couldStartJSONValue`、`isSSEChunk`、`isIncompleteSSEPrefix`；`*rawJSONScan` method `advance`；`*streamChunkRewriter` methods `retainPending`、`Write`、`writeRawJSONArray`、`writeSSESuffix`、`rawJSONChunks`、`tryRawJSONChunks`、`Flush`、`Finish`、`frameRawJSON`。
+
+保留 aliases `pluginabi`／`pluginapi` 和 paths `github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi`／`github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi`。各文件 imports 按下表分配，再由 U6 核对修复后新增声明的实际使用。
+
+| 文件 | imports |
+| --- | --- |
+| `main.go` | `encoding/json`、`errors`、`fmt`、`sync`、`pluginabi`、`pluginapi` |
+| `config.go` | `bytes`、`encoding/base64`、`encoding/json`、`fmt`、`io`、`strings`、`sync`、`gopkg.in/yaml.v3` |
+| `model_router.go` | `crypto/sha256`、`encoding/hex`、`encoding/json`、`net/http`、`net/url`、`strings`、`sync`、`pluginapi`、F3 的 `github.com/tidwall/gjson` |
+| `rules.go` | `fmt`、`strconv`、`strings`、`unicode` |
+| `executor.go` | `encoding/json`、`fmt`、`net/http`、`net/url`、`pluginabi`、`pluginapi` |
+| `executor_stream.go` | `encoding/json`、`errors`、`fmt`、`mime`、`net/http`、`strings`、`sync`、`pluginabi`、`pluginapi` |
+| `json_model.go` | `bytes`、`encoding/json`、`io`、`unicode/utf8` |
+| `sse_rewriter.go` | `bytes`、`encoding/json`、`fmt`、`strings`、`unicode` |
+| `stream_rewriter.go` | `bytes`、`encoding/json`、`fmt`、`io` |
+| `abi_cgo.go` | 原 `C`、`fmt`、`unsafe`、`pluginabi` 原文保持 |
+
+同 package 符号继续直接调用。ABI -> RPC／caller reset／stream lifecycle；config -> DSL；rules -> caller pattern；route -> config／rules／身份绑定／共用 headers；两种 executor -> route／JSON／RPC，stream executor 再调用 chunk rewriter -> SSE rewriter -> JSON 白名单。`joinStreamErrors` 继续供 stream executor 和 chunk Flush 共用，`maxPendingStreamBytes` 保持单一定义。
+
+### 初始化与纯移动核验
+
+BASE 没有 `init()`。十个 package vars 的类型和初始化保持：main 的 `pluginVersion = "0.0.0-dev"` 及零值 `hostAPIMu`／`hostCallbackFn`；config 的零值 `loadedConfigMu` 和 `loadedCfg = defaultConfig()`；router 的零值 `callerPatternCacheMu` 和原 caller map initializer；SSE 的固定 `utf8SSEBOM` byte array；stream executor 的固定 `errors.New(...)` 和原 anonymous struct／active map initializer。`defaultConfig()` 只构造 Config 并读取 stacking 常量，当前其他初始化不依赖其他可变 globals。
+
+原混合 var group 只按独立 ValueSpec 分配，caller cache 注释跟随声明。完整 const blocks 保留分组、顺序、隐式表达式和类型继承，特别是 iota。mutex、WaitGroup、`sync.Once` 和全部 package globals 保持唯一；不增加初始化函数或状态实例。
+
+R16 保留 ABI init 的 lifecycle reset -> caller reset -> 当前 Host callback 绑定 -> plugin API 设置顺序；shutdown 仍等待 preparing／active／workers，再 reset cache、清空 callback。保留 identifier、signature、tags、validation、RPC／schema／metadata、16MiB、ownership、白名单、headers、dispatch、错误及关闭顺序。
+
+U6 用标准 `go/parser`／`go/ast` 比较全部非 import 声明、receiver/signature/body/type/tag/initializer/hash、完整 const block 和 directive；只允许文件归属、imports、必要排版及指定 var 分组差异。另逐字比较 ABI、全部 tests／benchmark／fixture、module/dependencies、Makefile／workflow，核查七平台 `go/build.MatchFile` 文件选择和真实构建。AST 等价不能替代动态验收。Task I 的产品字节等于旧 BASE 条件属于当时 fixture-only 任务；本次比较修复后起点。
+
+Makefile、Windows arm64 和 FreeBSD CI 均以 package `.` 构建，新文件自动参与。`-X main.pluginVersion` 保持；新普通 Go 文件不增加 build tags 或 GOOS/GOARCH suffix，原 cgo constraint 只留在 ABI。module owner 精确更新 `CLAUDE.md` 当前架构说明，README 只加必要简短源码布局；历史 docs 和 CONCEPTS 不追改。新注释中文，已有无关注释保持。
 
 ### 修改触达与不需修改的边界
 
@@ -91,9 +160,13 @@ CPA handler 的 `parseInteractionsRequestTarget` 先验证 JSON，再读取精�
 | `.github/scripts/testdata/cpa-functional-regression_test.go` | producer、native loader、HTTP/WS、registration 和生命周期 | Interactions owner 改 `TestModelMapperFunctionalInteractionsAgent` 及其必需 GJSON import；stream owner 只新增独立 terminal fields 测试函数，不改 imports。 |
 | `gCPANewLocalProducer`、`setFixture`、`gCPALoadNative`、`eNativeDrain`、`eResponsesServer`、`eHTTP`、`eWS` | 两个 owner 复用测试能力 | 公共 helpers 不修改；stream 使用已有 `p.wire` custom wire，无需改 producer/imports。每 case 显式设置或清空 wire。 |
 | `.github/scripts/smoke-local_test.go` 的 `TestCPAPluginIntegration`／`runFunctionalCPAOverlay` | 唯一 parent-lifetime library 和 overlay 执行入口 | 保持现有入口；终验 owner 验证新增 test 被现有 regex 执行。 |
-| `abi_cgo.go`、`handleMethod`、registration/schema、配置／README／Makefile／CI | 公共行为、exports 和发布流程 | 不修改；使用现有测试、build/package 和 workflow 验收。 |
+| U6 的 `main.go`、8份新生产文件及配置／route／executor／rewrite 声明 | 生产职责划分、imports 和唯一共享状态 | module owner 按 R15/R16 移动 post-fix 声明，不与 U2/U3 并行写；registration/schema、配置语义和 executor 调用不变。 |
+| `CLAUDE.md`、README | 当前源码布局 | U6 按最终10文件精确更新架构段落和必要简短布局，不改历史 docs 或重复行为说明。 |
+| `abi_cgo.go`、Makefile、CI、公共 CPA helpers 和 smoke 入口 | C ABI、现有构建／integration／发布边界 | 全程保留；用原测试、build/package 和 workflow 验收，不新增接口或入口。 |
 
-同一个 `.go` 文件中的不同函数不自动保证无冲突。两个 owner 从相同已审查起点开始；stream 不修改 imports、Agent 函数或公共 fixture helpers，Interactions 不修改 scanner 或 stream 测试。若正式测试需要改同一 helper、import block 或 test function，协调者先更新精确所有权，按依赖顺序由单个 owner 完成该位置，不把冲突留给 merge。
+同一个 `.go` 文件中的不同函数不自动保证无冲突。U2/U3 从相同最终已审查 HEAD 并行开始；stream 不修改 imports、Agent 函数、module 或公共 fixture helpers，Interactions 不修改 scanner、stream tests 或公共 helpers。若正式测试需要改同一 helper、import block 或 test function，协调者先更新精确所有权，按依赖顺序由单个 owner 完成该位置，不把冲突留给 merge。
+
+U6 只在 U2/U3 完成全部 owner 步骤、提交且无冲突合并后开始。module owner 从该整合 HEAD 取得前置完整验收，再连续完成移动、后置验收、规格／质量审查、修正、复审和提交。U4 独立终验依赖 U6，U5 发布依赖 U4；不从原 F1-F3 旧计划直接启动编码。
 
 ## Acceptance Examples
 
@@ -104,6 +177,10 @@ CPA handler 的 `parseInteractionsRequestTarget` 先验证 JSON，再读取精�
 - AE5，Covers R5、R6、R7。`{"agent":"research-agent","agent":""}`、`{"agent":"research-agent","AGENT":false}`、`{"agent":"research-agent","Agent":""}` 继续 native unhandled，真实 HTTP 200／完整流，原始请求不被 mapper 改写。trim 后非空 agent 和普通唯一 lowercase agent 仍受保护。
 - AE6，Covers R7。invalid JSON 使 helper 返回 false；null+model 按普通 model。nonstring+model 的入口 400 与 direct 相同；agent-only nonstring 只核查 R5 的 CPA 分类，不把本地 fake upstream 的响应写成 Google API 支持证明。
 - AE7，Covers R1、R3、R4、R8。非 Grok Codex 依次交付 `event: keepalive`、`data: {"type":"keepalive"}`、`event: response.completed`、完整 completed data，或两个独立 data-only 单位。mapped native 保留两个有效逻辑 data，不合并 JSON；HTTP 200 正常到达完整 completion，WS 获得完整 completion JSON。keepalive 原字节、完成模型恢复与完整 output 一并核查；direct／disabled／unmapped、actual Grok comments、no-keepalive、data-only 普通 completion 保持。RED 按具体入口记录状态、缺失 data 和终止错误，不统一假定失败状态码。
+
+- AE8，Covers R15、R16。两项修复合并且 GREEN 后，U6 将全部生产声明唯一分配到10文件；移动前后完整 AST 等价、ABI／tests／benchmark／fixture 逐字不变。新文件布局编入原 package，默认与注入版的真实 registration、init/shutdown 和全部回归分别通过。
+- AE9，Covers R8、R9、R17。issue8 的四个 terminal cases 和全部36个 native field Tests，连同 OrdinaryMetadata／MixedMetadata／reverse／alternating 控制继续验证完整 `response.output`、九事件、opaque 中文内容、客户端 model、派发时点及 `emit -> host-close -> plugin-close`。原 subtests、table cases、断言和完整输入不减少。
+- AE10，Covers R12、R13、R18。post-fix、post-module 和 final 的默认 DLL 分别执行完整 `make integration`，`TestModelMapperFunctionalReconfigureReload` 仍精确要求 `0.0.0-dev`。独立候选版 DLL 的真实 ABI Version 等于核实后的 patch；最终 CI／Release 绑定含模块化的最终 SHA，原24／2／6456集合和新增 cases 分别验收。
 
 ## 永久测试与终验
 
@@ -121,17 +198,64 @@ root tests 逐项覆盖 missing／empty／ASCII和Unicode空白／null、`Agent`
 
 扩展原 `TestModelMapperFunctionalInteractionsAgent`，同时用真实 handler、native DLL、GeminiInteractionsExecutor、普通 model executor 检查 model mapping 和 native bypass。其 fake upstream 当前也用 Go struct 读取 Agent/Model，正式测试需改为各 case 的 raw byte 断言和同版 GJSON 分类，避免 test oracle 的 last-wins／大小写规则拒绝正确 native 请求；只改本函数和其必需 import。正常 string native agent 的 stream/nonstream、重复和大小写覆盖必须有 direct／disabled／unmapped 对照；请求字节、upstream identity、完整 response/SSE、调用次数必须保持。helper 正常不等于真实 native HTTP 正常。
 
+### 完整旧回归矩阵
+
+以下为 BASE 的全部 Test／Benchmark 声明数，由标准 Go AST 重新核查。声明清单与实际运行的展开 cases 分别核对；只核对顶层数量不能证明完整执行。
+
+| 文件 | Tests | Benchmarks | 必须保持的内容 |
+| --- | ---: | ---: | --- |
+| `main_test.go` | 216 | 15 | 配置／DSL／caller／route／executor、stream、registration、header 和 JSON 原控制。 |
+| `abi_cgo_test.go` | 4 | 0 | 实际 cgo 编入，nil、length、overflow 和失败 response 清零。 |
+| `json_rewrite_regression_test.go` | 7 | 0 | duplicate/escaped、六项白名单、opaque、数字字节与 ownership。 |
+| `performance_regression_test.go` | 12 | 10 | 全部 allocation／retention／batch 内容断言和门槛。 |
+| `route_runtime_regression_test.go` | 1 | 0 | runtime replacement 为空时 handled self、无 TargetModel，execute/stream 返回 `empty mapped model` 且 upstream calls 为零。 |
+| `stream_protocol_regression_test.go` | 38 | 0 | terminal、raw/SSE、格式隔离、完整大单位、prefix/error、limits 和 framing。 |
+| `stream_native_fields_regression_test.go` | 36 | 3 | field-pair/data-only、metadata/mixed、dispatch、wire、ownership、cursor／allocations。 |
+| `stream_lifecycle_regression_test.go` | 9 | 1 | 全部 shutdown、blocked emit/read/final flush、errors、close once 和 lifecycle reset。 |
+| `.github/scripts/package-release_test.go` | 26 | 0 | ZIP根 library/LICENSE、checksum、path alias拒绝、原子失败清理、sidecar和stale cleanup范围。 |
+| `.github/scripts/check-release-compatibility_test.go` | 8 | 0 | GLIBC/macOS inspector 和失败时不继续 package。 |
+| `.github/scripts/smoke-local_test.go` | 26 | 0 | host-platform build、process错误、用户config保护及唯一 integration 入口。 |
+| `.github/scripts/testdata/cpa-functional-regression_test.go` | 24 | 0 | 全部 producer/native/HTTP/WS、binary captures、metadata/mixed、reload 和大 translator。 |
+
+总计407个 Test 声明，分为 root323、scripts60、fixture24；root 另有29个 Benchmark声明。保留全部原 subtests/table cases、expected maps、断言、内部 deadlines 和数据规模。root／fixture 当前没有 Skip 或 `t.Parallel`；scripts 原平台、权限、make availability 和 integration 环境 Skip 保留条件，实际跳过单列。真实 integration 不得 Skip。不得通过缩小输入、放宽 equality、增加内部 timeout 或降低 allocation 门槛获得 GREEN。
+
+issue8 的四祖先提交分别保护独立无 LF event/data 与连续 data-only、opaque metadata、独立 id/retry/comment、data-only与field-pair切换时的完整前值及下一事件metadata。原 `TestFunctionalIssue8TerminalPayload` 四 cases（Payload+Done、split terminal、Payload+Error+Done、independent Done）保留上游 request、完整 terminal/model、原 error、精确 close counts 和 `emit -> host-close -> plugin-close`。`TestRunStreamForwardProcessesTerminalPayload` 的更早 terminal-order 历史归属单列，不归因于 issue8。
+
+完整历史控制同时覆盖：JSON/YAML 类型与单文档验证、原子 reconfigure、三个 stacking modes、comments/escaping/captures/ASCII case、wildcard 不回溯；exact 和 positive/inverse caller 身份绑定，credential 移除／替换后 warm cache 不得授权；五 formats、unmatched/identity/two-slice/count_tokens。请求顶层 semantic model、duplicate members/parents、escaped keys、`9007199254740993`、opaque/tool、unchanged bytes 与 changed/unchanged headers 均保持。
+
+stream 控制覆盖九事件顺序、metadata 的位置／次数／原字节、双向与交替 mixed shapes、metadata 不增加 data frames、迟到 delimiter 不重复 dispatch；generic LF/CRLF/bare CR/mixed/BOM、全部 splits/bytewise、raw JSON sequences/arrays、EOF、per-read boundaries 和 Gemini raw core 不二次 framing。完整大单位／累计完整流量可超过16MiB，incomplete 超限显露错误并清空，完整 prefix 与并存 error 同时保留，framed incomplete raw JSON 不派发，emit 失败停止输出与 replay，不制造 `[DONE]`。shutdown 保留原2s deadlines、无多余读取、原 primary/cleanup error、close once、preparing/active/workers 清理及下一 init/reset。
+
+全部29个 Benchmark声明的全部实际展开 cases 执行 preflight。现有2MiB／200 allocations 等门槛不变；`-benchtime=1x` 只证明 cases 可运行。修复影响的性能计时按同环境／policy 记录实际成本，preflight 不证明耗时无变化。
+
 ### Canonical DSO 与完整旧集合
 
 保持 parent `t.TempDir()` 在 child process 整个生命周期存活、单一 canonical library 文件、实际 SHA256 核查和顺序 enabled owner。每个 owner 仍新建 Host、执行真实 ApplyConfig/init/reconfigure/unload/reload；不缓存 Host，不每个子测试复制新 DSO，不新增共享 `t.Parallel`。
 
-原 24 个 functional tests、2 个 bridge tests 必须逐项执行并通过。四份 capture 保留完整 expected key 集合：`native-binary-captures.json` 1536、`mixed-native-captures.json` 1800、`mixed-binary-captures.json` 1440、`mixed-shape-controls.json` 1680，总数 6456；unknown／duplicate／missing 均为空。新 terminal 测试及新的 Agent 子测试另行列明，不能沿用 24 作为扩大后的全部顶层数。
+原 24 个 functional tests、2 个 bridge tests 必须逐项执行并通过。四份 capture 保留完整 expected key 集合：`native-binary-captures.json` 1536、`mixed-native-captures.json` 1800、`mixed-binary-captures.json` 1440、`mixed-shape-controls.json` 1680，总数 6456；unknown／duplicate／missing 均为空。普通1536组合包含原 none384，mixed1440独立验收。首次 unload/backpressure 后顺序读尽已接收的17帧，保留 terminal error 和 zero bridge state；完整16,842,937-byte translator unit 及原大 HTTP event 不缩小。新 terminal 测试及新的 Agent 子测试另行列明，不能沿用24作为扩大后的全部顶层数。
 
 正式证据记录源 BASE／起点／最终 HEAD、测试源码和 overlay SHA256、CPA revision/module Sum、实际命令和数字 exit、DLL／shadow DLL identity、原始 upstream/client payload。Go race 与正常 native 加载分层报告；尚未执行、环境拒绝和产品 RED 分开记录。缺日志时写明缺失，不以旧诊断输出代替正式 RED/GREEN。
 
+### 三阶段验收与版本产物
+
+| 阶段 | owner／起点 | 必须取得的证据 |
+| --- | --- | --- |
+| post-fix | U6 从 U2/U3 无冲突合并后的 GREEN HEAD 开始 | 全部 root/unit/vet、三个显式 scripts、全部 benchmark cases preflight、完整 race（总 timeout30m）、默认 Windows c-shared、真实 ABI registration 和 `make integration VERSION=`；保存全部声明／tests／fixture manifest 与展开 cases。 |
+| post-modularization | U6 完成纯移动后 | 相同完整检查重新执行；AST／initializer／const／directive 等价及 ABI/tests/fixture 字节证明；同 owner 审查修正复审提交。 |
+| final | U4 独立最终整合 worktree | 全部本地检查重新绑定最终 HEAD、新 build 和 overlay，完整旧矩阵与 F1-F3；独立候选注入产物的真实 ABI Version／package；U5 再验最终 SHA 的 Ubuntu integration、七平台 CI 和全部资产。 |
+
+三阶段分别重建动态库并记录 source commit/hash、built/copied library、实际 Windows shadow DLL、CPA binary SHA256、fixed CPA revision/module Sum 和真实命令/exit。旧 DLL、owner 合并前日志和历史发布反馈均不能作为后续阶段的结果。root ABI 必须 `CGO_ENABLED=1` 实际编入；普通 scripts 可能 Skip `TestCPAPluginIntegration`，不能冒称真实 integration。正常 native 加载与 race 分层记录。完整命令和 expected 顶层集合见对应计划 Verification Contract。
+
+默认产物保留 `pluginVersion = "0.0.0-dev"`；`TestModelMapperFunctionalReconfigureReload` 精确期待该值。三阶段默认 build/integration 明确清空 VERSION，真实 init/register/reconfigure/unload/reload 全部执行。候选版本使用独立路径／产物，以 `-X main.pluginVersion=<verified-patch>` 注入，再通过真实 ABI init/register 核对 Metadata.Version；不能覆盖默认 library，不能用 `.version` sidecar、archive basename 或源码变量证明 DLL 内 Version。sidecar 仅按现有 compatibility/packaging 流程核验。R13 的注入前及发布前两次占用核查不省略。
+
+### 宿主与实际运行限制
+
+fixed CPA 的 mixed direct/disabled HTTP 缺少 completed，按原 fixture 的完整字节控制单独报告，HTTP200不证明完整结束。XAI 独立 mixed WS60项的会话差异只允许已核实的 `prompt_cache_key`／`X-Grok-Conv-Id`，其余 mapped/direct equality保持。error-only WS 继续按 AE1 的既存1006边界；keepalive+completion和F2 WS必须正常完成。
+
+Gemini countTokens 没有可靠 operation signal／host count callback、Home 拒绝 plugin executor、current v8 unload callback 风险属于宿主边界；保持既有 guard/control和披露，不开发 CPA 功能。历史 Docker／CPA v8.0.10／公网 xAI反馈只证明当时结果，不能替代本次最终源码/DLL。最终 Ubuntu job 必须实际运行 `make integration`；七平台构建成功与七平台 runtime 验证分别报告，无法加载的平台不声称已验证运行。
+
 ## 发布与完成条件
 
-两个 coding owner 全部完成 R11 后，终验 owner在新的独立 worktree 验收 R12、R13；规格／质量问题在对应 owner 内修正并复审。源码再次改变后，重跑受影响检查和完整整合验收。
+U2/U3 全部完成 R11 并无冲突合并后，U6 在独立 worktree 连续完成 post-fix验收、模块化、post-module验收、审查修正复审和提交；再由 U4 在新的独立 worktree 验收 R12、R13、R15-R18，U5 依赖 U4。规格／质量问题在对应 owner 内修正并复审。源码再次改变后，重跑受影响检查和完整整合验收。
 
 本地 build/package 核查注入版本、注册 metadata、ABI 和 ZIP/checksum/根 LICENSE；兼容性维持 Linux GLIBC <=2.17、macOS deployment target 12.0。保留七个平台：linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64、windows/arm64、freebsd/amd64。
 
