@@ -171,13 +171,23 @@ flowchart TB
 | owner／单元 | 可修改文件和位置 | 保持不改／交接条件 |
 | --- | --- | --- |
 | U1，协调者和文档审查 | 当前 spec/plan；审查结果 | 不改产品/tests；全部候选终态、二次覆盖和五位独立文档审查完成，阻塞问题修正并复审通过后才分派编码。 |
-| U2，Interactions | `main.go` imports（3-24）及 `interactionsUsesAgent`（1716-1721）；`main_test.go` 的 `TestHandleModelRouteLeavesInteractionsAgentsNative`（1820-1853）；新 `interactions_agent_regression_test.go`；`go.mod`／`go.sum`；fixture imports 和 `TestModelMapperFunctionalInteractionsAgent`（1932-2027）。 | 不改 `handleModelRoute` caller、executor、scanner、stream regression、公共 CPA helpers。 |
-| U3，stream | `main.go` 的 `sseRewriter.Write`（198-269）和 `findDelimiterlessResponsesEventEnd`（583-778）的必要识别；`stream_native_fields_regression_test.go` 的独立新增用例；fixture 新 `TestModelMapperFunctionalResponsesTerminalFields` 及本测试专用局部代码。 | 不改 imports、Agent 函数、module、`main_test.go`、公共 producer/loader/helper、生命周期、batching 和恢复器。 |
+| U2，Interactions | `main.go` 的必需 GJSON import（原 imports 3-24）及 `interactionsUsesAgent`（1716-1721）；`main_test.go` 的 `TestHandleModelRouteLeavesInteractionsAgentsNative`（1820-1853）仅 whitespace expected false 改为 true；完整新 `interactions_agent_regression_test.go` 的45个 RPC cases及余下新增 cases；`go.mod`／`go.sum` 的必要 GJSON v1.18.0／match／pretty；fixture 必需 GJSON import 和 `TestModelMapperFunctionalInteractionsAgent`（1932-2027）。 | 不改 `handleModelRoute` caller、executor、scanner、stream regression、公共 CPA helpers；旧输入和其余断言保持。 |
+| U3，stream | `main.go` 的 `sseRewriter.Write`（198-269）和 `findDelimiterlessResponsesEventEnd`（583-778）仅两个 header 谓词、matched 的真实 data-only guard／单向 done alias；`stream_native_fields_regression_test.go` 的5个新增 terminal Tests、logical-metadata-callback-characterization及余下新增 cases；fixture 唯一 `TestModelMapperFunctionalResponsesTerminalFields` 的文件末尾长矩阵及本测试专用局部代码。 | 不改 imports、Agent 函数、module、`main_test.go`、公共 producer/loader/helper、生命周期、batching 和恢复器；全部旧 controls 保持。 |
 | U6，module | `main.go`、8份新生产文件；`CLAUDE.md`当前架构和README简短布局 | U2/U3无冲突合并后开始，不改ABI/tests/benchmark/fixture/module/Makefile/CI，不从旧源码覆盖修复。 |
 | U4，终验 | U6完成后新整合worktree的证据和验收 | 产品回归交对应 owner 在其 worktree 修正、复审、提交；主会话不补半成品代码。公共入口确需改变时先更新单 owner 所有权。 |
 | U5，协调者 | 经授权的 local main、remote main、tag、Release 验收 | 不创建 PR、force push、移动既有 tag、改 CPA 或删除其他已有工作区。 |
 
 行号只标识 BASE 的核查位置，实施以符号与实际 hunks 为准。两个 owner 可以在同一文件不同已分配位置并行；合并前比较完整 BASE..HEAD。fixture imports 只归 U2，U3 使用现有 imports。出现公共 helper 或同一函数共同修改需求时，先交协调者按依赖或单 owner 更新所有权，再继续。
+
+**恢复执行规则：**
+
+1. 本次恢复文档只修改本 plan，origin spec 逐字保持。U2/U3 必须从同一最终已审查文档 HEAD 各建新独立 worktree，各有唯一 fresh owner；原 BASE、文档起点和实际 production/tests 身份分别记录，不自行改变 base。既有位置可并行，新共享 hunk 先由协调者更新单 owner 所有权和依赖。
+2. 已停止的 `wf_e9f307ff-9e1` 的未提交来源永久只读：U2 为 `C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/wf_e9f307ff-9e1-1`，U3 为 `C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/wf_e9f307ff-9e1-2`。因 modified-since-read 冲突停止的 `wf_f90ea0be-a21` 及其可见 owner 工作树永久保留，不读取／复制其未提交文档草稿，不恢复旧 owner、writer 或 script。原来源全部内容不写、不删、不清理；只精确继承下述已证明归属的文件位置，其他 unknown 内容不进入新树提交。
+3. 四处争议写入已有成功 Edit 和正文匹配证明属于本次助手，具体运行时成因仍未知；来源全树 tracked/untracked/hash 的独立清点未完成，保持 unknown，不宣称 complete。允许的 Read／Glob 仅用于限定源文件。协调者对来源 `git -C status` 的取证已被隔离拒绝，不让 peer／MCP 重做，不修改权限或用户配置；Git 只在执行者自有工作树运行，不使用 `git -C`，不改变主会话或其他工作树。
+4. 在自有 ignored 证据目录保存继承来源原文快照，并冻结自有 BASE production、tests、overlay、默认 DLL 身份。原 BASE 的旧集合 manifest 从固定 BASE 对象取得；继承／新增测试 manifest 单独冻结，标明实际被测试的 production 和 DLL。每次实际测试分别记录被测试 production 的 commit/hash、测试源码和 overlay hash、argv/cwd、built/copied/shadow DLL 及 CPA 身份。overlay 只引用冻结的自有副本，不引用旧实时 source；旧 `run.py` 把 owner 当前源码作为 BASE manifest 的方式不得沿用。先在冻结 BASE 上逐 case 取得继承 cases 的目标 RED 或已正确 control，再最小引入已归属产品 hunks 并用同命令取得 GREEN；剩余 slices 按原 Approach 逐条完成。
+5. 每个 owner 独自连续完成 TDD、最小实现、规格／质量自审、修正、复审、全部检查和提交，不联系／恢复其他代理或启动 subagent。测试、构建和证据记录程序均前台顺序执行，不启动后台任务，不续跑旧 writer/script；以最终正常返回主动交付，由 harness 通知协调者。所有独立复核由协调 workflow 在 owner 完成提交后分派，reviewer 只读且不直接联系 writer。该执行限制不减少任何单 owner 完成条件。
+6. U2/U3 各自完成完整 root、vet、race（总 timeout30m）、三个显式 scripts、registration、29个旧 Benchmark 的全部展开 cases、受影响性能计时、issue8、完整旧矩阵与6456精确 keys、默认 DLL 和完整 integration，并至少重复两次各自关联 native 测试。原 native exit1 是重复声明导致的编译失败，未到目标，不计 RED；WinError5 启动失败未执行 race／bench，不计 pass。沿用全部旧断言、数据、内部时限、性能门槛和宿主限制，真实 integration 不得 Skip。
+7. 交付包含固定 BASE..最终 HEAD 的完整 diff、逐条真实命令与数字 exit、源码／tests／cwd／overlay／DLL 身份、自审修正复审及正常 path-limited commit。未启动或工具拒绝的 exit 保持未知，未完成检查不能计 pass。协调者核对无位置冲突且全部 owner 完成条件满足后才合并；post-fix、post-module、final、10文件模块化和 main／tag／CI／Release 的原门槛全部保持。
 
 ---
 
@@ -216,6 +226,10 @@ flowchart TB
 
 **Execution note：**逐条测试 -> 实际目标 RED -> 最小实现 -> GREEN，再进入下一行为。按 R17 从既有 model_route RPC 的结果观察分类，helper 的 true/false 是行为说明，不新增直接耦合其实现的测试。whitespace旧expected纠正属于RED阶段，private overlay不代替正式TDD。
 
+继承仅限已证明归属的六文件／hunks：`main.go` 的必需 GJSON import 和唯一 helper，`main_test.go` 的 whitespace expected false 改为 true，完整 `interactions_agent_regression_test.go` 的45个 RPC cases，`go.mod`／`go.sum` 的必要 GJSON v1.18.0／match／pretty，以及 fixture 的必需 GJSON import 和原 Agent 函数。按恢复执行规则冻结 BASE 和自有测试／overlay／默认 DLL，先将这些继承 cases 逐条记录为 BASE 目标 RED 或已正确 control，完成后才最小引入产品 hunks 并取得同命令 GREEN。继承测试不替代剩余 slices 的逐条 TDD；已由同一 helper 修复的 case仍在冻结 BASE 证明失败。
+
+原 `research-agent` stream/nonstream 控制、ASCII-tab 和 missing 必须保留，Test Scenarios 的剩余 native 矩阵全部补齐，包括原始 body、calls、URI、headers 和完整 response/SSE。保留各自关联 native 两轮及恢复执行规则列明的全部 owner 检查、自审修正复审和正常提交；不得以45个 RPC cases 或旧 private overlay 代替真实 native／完整 integration。
+
 **Approach：**
 
 1. 核对初始 HEAD、Git clean、fixed CPA module/version，检查唯一 caller 和 route -> executor。保留完整 BASE 和起点，不用 `HEAD~1`。保存只读 BASE 源码／默认 DLL 身份，供后续新增 native slices 证明基线失败。
@@ -249,6 +263,10 @@ flowchart TB
 **Files：**Exact Ownership 的 U3 文件；相关现存 controls 为 `TestFunctionalNativeSSEFieldDiscriminator/mismatch-control`、`TestFunctionalNativeSSEFieldDataOnlyTypeControl`、`TestFunctionalNativeSSEFieldFormatIsolation`、`TestFunctionalNativeSSEFieldWireControls`、ordinary/mixed metadata、limit/continuation/dispatch，以及 forwarder/error 回归。
 
 **Execution note：**每个行为连续完成最小测试、BASE目标RED和最小GREEN，再进入下一条；按 R17 从既有输出和 forwarder 入口核查新增行为，保留原状态／游标控制。重新保留exact-byte/native/HTTP证据，不批量写全部tests后再实现。
+
+继承仅限已证明归属的三文件／hunks：`main.go` 的两个 header 谓词、matched 的真实 data-only guard／单向 done alias，`stream_native_fields_regression_test.go` 的5个新增 terminal Tests及 logical-metadata-callback-characterization，以及 fixture 的两个同名 `TestModelMapperFunctionalResponsesTerminalFields`。先保存来源原文的自有只读快照，只在新树精确删除位于 `gCPALoadNative` 后、旧 `TestModelMapperFunctionalNativeProducerFields` 前的短重复函数，保留文件末尾长矩阵、5个 tests、characterization 和全部旧 controls；原来源保持只读，其他 unknown 内容不纳入提交。
+
+去除新树的短重复块后，先用冻结 BASE production／默认 DLL 和冻结自有 tests／overlay 逐 case 完成继承 cases 的目标 RED 或已正确 control，完成后才最小引入已归属产品 hunks 并取得同命令 GREEN，再逐条补齐 Test Scenarios 的剩余 slices。原重复声明的 native exit1 不计目标 RED，WinError5 未运行的 race／bench 不计 pass。保存 exact-byte、producer/native/HTTP/WS 的实际输出和身份，关联 native 至少两轮；恢复执行规则中的全部 owner 检查、自审修正复审和正常提交均须由同 owner 完成。
 
 **Approach：**
 
