@@ -142,10 +142,10 @@ func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
 			p = nil
 		}
 	}
-	if r.logicalEventFormat == "openai-response" && (bytes.HasPrefix(p, []byte("data:")) || bytes.HasPrefix(p, []byte("event:")) ||
-		isResponsesMetadataField(p) && completeSSEEvents(p)) {
+	if r.logicalEventFormat == "openai-response" {
 		s := &r.delimiterless
-		if !s.disabled && s.completeEnd > 0 && (s.completeEnd == len(r.buf) || s.metadataEnd == len(r.buf)) && s.dataStart == s.headerStart {
+		if !s.disabled && s.completeEnd > 0 && (s.completeEnd == len(r.buf) || s.metadataEnd == len(r.buf)) && s.dataStart == s.headerStart &&
+			(bytes.HasPrefix(p, []byte("data:")) || bytes.HasPrefix(p, []byte("event:")) || isResponsesMetadataField(p) && completeSSEEvents(p)) {
 			// 下一独立 event/data 或完整 metadata 单位确认前值边界，metadata 保留给下一事件。
 			nextFields := r.buf[s.completeEnd:]
 			r.buf = r.buf[:s.completeEnd]
