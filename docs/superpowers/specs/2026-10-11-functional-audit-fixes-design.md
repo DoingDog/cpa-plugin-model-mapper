@@ -9,7 +9,7 @@ baseline: 7f5e50aa444d31298e3086b0435552bc0ebb9747
 
 ## 目标和范围
 
-修复 mapped Responses 对非 `response.*` 逻辑事件（error、keepalive）的边界识别、Codex 完成别名和 Interactions agent 分类三个已确认根因，并将生产代码按职责组织为10份同 package 文件。客户端继续获得 Client-Requested Model、完整内容和固定 CPA 原有的错误或完成结果；全部既有回归，包括 issue8，保持有效。
+修复 mapped Responses 对非 `response.*` 逻辑事件（error、keepalive）及已验证完整 data-only 值后完整 metadata 单位的边界识别、Codex 完成别名和 Interactions agent 分类三个已确认根因，并将生产代码按职责组织为10份同 package 文件。客户端继续获得 Client-Requested Model、完整内容和固定 CPA 原有的错误或完成结果；全部既有回归，包括 issue8，保持有效。
 
 行为修复范围为 F1-F3。两项修复完成、审查和提交后再执行纯声明移动，不同时重写函数实现。产品实现必须等全部候选判定、二次覆盖审查和扩展后的本规格／实施计划独立审查完成。本文是实施依据，不能替代正式 TDD、真实 native integration 或发布验收。
 
@@ -17,21 +17,27 @@ baseline: 7f5e50aa444d31298e3086b0435552bc0ebb9747
 
 ## 基线与证据
 
-- 插件 BASE 为 `7f5e50aa444d31298e3086b0435552bc0ebb9747`。本次文档 worktree 的初始 HEAD 与 BASE 相同，初始工作区干净；没有运行产品测试。
+- 插件 BASE 保持 `7f5e50aa444d31298e3086b0435552bc0ebb9747`。本轮文档 worktree 初始 HEAD 为 `86a3c2ceb8d5e123015d563c5ab07eefb2670149`，初始工作区干净；本轮只更新 spec/plan，没有实施或运行产品测试。
 - `go.mod` 为 Go `1.26.0`、CPA `v7.2.152`、`gopkg.in/yaml.v3 v3.0.1`。固定 CPA revision 为 `c76dfd4e0edabab9000628b1560ab8ab379eadb8`，module Sum 为 `h1:FkvGzpOCvuDGswaOyoVfbY5Ua7OlP/wMXw3agiNMUQI=`。
 - 当前根模块没有直接 require 或 import `github.com/tidwall/gjson`，`go.sum` 没有其条目。固定 CPA 的 `go.mod` 使用 `github.com/tidwall/gjson v1.18.0`。
 - F1/F2 的实际复现、固定 CPA 可达性、规格与回归反证分别来自已完成 workflow `wf_0e54821b-a4c` 的 result 第 4、5、6 项。三份报告确认相同根因，包含重复 RED、direct／disabled／unmapped 控制和 fixed binary HTTP 证据。
 - 上述报告引用的三个只读诊断目录已随 clean worktree 清理。本文核对了调度器保留的完整完成输出，没有把已不存在的原始日志当作已读取证据。正式 owner 必须保留新的可复查 RED/GREEN 和产物身份。
-- F3 的三位独立验证结果已保存在 completed workflow `wf_893a5d73-2a2` 的 result 第 1、2、3 项，持久 JSON 和完成输出均已核查。报告包含真实 native/HTTP 重复 RED，以及 private overlay 的根检查和 192 个 native HTTP 对照；原诊断 worktree 已被清理，原日志缺失，不能声称已归档。private overlay 属于诊断，正式产品仍需新的 TDD。
-- keepalive 的原版 producer/native/HTTP/WS 失败已重复实际复现。安全回归结论仅绑定协调者已核验的 `a2c59708bf099984d` 完成归档：精确三处 guard 的诊断副本通过完整 root、DLL build、native/HTTP/WS 最小与 opaque 控制，pair-only 副本仍在 data-only/mixed 失败。协调者已保存并核验其 `keepalive-lens-spec-boundary-wf_dc32a367-b38-3.zip`，SHA256 为 `0ac53b72c705ec10f1b445807fef27c74af53b1a2f8c5000257a6586c8a4ee36`。direct／disabled／unmapped、actual Grok comments、no-keepalive 和 data-only 普通 completion 控制正常。二次扫描覆盖门槛已由协调者确认。原文档提交 `93d99213bb6a8fe45af2770d92faf95ea1f4e2a9` 的五位独立 reviewer 均返回 `findings=[]`；该结果只覆盖原 F1-F3 文档，扩展后的模块化和完整回归要求仍须独立审查。private overlay 不作为正式产品完成证据。
+- F3 的三位独立验证结果已保存在 completed workflow `wf_893a5d73-2a2` 的 result 第 1、2、3 项，持久 JSON 和完成输出均已核查。报告包含真实 native/HTTP 重复 RED，以及 private overlay 的根检查和 192 个 native HTTP 对照；原诊断 worktree 已被清理，原日志缺失，不能声称已归档。private overlay 属于诊断，不充当正式 TDD；U2 当前完成状态见下文。
+- keepalive 的原版 producer/native/HTTP/WS 失败已重复实际复现。旧安全回归结论绑定协调者已核验的 `a2c59708bf099984d` 完成归档：精确三处 guard 的诊断副本通过其完整 root、DLL build、native/HTTP/WS 最小与 opaque 控制，pair-only 副本仍在 data-only/mixed 失败。归档 `keepalive-lens-spec-boundary-wf_dc32a367-b38-3.zip` 的 SHA256 为 `0ac53b72c705ec10f1b445807fef27c74af53b1a2f8c5000257a6586c8a4ee36`。其中 actual Grok 成功 cases 只有完整 comment(s) -> pair 或 data-only completed，没有前置 data-only created；旧 root after-created 使用 pair-created 和 JSON keepalive。direct／disabled／unmapped、no-keepalive 和普通 completion 的成功在该实际矩阵内成立，不能推断全部 Grok 排列正常或三谓词已满足全部控制。二次扫描覆盖门槛已由协调者确认。原文档提交 `93d99213bb6a8fe45af2770d92faf95ea1f4e2a9` 的五位独立 reviewer 均返回 `findings=[]`；该结果不覆盖本轮新增事实和技术范围，更新后的 spec/plan 须重新独立审查。private overlay 不作为正式产品完成证据。
+- 新 workflow `wf_31e9e13c-e72` 的 runtime、oracle-adversarial、boundary-history 三项独立诊断均已完成。协调者的只读记录为协调 worktree 中的 `dist/functional-audit-fixes-20261011/coordination/U3-Grok-synthesis-wf_31e9e13c-e72.json`；其证据目录 `dist/functional-audit-fixes-20261011/U3-independent-confirmed-wf_31e9e13c-e72/` 保存三个 ZIP、receipts 和 `manifest-verification.json`，协调者已逐项核对全部 length／SHA256／CRC。本轮核对记录、完整 workflow 输出和 ZIP 内必要原始证据，未执行归档脚本或重新运行产品。
+- 三个新 ZIP 的 SHA256 分别为：`runtime.zip`，`de5e18bb7f9e5d8eaa8e5fde44a579c767315d13f04aaf942396768a0f6f7598`；`oracle-adversarial.zip`，`04d4b2acefac10973cb682d86908c5d93017a6a5d0f9072d340b273a0b5c9396`；`boundary-history.zip`，`17fd96f0161bec2f057a6f6be1d8d4eea0d2460e0aebbfe781b0201e3037acfa`。
+- 新真实 fixed CPA Codex Grok client context 交付三个非空 callbacks：无 LF data-only response.created -> 完整 `: keepalive\n\n` -> 无 LF data-only response.completed。冻结 BASE 和精确三谓词版本的新 build／ABI／native／HTTP／WS 重复 RED；第一次 comment callback emit 已将 created JSON 与 comment 合并，created.model 保留 Upstream Model。native 后续 completion 本身完整且 model 恢复；mapped HTTP 为 502 `invalid SSE data JSON`，mapped WS 没有取得 created/completed 数据并 close 1006。direct／disabled／enabled-unmapped 的两个 model 正常，whole／bytewise upstream 写入产生相同非空 callbacks。另一独立 oracle 按事件数量、合法 JSON、status/model 和完整 output 复现，未依赖 nil/empty 或 native 与 HTTP delimiter equality。
+- 新确认依据冻结 Git source、精确诊断副本、有效 overlay、实际 build 和 built／canonical／shadow DLL 链。BASE `main.go` 的 Git 内容是 LF，原始 SHA256 为 `207f4290f3ca0308d562acc08d2e6aedd731df32a9ac36c5b89e8b539fe13a42`；同内容 CRLF 副本为 `6981b88615c132c87f6614d0042a327b9a8eb4df6e553aea0e2ff387db5bc2a2`。runtime 的 build cwd HEAD 为 `86a3c2ceb8d5e123015d563c5ab07eefb2670149`，实际 BASE 编译输入来自固定 BASE 对象，三谓词输入来自固定 START 的限定替换；build cwd HEAD、buildinfo VCS 字段与 production source 身份分别记录。旧 BASE runtime metadata 采样当时 current source hash，不能独自证明 BASE 编译来源；文件名、Version 或相同 DLL hash 也不能证明 source 归属。
+- 新证据推翻 KTD1/U3 仅三谓词足以满足全部真实控制的技术判断；F1-F3 产品目标和全部保护边界不变。用户原有全面修复、先 spec/plan、TDD 和全程自主执行要求覆盖该技术修正；代理通知不构成新批准。本轮文档完成提交并经独立审查通过前，产品写入保持暂停。
+- U2 已完整提交 `7f17c7db69d318d84e68a0b5fcd8e0e616bd44f1`，两位 fresh reviewer 均返回 `findings=[]`，协调者已核对完整 diff 和六文件范围，尚未合并。U3 在 `C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/wf_43831682-e1f-2` 的三文件未提交来源保持永久只读，报告 HEAD 仍为 `86a3c2ceb8d5e123015d563c5ab07eefb2670149`；旧 owner 不恢复。新 U3 从本轮最终已审查文档 HEAD 建立独立 worktree 和唯一 fresh owner，继承范围与完整验收由对应计划约束，不重新分派或重做已完成 U2。
 - 已核查当前产品、唯一永久 CPA fixture、固定 CPA 的相关 parser／producer／translator 源码，以及 `CONCEPTS.md`、`docs/solutions/workflow-issues/model-mapper-release-automation-alignment.md`。旧功能修复和 canonical library 规格用于保持现有边界，不沿用其历史未完成状态或候选版本。
 - 本次扩展全文读取已完成任务 `wa2mmgu21.output` 的三份模块设计、`wttct1sv9.output` 的 issue8／完整回归报告和 `wa7ayrae9.output` 的原文档及五份独立审查结果。模块方案采用第三份报告的10文件划分，并用另两份报告核对初始化、CGo 和构建边界。调查 worktree 的中间清单可能已清理；正式 module owner 必须从实际 post-fix HEAD 重新取得 AST，不能依赖旧行号或缺失文件。
-- 本次文档 worktree 从 clean BASE 通过 fast-forward 接入上述完整文档提交链，未重写旧提交。当前 `main.go`、`abi_cgo.go` 全文及 Makefile／workflow、canonical lifetime spec／plan 已重新核查；本次仅扩展两文档，未运行产品 tests/build。
+- 此前文档扩展从 clean BASE 通过 fast-forward 接入完整文档提交链，并核查 `main.go`、`abi_cgo.go` 全文、Makefile／workflow 和 canonical lifetime spec／plan。该阶段及本轮均未运行产品 tests/build；本轮在上述文档 HEAD 更新两文件，核对 shared SSE 源码、相关原回归和新增证据，不重写旧提交。
 - issue8 四项产品修复 `4bc47fe0c3718a2194658c90e28775be284336b9`、`e9c005b4000628a62da0897f87869a85b5d48031`、`8fe51c134e327a21e56e4fb3205d0cdf50e0847a`、`cf39f6e5575a6a5d8de36e707687399eeadbae68` 均已用 Git 核对为 BASE ancestors；本地 `v0.5.13` tag 指向 BASE。完成报告确认它是首次正式发布这些修复的 Release。原 terminal-order 提交 `8b7bd9a0d135251878792b3740bc06a7da7ede00` 早于 issue8，单列为历史控制。
 
 | 编号 | 已观察结果 | 根因和实际入口 | 本次修复归属 |
 | --- | --- | --- | --- |
-| F1，非 `response.*` 逻辑事件 | XAI 单 error 的 mapped HTTP 返回 502 generic error；先有 created 时原 `server_error`／`failed` 被 premature-terminal error 替换。非 Grok Codex keepalive pair 与后续 completion 合并成缺少 data 字段的 wire；data-only keepalive 与 completion JSON 合并为 invalid SSE JSON，mapped HTTP/WS 缺数据或异常终止。具体状态和错误按实际路径记录。 | 固定 producer／translator／host callback 交付独立无 LF 字段。header 的两个识别位置与 data-only type 判定只认可 `response.*`，拒绝已验证的 error／keepalive 单位。 | 共享 Responses scanner 的明确 header/type allowlist，覆盖 pair 和连续 data-only。 |
+| F1，非 `response.*` 逻辑事件及完整 metadata 边界 | XAI 单 error 的 mapped HTTP 返回 502 generic error；先有 created 时原 `server_error`／`failed` 被 premature-terminal error 替换。非 Grok Codex keepalive pair／data-only 与后续 completion 合并。真实 Grok data-only created 后完整 comment 在 BASE 和三谓词版本均与 created JSON 合并，created.model 未恢复；native 后续 completion 完整且 model 恢复，mapped HTTP 502 invalid SSE JSON，mapped WS 无数据并 close 1006。 | 固定 producer 交付独立无 LF fields，也交付完整带 LF comment。原三处识别拒绝 error／keepalive；`sseRewriter.Write` 的 metadata 分支要求无 CR/LF，完整 comment 被追加到已验证 pending data-only 值，随后标准 delimiter 消费合并值。 | 保留三谓词识别修复；U3 另独占 shared Write 中已验证完整 data-only 前值与完整带 line-ending metadata 单位的边界及有序派发。具体 metadata patch 尚未实现或安全验收。 |
 | F2 | Codex mapped native 拼接 fields、未恢复 `response.model`；单 terminal HTTP 502，created 后丢失完成数据，mapped WS close 1006。disabled／unmapped 的 HTTP 和 WS 正常完成。 | 固定 Codex producer 保留 `event: response.done`，将 data 正常化为 `type: response.completed`；scanner 的相等判定拒绝这一实际 alias。 | 共享 discriminator 的单向精确 alias。 |
 | F3 | 空白 agent、未知大小写 key 或首个空 agent 后非空 agent 使普通 model 跳过映射；首个真实 agent 后空值或大小写覆盖导致错误 self route，真实 HTTP 400。 | `interactionsUsesAgent` 的 Go struct `Unmarshal` 大小写不敏感、重复 key last-wins、未 trim；CPA 以精确 decoded lowercase `agent`、GJSON first-wins、`String()` 和 `TrimSpace` 判定。 | 唯一 helper 复用 CPA 同版 GJSON。 |
 
@@ -41,10 +47,10 @@ error-only direct WS 本来就 close 1006，当前固定 CPA 不返回正常 err
 
 ### Responses 字段与完成结果
 
-- R1. 固定 Responses output units 的 `error` 和 `keepalive` 完整逻辑单位必须恢复字段和事件边界，覆盖独立 event/data pair 与连续 data-only。error 保留原 `code`、`message`、`param` 和其他 JSON 字节，单 error 与 created 后 error 的 HTTP 保持 direct 原错误；keepalive 后的完整 completion 在 mapped HTTP/WS 正常到达。白名单外内容不变，不生成缺失数据引起的 generic/premature-terminal error。
+- R1. 固定 Responses output units 的 `error` 和 `keepalive` 完整逻辑单位必须恢复字段和事件边界，覆盖独立 event/data pair、连续 data-only，以及已验证完整 data-only created -> 完整 `: keepalive\n\n` -> data-only completed。该 metadata 边界须分别输出合法 created、原 comment 和合法 completed，保持顺序、次数和完整 output，两个响应的白名单 model 均恢复为 Client-Requested Model。error 保留原 `code`、`message`、`param` 和其他 JSON 字节，单 error 与 created 后 error 的 HTTP 保持 direct 原错误；keepalive 后的 completion 在 mapped HTTP/WS 正常到达，不生成缺失或非法 data 引起的 generic/premature-terminal error。
 - R2. 接受 `event: response.done`／`type: response.completed` 这一方向的实际 alias，保留原 header 和 data.type。mapped HTTP 和 WS 必须获得完整 completed output，现有白名单内的 model 恢复为 Client-Requested Model。
 - R3. 新增 allowlist 仅为精确 `error`、`keepalive`，event/data pair 仍要求同名 type，F2 仅允许 R2 的方向；data-only 仍必须是完整合法且 type 被认可的 JSON。保留原 exact-match 和真正 mismatch，不接受任意 unknown event/type 或反方向 alias，不改写 discriminator、opaque metadata、unknown fields 或工具文本。event/type 配对要求只约束无标准 delimiter 的 output-unit 边界；generic 标准 SSE 的 error／keepalive 和 header/type mismatch 继续按既有白名单恢复模型。
-- R4. 保留当前 output-unit 的顺序与派发时点，generic SSE wire 的 LF／CR／CRLF、BOM、合法分片、迟到 delimiter 和 metadata 保字节行为不变。HTTP 网络分段经过真实 producer Scanner，不能直接当作 plugin callback 的字段边界。
+- R4. 允许 R1 新确认的完整带 line-ending metadata 单位为已验证完整 data-only 前值确认边界，并在该 Write 中先输出前值，再按原字节输出完整 comment。其余派发策略保持：普通完整 data-only 值不普遍提前派发，无 LF ordinary/mixed metadata callbacks 期间的原 zero-output 时点不变。generic SSE wire 的任意网络分段、LF／CR／CRLF、BOM、合法分片、迟到 delimiter 和 partial-metadata-characterization 原断言及 metadata 字节保持；HTTP 网络分段经过真实 producer Scanner，不能直接当作 plugin callback 的字段边界。
 
 ### Interactions 路径选择
 
@@ -73,11 +79,13 @@ error-only direct WS 本来就 close 1006，当前固定 CPA 不返回正常 err
 
 ### Shared Responses scanner
 
-修改点限定在 `main.go` 的 `sseRewriter.Write` 和 `findDelimiterlessResponsesEventEnd`，当前约为 198-778 行。复用现有增量游标、`json.Unmarshal`、completeEnd 验证、`rewritePendingEvent` 和响应恢复器。
+修改点限定在 `main.go` 的 `sseRewriter.Write` 和 `findDelimiterlessResponsesEventEnd`，BASE 约为 198-778 行。U3 保留原三谓词修复，另独占 Write 内已验证完整 data-only 前值与完整带 line-ending metadata 单位的边界及顺序派发。复用现有 scanner 状态、增量游标、`json.Unmarshal`、completeEnd 验证、`drain`、`rewritePendingEvent` 和白名单恢复器。
 
-R1 涉及三个谓词：无 LF native header 的记录、有真实 line ending 的 header 验证、无 header 的 data-only type 验证。三处沿用 `response.*` 并加入精确 `error`／`keepalive`；新增 data-only 许可须由 `s.dataStart == s.headerStart` 确认，不能只凭 `s.eventType == ""` 放行被清空 discriminator 的 opaque header。完整 JSON 验证后，pair 仍匹配同名 type，R2 的单向 alias 参与原 matched 判定。只改 header 两处无法修复连续 data-only keepalive。
+三个谓词分别处理无 LF native header 的记录、有真实 line ending 的 header 验证、无 header 的 data-only type 验证。三处沿用 `response.*` 并加入精确 `error`／`keepalive`；新增 data-only 许可须由 `s.dataStart == s.headerStart` 确认，不能只凭 `s.eventType == ""` 放行被清空 discriminator 的 opaque header。完整 JSON 验证后，pair 仍匹配同名 type，R2 的单向 alias 参与原 matched 判定。三谓词覆盖识别问题，尚不能处理新确认的完整 comment 边界。
 
-error／keepalive body 没有 model marker 时仍需正确识别边界。补写 LF 和派发 blank delimiter 沿用当前机制，保留原 event text 和 JSON 字节；data-only keepalive 与后续 completion 不得合成一个 data JSON。普通 completed、原 Responses/Interactions logical events 和其他 formats 保持既有行为，actual Grok 的 keepalive-to-comment 原文与 metadata 时点不变。
+Write 必须在该边界用现有路径派发已验证前值，再处理完整 metadata，不能将完整 comment 拼入前值 JSON。无 LF metadata 仍按原策略留给下一事件，普通完整 data-only 值仍等待原边界或 EOF；generic 分片和 partial metadata 不能被当作已确认完整单位。具体 metadata patch 尚未实现或安全验收，单独删除 `bytes.IndexAny` 的换行 guard 不构成充分修复。允许范围不扩展到 scanner 算法、JSON 恢复器、生命周期、batching 或公共 helpers；实现若证明还需扩大范围，保留证据并交协调者更新文档和依赖后再继续。
+
+error／keepalive body 没有 model marker 时仍需正确识别边界。补写 LF 和派发 blank delimiter 复用当前机制，保留原 event text 和 JSON 字节；data-only keepalive 与 completion 不得合成一个 data JSON。新 Grok created/comment/completed 按 R4 在完整 comment callback 有序输出前值及 comment，comment 原文、两个合法 data 的次数、model 白名单和完整 output 保持。其余普通 completed、Responses/Interactions logical events、其他 formats 和原 metadata 派发控制不变；完整 prefix+error、16MiB、ownership、allocation、增量游标、Flush/Finish 和关闭顺序保持。
 
 F1/F2 共用 scanner、回归文件和 fixture，因此由同一个 stream owner 连续实现和审查。没有 provider-specific 产品分支、HTTP/WS workaround、配置、mode、ABI flag 或第二 parser。
 
@@ -155,7 +163,7 @@ Makefile、Windows arm64 和 FreeBSD CI 均以 package `.` 构建，新文件自
 | `main.go` imports、`interactionsUsesAgent`（1716-1721）、`handleModelRoute` caller（1758） | native guard -> route -> 两种 executor | Interactions owner 改 imports/helper；caller 和 executor 实现保持。 |
 | `main_test.go` 的 `TestHandleModelRouteLeavesInteractionsAgentsNative`；新增 `interactions_agent_regression_test.go` | helper、route 的 exact-key／first-wins／trim 回归 | Interactions owner。 |
 | `go.mod`、`go.sum` | 必需 GJSON 依赖 | Interactions owner，直接 require v1.18.0。 |
-| `main.go` 的 shared scanner/Write；`stream_native_fields_regression_test.go` | `streamChunkRewriter.Write` -> `sseRewriter.Write/drain` -> `rewritePendingEvent/rewriteEvent` | stream owner 仅改识别位置和对应回归；复用下游恢复器。 |
+| `main.go` 的 shared scanner/Write；`stream_native_fields_regression_test.go` | `streamChunkRewriter.Write` -> `sseRewriter.Write/drain` -> `rewritePendingEvent/rewriteEvent` | U3 独占三谓词、单向 alias 及 Write 中完整 data-only 前值／完整带 line-ending metadata 的边界和有序派发；永久 root exact-byte/per-Write/Finish/error 回归，复用下游恢复器，不修改 scanner 算法。 |
 | `runStreamForward` -> `processPayload`、`finish` -> `flushAndEmit` -> `Flush/Finish` | terminal Payload、EOF 和错误时的有效 bytes | stream owner 通过 forwarder tests 核查；不修改这些调用者、生命周期或 batching。 |
 | `.github/scripts/testdata/cpa-functional-regression_test.go` | producer、native loader、HTTP/WS、registration 和生命周期 | Interactions owner 改 `TestModelMapperFunctionalInteractionsAgent` 及其必需 GJSON import；stream owner 只新增独立 terminal fields 测试函数，不改 imports。 |
 | `gCPANewLocalProducer`、`setFixture`、`gCPALoadNative`、`eNativeDrain`、`eResponsesServer`、`eHTTP`、`eWS` | 两个 owner 复用测试能力 | 公共 helpers 不修改；stream 使用已有 `p.wire` custom wire，无需改 producer/imports。每 case 显式设置或清空 wire。 |
@@ -164,7 +172,7 @@ Makefile、Windows arm64 和 FreeBSD CI 均以 package `.` 构建，新文件自
 | `CLAUDE.md`、README | 当前源码布局 | U6 按最终10文件精确更新架构段落和必要简短布局，不改历史 docs 或重复行为说明。 |
 | `abi_cgo.go`、Makefile、CI、公共 CPA helpers 和 smoke 入口 | C ABI、现有构建／integration／发布边界 | 全程保留；用原测试、build/package 和 workflow 验收，不新增接口或入口。 |
 
-同一个 `.go` 文件中的不同函数不自动保证无冲突。U2/U3 从相同最终已审查 HEAD 并行开始；stream 不修改 imports、Agent 函数、module 或公共 fixture helpers，Interactions 不修改 scanner、stream tests 或公共 helpers。若正式测试需要改同一 helper、import block 或 test function，协调者先更新精确所有权，按依赖顺序由单个 owner 完成该位置，不把冲突留给 merge。
+同一个 `.go` 文件中的不同函数不自动保证无冲突。U2 的完整已审查提交保留，尚未合并，不重新分派；新 U3 在本轮最终已审查文档 HEAD 的独立 worktree 开始。stream 不修改 imports、Agent 函数、module 或公共 fixture helpers，U2 已提交范围不修改 scanner、stream tests 或公共 helpers。若正式测试需要改同一 helper、import block 或 test function，协调者先更新精确所有权和依赖，由单个 owner 完成该位置。U2/U3 全完成后比较完整 diff，确认无位置冲突才合并。
 
 U6 只在 U2/U3 完成全部 owner 步骤、提交且无冲突合并后开始。module owner 从该整合 HEAD 取得前置完整验收，再连续完成移动、后置验收、规格／质量审查、修正、复审和提交。U4 独立终验依赖 U6，U5 发布依赖 U4；不从原 F1-F3 旧计划直接启动编码。
 
@@ -176,7 +184,7 @@ U6 只在 U2/U3 完成全部 owner 步骤、提交且无冲突合并后开始。
 - AE4，Covers R5、R6。`{"agent":" \t　","model":"client"}`、`{"Agent":"research-agent","model":"client"}`、`{"agent":"","agent":"research-agent","model":"client"}` 都按普通 model 执行原映射，上游 model 为 upstream，下游白名单 model 为 client。
 - AE5，Covers R5、R6、R7。`{"agent":"research-agent","agent":""}`、`{"agent":"research-agent","AGENT":false}`、`{"agent":"research-agent","Agent":""}` 继续 native unhandled，真实 HTTP 200／完整流，原始请求不被 mapper 改写。trim 后非空 agent 和普通唯一 lowercase agent 仍受保护。
 - AE6，Covers R7。invalid JSON 使 helper 返回 false；null+model 按普通 model。nonstring+model 的入口 400 与 direct 相同；agent-only nonstring 只核查 R5 的 CPA 分类，不把本地 fake upstream 的响应写成 Google API 支持证明。
-- AE7，Covers R1、R3、R4、R8。非 Grok Codex 依次交付 `event: keepalive`、`data: {"type":"keepalive"}`、`event: response.completed`、完整 completed data，或两个独立 data-only 单位。mapped native 保留两个有效逻辑 data，不合并 JSON；HTTP 200 正常到达完整 completion，WS 获得完整 completion JSON。keepalive 原字节、完成模型恢复与完整 output 一并核查；direct／disabled／unmapped、actual Grok comments、no-keepalive、data-only 普通 completion 保持。RED 按具体入口记录状态、缺失 data 和终止错误，不统一假定失败状态码。
+- AE7，Covers R1、R3、R4、R8。非 Grok Codex 的 keepalive pair 或 data-only 后接 completion，mapped native 保留两个有效逻辑 data，HTTP 200／WS 获得完整 completion。真实 Grok 的无 LF data-only created -> 完整 `: keepalive\n\n` -> 无 LF data-only completed：首个 Write 无输出，comment Write 输出已恢复的合法 created data event，随后输出原 comment；completed Write 仍按原 data-only 策略等待，Finish 输出一次完整且已恢复的 completed。累计输出只有两个 data events，comment 原字节和顺序保持，完整 output／opaque 内容不变，HTTP／WS 正常取得 created/completed。保留 whole／bytewise × pair／data-only × created／no-created 的 Grok 与普通 completed，以及非 Grok keepalive/error/done alias 全部对照。direct／disabled／unmapped 两个实际 model、no-keepalive 和无 LF metadata 原派发时点保持；BASE 及三谓词新排列均须正式目标 RED，再取得最小 GREEN。各入口按自身内容和 framing 验收，不要求 native 与 HTTP delimiter equality。
 
 - AE8，Covers R15、R16。两项修复合并且 GREEN 后，U6 将全部生产声明唯一分配到10文件；移动前后完整 AST 等价、ABI／tests／benchmark／fixture 逐字不变。新文件布局编入原 package，默认与注入版的真实 registration、init/shutdown 和全部回归分别通过。
 - AE9，Covers R8、R9、R17。issue8 的四个 terminal cases 和全部36个 native field Tests，连同 OrdinaryMetadata／MixedMetadata／reverse／alternating 控制继续验证完整 `response.output`、九事件、opaque 中文内容、客户端 model、派发时点及 `emit -> host-close -> plugin-close`。原 subtests、table cases、断言和完整输入不减少。
@@ -186,11 +194,13 @@ U6 只在 U2/U3 完成全部 owner 步骤、提交且无冲突合并后开始。
 
 ### Stream 回归
 
-在现有 `stream_native_fields_regression_test.go` 增加独立 error、keepalive、done alias、派发和 forwarder 回归。各条均核查 exact bytes、data event 数量、顺序和完整内容，不能仅检查 model `Contains` 或 emit 次数。
+在现有 `stream_native_fields_regression_test.go` 保留5个新增 root 名称：`TestFunctionalNativeSSEFieldError`、`TestFunctionalNativeSSEFieldKeepalive`、`TestFunctionalNativeSSEFieldDoneAlias`、`TestFunctionalNativeSSEFieldTerminalDispatch`、`TestFunctionalNativeSSEFieldTerminalForwarder`。在其对应测试补齐行为 cases；各条均核查 exact bytes、data event 数量、顺序和完整内容，不能仅检查 model `Contains` 或 emit 次数，不新增 private scanner state 断言。
 
-覆盖独立无 LF fields、连续 data-only、标准 LF/CR/CRLF logical events、Flush/Finish、单 terminal、created 后 terminal、keepalive 后 completion、metadata 前置／header与data之间／事件之间、连续 opaque comment、迟到 delimiter、callback/in-band error 和 terminal Payload+Done。原 `Discriminator/mismatch-control`、`DataOnlyTypeControl`、`FormatIsolation`、generic wire、mixed metadata、增量游标、ownership、完整大单位与 incomplete 限额保持。unknown/nonstring/missing type 控制保持，不将非目标 logical event 当作新增边界。
+新增永久完整 metadata 边界 case 的三个输入为 `data: {"type":"response.created","response":{"model":"grok-4.7","status":"in_progress","output":[]}}`（无 LF）、`: keepalive\n\n`、`data: ` + `gNativeCompleted`（无 LF）。TerminalDispatch 的首个 Write 输出为空；comment Write 的 exact expected 是 `data: {"type":"response.created","response":{"model":"grok-4.6","status":"in_progress","output":[]}}\n\n: keepalive\n\n`；completed Write 无新增输出，Flush/Finish 的 expected 是 `data: ` + `gNativeCompletedWant` + `\n\n`，只输出一次。累计两条合法 JSON data，零额外 data，全部白名单和 opaque 内容保持。TerminalForwarder 覆盖该排列的自然 EOF、Payload+Done、callback/in-band/cleanup error、emit 失败及完整 prefix+error，核查原错误和关闭顺序。在冻结 BASE 和当前三谓词源码／DLL 上分别取得本 case 的目标 RED，再完成最小 GREEN；独立诊断或旧部分完成不能充当正式 TDD。
 
-唯一 CPA fixture 新增 `TestModelMapperFunctionalResponsesTerminalFields`，复用真实 XAI/Codex producer 和已有 custom wire。矩阵明确区分 error／done alias／普通 completed／keepalive 后 completion，field-pair／data-only，terminal-only／after-created，whole／bytewise 网络分段，mapped／enabled-unmapped／disabled 两个实际 model 和 no-mapper direct。metadata、actual Grok comments、no-keepalive 控制与原数据、type/header、model、完整 output、原 upstream body/headers/URI/calls 一并核查。error-only WS 是既存限制控制；keepalive+completion 和 F2 WS 必须正常完成。
+原覆盖继续包括独立无 LF fields、连续 data-only、标准 LF/CR/CRLF logical events、Flush/Finish、单 terminal、created 后 terminal、keepalive 后 completion、metadata 前置／header与data之间／事件之间、连续 opaque comment、迟到 delimiter、callback/in-band error 和 terminal Payload+Done。原 `Discriminator/mismatch-control`、`DataOnlyTypeControl`、`FormatIsolation`、generic wire 任意分段／BOM、ordinary/mixed metadata 的无 LF zero-output、logical-metadata-callback-characterization、增量游标、ownership、allocation、完整大单位与 incomplete 限额保持。unknown/nonstring/missing type 控制保持，不将非目标 logical event 或 partial metadata 当作新增完整边界。
+
+唯一 CPA fixture 保留末尾唯一 `TestModelMapperFunctionalResponsesTerminalFields` 长矩阵，复用真实 XAI/Codex producer 和已有 custom wire。whole／bytewise × field-pair／data-only × created／no-created 的 actual Grok keepalive comment 与普通 completed 均逐项运行；error／done alias／非 Grok keepalive 后 completion、metadata 全位置和合法交替 shapes 等原要求不减少。各 case 核查 core／host callback 单位、mapped native／HTTP／WS、enabled-unmapped、disabled 和 no-mapper direct 的两个实际 model、type/header、完整 output、原 upstream body/headers/URI/calls；按各入口自身 framing 核对，不以 nil/empty 或跨入口 delimiter equality 判成功。no-keepalive 控制保持；error-only WS 是既存限制控制，keepalive+completion 和 F2 WS 必须正常完成。
 
 ### Interactions 回归
 

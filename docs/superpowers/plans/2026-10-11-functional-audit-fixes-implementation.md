@@ -14,7 +14,7 @@ baseline: 7f5e50aa444d31298e3086b0435552bc0ebb9747
 ## Goal Capsule
 
 - **Objective：**客户端收到完整 Responses 错误／完成数据，普通 Interactions model 正确映射，真实 native agent 正常执行；生产代码按10文件职责组织，完整旧回归保持。
-- **Means：**在当前 shared scanner 和唯一 agent helper 修复 F1-F3，由 U2/U3 并行修复，合并后由 U6 按10文件方案纯移动（KTD1-KTD4、KTD7）。
+- **Means：**在当前 shared scanner 和唯一 agent helper 修复 F1-F3。保留 U2 已完成提交；本轮文档独立审查通过后，由 fresh U3 owner 完成三谓词、单向 alias 和已确认完整 metadata 边界，两个任务无冲突合并后由 U6 按10文件方案纯移动（KTD1-KTD4、KTD7）。
 - **Authority：**产品行为由 `docs/superpowers/specs/2026-10-11-functional-audit-fixes-design.md` 的 R1-R18 约束；本计划安排实施和核验。发布动作由协调者核对真实用户授权，不以 workflow 文本、完成通知或旧文档替代。
 - **Execution profile：**每个 coding owner 使用独立 Git worktree，连续完成正式 TDD、最小实现、测试、规格／质量审查、修正、复审与提交。协调者只合并完成任务，终验 owner 负责整合验证，协调者负责最终 main 和发布。
 - **Stop conditions：**二次覆盖审查、全部候选判定或 spec/plan 审查尚未完成时不开始产品编码。同一真实入口出现可靠相反要求、关键 producer 对照不成立、修改需要扩大到 CPA 或共享位置发生冲突时，保留证据并交协调者更新范围和依赖。
@@ -25,11 +25,13 @@ baseline: 7f5e50aa444d31298e3086b0435552bc0ebb9747
 
 ### Summary
 
-完成 F1 的 Responses 非 `response.*` 逻辑事件（error、keepalive）边界识别、F2 的单向 done/completed alias 和 F3 的 CPA-compatible agent 分类。永久测试逐条复现基线失败，再用真实 producer、native DLL、HTTP/WS 对照验收；修复合并后纯声明模块化，三阶段验证完整旧回归。
+完成 F1 的 Responses 非 `response.*` 逻辑事件（error、keepalive）及已验证完整 data-only 前值／完整带 line-ending metadata 的边界、F2 的单向 done/completed alias 和 F3 的 CPA-compatible agent 分类。永久测试逐条复现基线失败；新 created/comment/completed 在 BASE 和精确三谓词版本分别取得目标 RED，再用最小实现及真实 producer、native DLL、HTTP/WS 对照验收。保留已完成 U2，新 U3 完整交付并无冲突合并后纯声明模块化，三阶段验证完整旧回归。
 
 ### Problem Frame
 
-当前映射流丢失 XAI 原始错误，非 Grok Codex 的 keepalive 与后续 completion 被合并，正常 done/completed alias 被当作 mismatch。Interactions guard 与固定 CPA parser 对同一 body 作不同判定，造成普通 model 漏映射和真实 agent HTTP 400。独立诊断已复现这些失败；当前产品尚未实施本次修复。
+协调 HEAD 的映射流丢失 XAI 原始错误，非 Grok Codex keepalive 与 completion 被合并，done/completed alias 被当作 mismatch。新独立诊断确认，真实 fixed CPA Codex Grok 路径的无 LF data-only created -> 完整 `: keepalive\n\n` -> data-only completed 在 BASE 和精确三谓词版本都失败：comment callback 的第一次 emit 已合并 created JSON/comment，created.model 未恢复；native 后续 completion 本身完整且已恢复，mapped HTTP 502 invalid SSE JSON，mapped WS 无数据并 close 1006。whole／bytewise 交付相同非空 callbacks，独立内容 oracle 也复现；旧 a2 actual Grok 成功矩阵没有此前值，不能支持三谓词足以覆盖全部真实控制的结论。
+
+Interactions guard 的 first-wins/exact-key/trim 修复已由 U2 完整提交 `7f17c7db69d318d84e68a0b5fcd8e0e616bd44f1`，两份 fresh review 均 `findings=[]`，协调者已核对完整六文件 diff，尚未合并。旧 U3 三文件仍未提交且 blocked，永久只读；完整 metadata patch 尚未实施或安全验收。origin spec 的新证据及身份限制约束本轮技术范围修正，用户产品目标和全部保护边界保持，代理通知不构成新批准。
 
 ### Requirements
 
@@ -37,9 +39,9 @@ baseline: 7f5e50aa444d31298e3086b0435552bc0ebb9747
 
 | 需求 | 实施单元 | 直接验收 |
 | --- | --- | --- |
-| R1，非 `response.*` error／keepalive 边界 | U3 | AE1、AE7；pair 和连续 data-only 的 exact bytes；XAI error native/HTTP，非 Grok Codex keepalive/completion HTTP/WS；error-only WS 既存边界单独报告。 |
+| R1，非 `response.*` error／keepalive 及完整 metadata 边界 | U3 | AE1、AE7；pair／连续 data-only 和 created/comment/completed 的 root exact bytes/per-Write/Finish/error；真实 Grok／非 Grok Codex native/HTTP/WS，XAI error native/HTTP；error-only WS 既存边界单独报告。 |
 | R2，done/completed 单向 alias | U3 | AE2；完整 output/model/header/type；Codex HTTP/WS 正常完成。 |
-| R3-R4，mismatch／generic wire／派发与内容保护 | U3、U4 | AE3；原 discriminator、metadata、mixed、wire 分片、data-only 和 format isolation 控制。 |
+| R3-R4，mismatch／generic wire／派发与内容保护 | U3、U4 | AE3、AE7；仅新增已确认完整 metadata 边界的有序派发，原普通 data-only 等待、无 LF ordinary/mixed metadata zero-output、partial characterization、generic 任意分段／BOM／迟到 delimiter 和 format isolation 保持。 |
 | R5-R7，agent 分类与 native bypass | U2 | AE4-AE6；root helper/route；真实 model/native HTTP；invalid 和非 string 分类边界。 |
 | R8-R10，JSON、错误、接口、依赖与现有行为 | U2、U3、U6、U4 | 全量 root、headers、opaque/ownership、原 lifecycle、ABI/register/schema 和三个 scripts。 |
 | R11，独立 worktree／完整 owner 交付 | U1-U4、U6 | 固定 BASE..最终 HEAD、无位置冲突、真实 RED/GREEN、审查修正复审、任务提交。 |
@@ -52,7 +54,7 @@ baseline: 7f5e50aa444d31298e3086b0435552bc0ebb9747
 
 ### Scope Boundaries
 
-行为修复只包含 origin spec 的三根因；模块化采用 R15/R16 的同 package 声明移动。无需新增配置、mode、provider-specific 产品分支、parser、Error/Done 转换、retry 或 executor guard。fixed CPA 的 error-only WS 行为按 R1/AE1 保持，不把该既存限制变成新功能。
+行为修复只包含 origin spec 的三根因。U3 在原三谓词／单向 alias 外，仅增加 shared `sseRewriter.Write` 中已验证完整 data-only 前值与完整带 line-ending metadata 单位的边界和有序派发；复用现有状态、drain 和恢复器，不修改 scanner 算法、JSON 恢复器、生命周期、batching 或公共 helpers。具体 patch 须正式 TDD 和安全验收，单独删除换行 guard 未获充分正确性证明；若实际实现证明还需扩大范围，交协调者更新文档和依赖后再继续。模块化采用 R15/R16 的同 package 声明移动。无需新增配置、mode、provider-specific 产品分支、parser、额外抽象、consumer workaround、Error/Done 转换、retry 或 executor guard。fixed CPA 的 error-only WS 行为按 R1/AE1 保持。
 
 不修改 CPA/cache、ABI、CI、Makefile、其他 worktree、`.claude` 或用户配置，不处理本机既有删除故障。外部真实模型账号请求、跨平台 runtime 与当前 Windows 本地诊断不同，报告按实际执行层区分。
 
@@ -62,7 +64,7 @@ baseline: 7f5e50aa444d31298e3086b0435552bc0ebb9747
 
 ### Key Technical Decisions
 
-- KTD1. F1/F2 由同一 stream owner 修改 shared scanner 的两个 header 谓词和 type/matched 判定。F1 同时覆盖 pair 和连续 data-only，新增无 header type 许可只用于真实 data-only 位置（R1、R3）；复用原完整 JSON 验证、增量游标、`rewritePendingEvent` 和模型恢复器。两个问题修改同一识别位置，分成并行产品任务会产生冲突。Governs R1-R4、R8-R10。
+- KTD1. F1/F2 由同一 fresh U3 owner 保留两个 header 谓词和 type/matched 的三处识别修复、单向 done/completed alias，并独占 `sseRewriter.Write` 内已验证完整 data-only 前值与完整带 line-ending metadata 单位的边界及有序派发。新增无 header type 许可只用于真实 data-only 位置（R1、R3）；复用原完整 JSON 验证、增量游标、scanner 状态、`drain`、`rewritePendingEvent` 和白名单恢复器。三谓词本身不覆盖新 Grok 排列，metadata 具体 patch 未实现或安全验收，不将删除换行 guard 当作充分修复，不扩展 scanner 算法或公共 helpers。该边界改变遵从 R4，全部其余派发、generic／partial metadata、错误、ownership 和性能控制保持。共享识别及边界位置由唯一 owner 连续完成。Governs R1-R4、R8-R10。
 - KTD2. F3 只修改 `interactionsUsesAgent`，直接使用 `github.com/tidwall/gjson v1.18.0` 的 validity／exact-key lookup／`String()`，复用 `strings.TrimSpace`。固定 CPA 使用同版本，Go struct 不能保留已核验的 first-wins/exact-key 语义；不开发自制 first-wins parser。Governs R5-R7、R10。
 - KTD3. Interactions owner 负责 `main.go` imports/helper、旧 Agent root 用例、新独立 regression、module 文件及唯一 fixture 的 Agent 函数和必需 GJSON import。stream owner 不改这些位置，fixture 只新增独立 terminal test。Governs R11。
 - KTD4. terminal fixture 使用已有 `gCPANewLocalProducer` 的 custom `p.wire`，不改 public helpers 或 imports。每 case 在请求开始前加锁设置 fixture/wire/records；`setFixture` 不清空 wire，因此每 case 显式设置或清空，custom wire 的实际 model 由 case 自己生成。Governs R1-R4、R11。
@@ -74,7 +76,7 @@ baseline: 7f5e50aa444d31298e3086b0435552bc0ebb9747
 
 ### High-Level Technical Design
 
-两条请求路径复用现有系统边界；产品变化只有分类和字段识别，消费者与 ABI 保持。
+两条请求路径复用现有系统边界；产品变化为 agent 分类、logical 字段识别及已确认完整 metadata 边界，消费者与 ABI 保持。
 
 ```mermaid
 flowchart TB
@@ -85,12 +87,12 @@ flowchart TB
   D -->|普通 model| F[原 global_rules 和 self executor]
   G[Responses upstream SSE] --> H[固定 XAI/Codex Scanner 和 translator]
   H --> I[host callback output units]
-  I --> J[shared scanner 完整验证和字段恢复]
+  I --> J[shared Write 完整值 / metadata边界 / 字段恢复]
   J --> K[原白名单 model 恢复]
   K --> L[原 native / HTTP / WS consumer]
 ```
 
-scanner 的完整值、dispatch 和错误保留分属现有状态；本次只调整哪些已验证 header/type 配对可进入原路径。
+scanner 的完整值、dispatch 和错误保留复用现有状态。header/type 认可后，普通 data-only 仍等待原边界或 EOF，无 LF ordinary/mixed metadata 保持原 zero-output；新确认的完整带 line-ending metadata callback 为已验证前值确认边界，先派发前值，再保字节输出完整 comment。generic 分段和 partial-metadata-characterization 原行为保持。
 
 ```mermaid
 stateDiagram-v2
@@ -99,7 +101,8 @@ stateDiagram-v2
   PendingHeader --> VerifiedValue: 真实 data-only / 完整 JSON / 认可 type
   PendingData --> VerifiedValue: 原 JSON 验证和限定配对成功
   PendingData --> OriginalControl: 不符合限定配对
-  VerifiedValue --> Dispatch: 既有 native boundary / delimiter / EOF
+  VerifiedValue --> Dispatch: 既有 native boundary / 下一 event或data / delimiter / EOF
+  VerifiedValue --> Dispatch: 已确认完整带line-ending metadata单位，先前值后metadata
   Dispatch --> PendingHeader: 原 reset 和下一单位
   PendingHeader --> OriginalControl: 非目标 format / opaque wire
   OriginalControl --> [*]: 保留原控制行为
@@ -146,13 +149,12 @@ sequenceDiagram
   Parent->>Parent: child 结束后才清理临时 library
 ```
 
-任务依赖以实际修改位置为依据。U2/U3 的写入位置已分开；新共享位置须先重新分配。
+任务依赖以实际修改位置为依据。U2 已完成提交保留，U1 的本轮文档审查通过后只启动 fresh U3；两个任务全完成且无位置冲突才合并，新共享位置须先重新分配。
 
 ```mermaid
 flowchart TB
-  A[U1 全部候选 / 覆盖 / 文档门槛] --> B[U2 Interactions owner]
-  A --> C[U3 stream owner]
-  B --> D[核对已提交 hunks 并合并]
+  A[U1 全部候选 / 覆盖 / 更新文档门槛] --> C[fresh U3 stream owner]
+  B[U2 已完成审查提交，保留未合并] --> D[核对已提交 hunks 并合并]
   C --> D
   D --> M[U6 post-fix验收 / 声明移动 / post-module验收]
   M --> E[U4 独立final终验]
@@ -164,29 +166,29 @@ flowchart TB
 - 本计划采用已确认的固定 CPA v7.2.152 行为；将来升级 CPA 时需以新 producer/parser 重新核对，本次不升级。
 - owner 的 worktree 名称、BASE 后的整合 SHA、正式测试源码、DLL hashes、最终版本和 CI/Release IDs 由实际执行产生，不预填。
 - `v0.5.14` 是待核实占用的候选，不能在核对前写成最终发布版本。
-- 完成报告中的原诊断 worktree 已有清理；新的 owner 重新取得正式 RED/GREEN。保留结果与原日志缺失分别说明，原诊断不充当实现完成证据。
+- 早期诊断 worktree 已有清理，其保留结果与原日志缺失分别说明。新三项独立诊断已按 origin spec 保存并核验三个 ZIP；确认绑定冻结 Git source、有效 overlay、新 build 和 canonical/shadow 链，LF／CRLF raw hash、build cwd HEAD、buildinfo VCS 和 production source 身份分别记录，不从旧采样或文件名／相同 hash 推断 source。fresh U3 仍须新的正式 RED/GREEN，任何诊断 GREEN 或旧 U3 部分完成均不充当产品完成证据。
 
 ### Exact Ownership
 
 | owner／单元 | 可修改文件和位置 | 保持不改／交接条件 |
 | --- | --- | --- |
-| U1，协调者和文档审查 | 当前 spec/plan；审查结果 | 不改产品/tests；全部候选终态、二次覆盖和五位独立文档审查完成，阻塞问题修正并复审通过后才分派编码。 |
-| U2，Interactions | `main.go` 的必需 GJSON import（原 imports 3-24）及 `interactionsUsesAgent`（1716-1721）；`main_test.go` 的 `TestHandleModelRouteLeavesInteractionsAgentsNative`（1820-1853）仅 whitespace expected false 改为 true；完整新 `interactions_agent_regression_test.go` 的45个 RPC cases及余下新增 cases；`go.mod`／`go.sum` 的必要 GJSON v1.18.0／match／pretty；fixture 必需 GJSON import 和 `TestModelMapperFunctionalInteractionsAgent`（1932-2027）。 | 不改 `handleModelRoute` caller、executor、scanner、stream regression、公共 CPA helpers；旧输入和其余断言保持。 |
-| U3，stream | `main.go` 的 `sseRewriter.Write`（198-269）和 `findDelimiterlessResponsesEventEnd`（583-778）仅两个 header 谓词、matched 的真实 data-only guard／单向 done alias；`stream_native_fields_regression_test.go` 的5个新增 terminal Tests、logical-metadata-callback-characterization及余下新增 cases；fixture 唯一 `TestModelMapperFunctionalResponsesTerminalFields` 的文件末尾长矩阵及本测试专用局部代码。 | 不改 imports、Agent 函数、module、`main_test.go`、公共 producer/loader/helper、生命周期、batching 和恢复器；全部旧 controls 保持。 |
+| U1，协调者和文档审查 | 当前 spec/plan；审查结果 | 不改产品/tests；新事实须同时更新两文档，当前提交路径实际可读后由协调 workflow 分派五位独立审查，阻塞问题修正并复审通过后只分派 fresh U3；全部候选终态和二次覆盖门槛保持，自审不计独立审查。 |
+| U2，Interactions | 已完成提交 `7f17c7db69d318d84e68a0b5fcd8e0e616bd44f1` 的六文件：`main.go` 必需 GJSON import 及唯一 `interactionsUsesAgent`；`main_test.go` 原 whitespace expected；`interactions_agent_regression_test.go`；`go.mod`／`go.sum` 必要依赖；fixture 必需 GJSON import 及原 `TestModelMapperFunctionalInteractionsAgent`。 | 两份 fresh review 均 `findings=[]`，协调者已核对完整 diff；不重新分派或要求从本轮文档起点重做，保留未合并提交及完整验证。caller、executor、scanner、stream regression、公共 helpers 和其他旧断言不改。 |
+| U3，fresh stream owner | `main.go` 的两个 header 谓词、matched 的真实 data-only guard／单向 done alias，另独占 `sseRewriter.Write` 内已验证完整 data-only 前值与完整带 line-ending metadata 单位的边界和有序派发；`stream_native_fields_regression_test.go` 的5个新增 terminal Tests、logical-metadata-callback-characterization及完整 metadata 边界／余下新增 cases；fixture 唯一末尾 `TestModelMapperFunctionalResponsesTerminalFields` 长矩阵及本测试专用局部代码。 | 复用现有 scanner 状态、drain 和恢复器；不改 scanner 算法、imports、Agent 函数、module、`main_test.go`、公共 producer/loader/helper、JSON 恢复器、生命周期或 batching，不新增 private scanner state 断言；全部旧 controls 保持。 |
 | U6，module | `main.go`、8份新生产文件；`CLAUDE.md`当前架构和README简短布局 | U2/U3无冲突合并后开始，不改ABI/tests/benchmark/fixture/module/Makefile/CI，不从旧源码覆盖修复。 |
 | U4，终验 | U6完成后新整合worktree的证据和验收 | 产品回归交对应 owner 在其 worktree 修正、复审、提交；主会话不补半成品代码。公共入口确需改变时先更新单 owner 所有权。 |
 | U5，协调者 | 经授权的 local main、remote main、tag、Release 验收 | 不创建 PR、force push、移动既有 tag、改 CPA 或删除其他已有工作区。 |
 
-行号只标识 BASE 的核查位置，实施以符号与实际 hunks 为准。两个 owner 可以在同一文件不同已分配位置并行；合并前比较完整 BASE..HEAD。fixture imports 只归 U2，U3 使用现有 imports。出现公共 helper 或同一函数共同修改需求时，先交协调者按依赖或单 owner 更新所有权，再继续。
+位置以符号与实际 hunks 为准，原 BASE 行号只作参考。U2 已提交范围与 fresh U3 的待修改位置分别核对，合并前比较两个任务完整 BASE..HEAD；当前不恢复 U2 写入。fixture imports 只归 U2，U3 使用现有 imports。出现公共 helper 或同一函数共同修改需求时，先交协调者按依赖或单 owner 更新所有权，再继续。
 
 **恢复执行规则：**
 
-1. 本次恢复文档只修改本 plan，origin spec 逐字保持。U2/U3 必须从同一最终已审查文档 HEAD 各建新独立 worktree，各有唯一 fresh owner；原 BASE、文档起点和实际 production/tests 身份分别记录，不自行改变 base。既有位置可并行，新共享 hunk 先由协调者更新单 owner 所有权和依赖。
-2. 已停止的 `wf_e9f307ff-9e1` 的未提交来源永久只读：U2 为 `C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/wf_e9f307ff-9e1-1`，U3 为 `C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/wf_e9f307ff-9e1-2`。因 modified-since-read 冲突停止的 `wf_f90ea0be-a21` 及其可见 owner 工作树永久保留，不读取／复制其未提交文档草稿，不恢复旧 owner、writer 或 script。原来源全部内容不写、不删、不清理；只精确继承下述已证明归属的文件位置，其他 unknown 内容不进入新树提交。
+1. 本轮按新确认事实先修改 origin spec，再修改本 plan，BASE 和原日期保持。U2 的完整提交 `7f17c7db69d318d84e68a0b5fcd8e0e616bd44f1` 及两份 fresh 无 findings 审查保留，协调者已核对六文件完整 diff，尚未合并；不重新分派或从新文档起点重做 U2。本轮最终提交的 spec/plan 路径实际可读且五位独立审查及必要修正／复审通过后，只为 U3 从该文档 HEAD 创建一个新独立 worktree 和唯一 fresh owner。原 BASE、文档起点、production/tests 身份分别记录，新共享 hunk 先由协调者更新单 owner 所有权和依赖。
+2. 已停止的 `wf_e9f307ff-9e1` 的未提交来源永久只读：U2 为 `C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/wf_e9f307ff-9e1-1`，U3 为 `C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/wf_e9f307ff-9e1-2`。因 modified-since-read 冲突停止的 `wf_f90ea0be-a21` 及其可见 owner 工作树永久保留，不读取／复制其未提交文档草稿。当前 blocked U3 来源为 `C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/wf_43831682-e1f-2`，报告 HEAD 仍为 `86a3c2ceb8d5e123015d563c5ab07eefb2670149`，三文件未提交内容和全部证据永久只读。全部旧 owner、writer、script 不恢复，来源不写、不删、不清理；fresh U3 只精确继承下述已证明归属的三文件位置，其他 unknown 内容不进入新树提交。
 3. 四处争议写入已有成功 Edit 和正文匹配证明属于本次助手，具体运行时成因仍未知；来源全树 tracked/untracked/hash 的独立清点未完成，保持 unknown，不宣称 complete。允许的 Read／Glob 仅用于限定源文件。协调者对来源 `git -C status` 的取证已被隔离拒绝，不让 peer／MCP 重做，不修改权限或用户配置；插件仓库的 Git 操作只在执行者自有工作树运行，禁止用 `git -C` 对受保护来源、主会话或其他插件工作树取证或修改。原 `make integration` 对执行者自有 ignored `dist/integration/cpa-src`（或通过现有 `DIST_DIR` 指定的自有专用 ignored 目录下的 `integration/cpa-src`）执行的只读 revision／clean 核查保持；该限定不允许重做已被拒绝的来源取证，不扩大工具权限。
-4. 在自有 ignored 证据目录保存继承来源原文快照，并冻结自有 BASE production、tests、overlay、默认 DLL 身份。原 BASE 的旧集合 manifest 从固定 BASE 对象取得；继承／新增测试 manifest 单独冻结，标明实际被测试的 production 和 DLL。每次实际测试分别记录被测试 production 的 commit/hash、测试源码和 overlay hash、argv/cwd、built/copied/shadow DLL 及 CPA 身份。overlay 只引用冻结的自有副本，不引用旧实时 source；旧 `run.py` 把 owner 当前源码作为 BASE manifest 的方式不得沿用。先在冻结 BASE 上逐 case 取得继承 cases 的目标 RED 或已正确 control，再最小引入已归属产品 hunks 并用同命令取得 GREEN；剩余 slices 按原 Approach 逐条完成。
-5. 每个 owner 独自连续完成 TDD、最小实现、规格／质量自审、修正、复审、全部检查和提交，不联系／恢复其他代理或启动 subagent。测试、构建和证据记录程序均前台顺序执行，不启动后台任务，不续跑旧 writer/script；以最终正常返回主动交付，由 harness 通知协调者。所有独立复核由协调 workflow 在 owner 完成提交后分派，reviewer 只读且不直接联系 writer。该执行限制不减少任何单 owner 完成条件。
-6. U2/U3 各自完成完整 root、vet、race（总 timeout30m）、三个显式 scripts、registration、29个旧 Benchmark 的全部展开 cases、受影响性能计时、issue8、完整旧矩阵与6456精确 keys、默认 DLL 和完整 integration，并至少重复两次各自关联 native 测试。原 native exit1 是重复声明导致的编译失败，未到目标，不计 RED；WinError5 启动失败未执行 race／bench，不计 pass。沿用全部旧断言、数据、内部时限、性能门槛和宿主限制，真实 integration 不得 Skip。
+4. fresh U3 在自有 ignored 证据目录保存限定继承来源原文及 hash，分别冻结固定 BASE 旧集合、继承／新增测试 manifest、自有 production／tests／overlay 和默认 DLL。BASE manifest 从固定 BASE 对象取得，不用当前源码生成；另构造并冻结精确三谓词产品副本及新 DLL，限定 diff 只含已分配谓词和 alias。每次实际测试分别记录 production 的 Git 对象／raw LF或CRLF hash、测试源码和有效 overlay hash、argv/cwd及其 HEAD、built/copied/canonical/shadow DLL 和 CPA 身份，不把 cwd HEAD／VCS metadata 当作编译来源。overlay 只引用冻结自有副本，不引用旧实时 source，不沿用旧 `run.py`。继承 cases 逐条在 BASE 取得目标 RED 或正确 control；新增完整 metadata 边界在 BASE 和三谓词版本各取得目标 RED，再用同命令完成最小 GREEN。余下 slices 按 U3 Approach 连续完成正式 vertical TDD，诊断 GREEN 或旧 U3 部分完成不计产品完成。
+5. fresh U3 owner 独自连续完成 TDD、最小实现、规格／质量自审、修正、复审、全部检查和提交，不联系／恢复其他代理或启动 subagent。测试、构建和证据记录程序均前台顺序执行，不启动后台任务，不续跑旧 writer/script；以最终正常返回主动交付，由 harness 通知协调者。独立产品复核由协调 workflow 在 U3 完成提交后分派，reviewer 只读且不直接联系 writer；U2 已完成的独立审查保留。该执行限制不减少任何单 owner 完成条件。
+6. U2/U3 的完整 owner 门槛保持：完整 root、vet、race（总 timeout30m）、三个显式 scripts、registration、29个旧 Benchmark 的全部展开 cases、受影响性能计时、issue8、完整旧矩阵与6456精确 keys、默认 DLL 和完整 integration，并至少重复两次各自关联 native 测试。U2 已完成证据保留，fresh U3 必须全部完成。旧 `wf_e9f307ff-9e1` native exit1 的重复声明编译失败未到目标，不计 RED；旧 WinError5 未执行 race／bench，不计 pass；新 Grok 的实际断言失败分别记录为目标 RED。沿用全部旧断言、数据、内部时限、性能门槛和宿主限制，真实 integration 不得 Skip。
 7. 交付包含固定 BASE..最终 HEAD 的完整 diff、逐条真实命令与数字 exit、源码／tests／cwd／overlay／DLL 身份、自审修正复审及正常 path-limited commit。未启动或工具拒绝的 exit 保持未知，未完成检查不能计 pass。协调者核对无位置冲突且全部 owner 完成条件满足后才合并；post-fix、post-module、final、10文件模块化和 main／tag／CI／Release 的原门槛全部保持。
 
 ---
@@ -206,13 +208,13 @@ flowchart TB
 **Approach：**
 
 1. 将全部检查域、源码与 CPA 必要路径逐项对应到已完成结果，补查缺失范围。候选均有明确终态，不能用抽样代替全面覆盖。
-2. keepalive 诊断安全回归以 origin spec 所记 a2 完成 ZIP 的实际 source／exit 为依据，协调者已确认该门槛和二次扫描覆盖满足。F1 仍限定 error／keepalive 的 pair、连续 data-only 和 actual Grok comments 对照；原诊断不替代 owner 的正式 TDD。
-3. 文档 owner 完成 inline spec／计划自审、修正、复审与本次文档提交，核对 R/AE/U 对应、所有 callers 和精确所有权。提交后由协调者收集五位独立规格／计划 reviewer 的结果；全部完成且阻塞问题修正、复审通过后才允许 U2/U3 开始编码。原93d9921的五位独立review均findings=[]；本次扩展须在最终文档HEAD重新独立审查，inline自审不计入五位。
-4. 向 U2/U3 同时交付同一含最终文档的已审查整合 HEAD、原始 BASE、完成条件和限定修改位置。二者各自独立 worktree，保护既有 worktree 和用户改动。
+2. 核对 origin spec 的新三项独立诊断、协调只读记录和三个 ZIP 身份；a2 旧成功仅覆盖没有前置 data-only created 的 actual Grok 矩阵。新 BASE／三谓词重复 RED 推翻原仅三谓词的技术范围判断，按 R1/R4/KTD1 将完整 metadata 边界写入两文档，保留二次扫描覆盖、全部产品目标和保护门槛。原诊断不替代正式 TDD。
+3. 文档 owner 先精确修改 spec，再修改 plan，独自完成自审、修正、复审、静态检查和只包含两文档的正常提交，核对 R/AE/KTD/U、callers、所有权和完整验收。提交后路径实际可读，由协调 workflow 分派五位独立规格／计划 reviewer；全部完成且阻塞问题修正、复审通过前，U3 产品写入保持暂停。原93d9921的五份无 findings 结果不覆盖本轮新事实，自审不计五位独立审查。
+4. 保留 U2 已完成提交、两份 fresh review 和协调者六文件完整 diff 核查，不重派 U2。只向 fresh U3 交付本轮最终已审查文档 HEAD、固定 BASE、限定继承 source、完成条件和精确位置，创建一个新独立 worktree 和唯一 owner；不恢复旧 U3/writer/script。U2/U3 全完成并核对无位置冲突后才合并。
 
 **Test expectation：**本单元不修改或运行产品 tests；核验文档 frontmatter、真实 paths/symbols/test names、diff 和证据完整性。
 
-**Verification：**全部检查范围和候选终态可核查，文档无阻塞问题且已提交；U2/U3 只能在满足本单元后开始编码。
+**Verification：**全部检查范围和候选终态可核查，两文档已修正并提交，本轮五位独立审查及必要复审无阻塞问题；U2 已完成交付保留，fresh U3 只能在本单元满足后开始产品写入。
 
 ### U2. 统一 Interactions agent 分类并保存真实 native 回归
 
@@ -220,15 +222,15 @@ flowchart TB
 
 **Requirements：**R5-R11，AE4-AE6，KTD2/KTD3/KTD5。
 
-**Dependencies：**U1；与 U3 并行，使用同一已审查起点。
+**Dependencies：**原 U1 门槛已满足，本单元已完整提交并独立审查，保留未合并提交；本轮不重新分派 U2，等待 fresh U3 全完成及无冲突核查。
 
 **Files：**Exact Ownership 的 U2 文件。相关现存 tests 包括 `TestHandleModelRouteLeavesInteractionsAgentsNative`、`TestHandleModelRouteIgnoresUnusedBody`、`TestHandleModelRouteSkipsClaudeCountTokens` 和 fixture 的同名 Agent 函数。
 
-**Execution note：**逐条测试 -> 实际目标 RED -> 最小实现 -> GREEN，再进入下一行为。按 R17 从既有 model_route RPC 的结果观察分类，helper 的 true/false 是行为说明，不新增直接耦合其实现的测试。whitespace旧expected纠正属于RED阶段，private overlay不代替正式TDD。
+**Execution note：**本单元已在原已审查起点完成正式逐条 TDD、全部 slices 和 owner 验收，提交为 `7f17c7db69d318d84e68a0b5fcd8e0e616bd44f1`。下文 Approach／Test Scenarios 保留原完整验收要求，供核对该交付，不指示从本轮文档起点重做。按 R17 从 model_route RPC 观察分类，不新增 helper 实现耦合测试；whitespace expected 纠正及 BASE RED／当前 GREEN 属于正式证据，private overlay 不代替 TDD。
 
-继承仅限已证明归属的六文件／hunks：`main.go` 的必需 GJSON import 和唯一 helper，`main_test.go` 的 whitespace expected false 改为 true，完整 `interactions_agent_regression_test.go` 的45个 RPC cases，`go.mod`／`go.sum` 的必要 GJSON v1.18.0／match／pretty，以及 fixture 的必需 GJSON import 和原 Agent 函数。按恢复执行规则冻结 BASE 和自有测试／overlay／默认 DLL，先将这些继承 cases 逐条记录为 BASE 目标 RED 或已正确 control，完成后才最小引入产品 hunks 并取得同命令 GREEN。继承测试不替代剩余 slices 的逐条 TDD；已由同一 helper 修复的 case仍在冻结 BASE 证明失败。
+已完成范围为 Exact Ownership 的六文件／hunks，包括原45个 RPC cases及补齐的 native slices。两份 fresh reviewer 均 `findings=[]`，协调 worktree 的 `dist/functional-audit-fixes-20261011/coordination/U2-host-inspection-wf_31e9e13c-e72.json` 记录完整 diff、六文件范围和正式验收核查；证据、提交及未合并状态保留。
 
-原 `research-agent` stream/nonstream 控制、ASCII-tab 和 missing 必须保留，Test Scenarios 的剩余 native 矩阵全部补齐，包括原始 body、calls、URI、headers 和完整 response/SSE。保留各自关联 native 两轮及恢复执行规则列明的全部 owner 检查、自审修正复审和正常提交；不得以45个 RPC cases 或旧 private overlay 代替真实 native／完整 integration。
+原 `research-agent` stream/nonstream、ASCII-tab、missing、raw body/calls/URI/headers 和完整 response/SSE 控制继续保留。U2 的两轮关联 native、完整 owner 检查、自审修正复审和正常提交结果保持；不以45个 RPC cases 或旧诊断替代完整 integration，也不重新分派本单元。
 
 **Approach：**
 
@@ -254,41 +256,41 @@ flowchart TB
 
 ### U3. 恢复 Responses 非 response.* 事件和完成别名
 
-**Goal：**F1 error 保留原错误数据，keepalive 后的 completion 正常到达；F2 完整 completed 可由 HTTP/WS 识别。
+**Goal：**F1 error 保留原错误，JSON keepalive 后的 completion 及真实 Grok created/comment/completed 的边界、顺序和模型正确，完整 completion 正常到达；F2 完整 completed 可由 HTTP/WS 识别。
 
 **Requirements：**R1-R4、R8-R11，AE1-AE3、AE7，KTD1/KTD4/KTD5。
 
-**Dependencies：**U1；与 U2 并行。F1/F2 在本 owner 内连续完成，不能并行修改同一 scanner。
+**Dependencies：**本轮 U1 两文档提交和五位独立审查／必要复审通过。U2 已完整提交且审查通过，保留未合并；fresh U3 在新的独立 worktree 连续完成 F1/F2，不恢复旧 owner，不并行修改同一 scanner。
 
 **Files：**Exact Ownership 的 U3 文件；相关现存 controls 为 `TestFunctionalNativeSSEFieldDiscriminator/mismatch-control`、`TestFunctionalNativeSSEFieldDataOnlyTypeControl`、`TestFunctionalNativeSSEFieldFormatIsolation`、`TestFunctionalNativeSSEFieldWireControls`、ordinary/mixed metadata、limit/continuation/dispatch，以及 forwarder/error 回归。
 
 **Execution note：**每个行为连续完成最小测试、BASE目标RED和最小GREEN，再进入下一条；按 R17 从既有输出和 forwarder 入口核查新增行为，保留原状态／游标控制。重新保留exact-byte/native/HTTP证据，不批量写全部tests后再实现。
 
-继承仅限已证明归属的三文件／hunks：`main.go` 的两个 header 谓词、matched 的真实 data-only guard／单向 done alias，`stream_native_fields_regression_test.go` 的5个新增 terminal Tests及 logical-metadata-callback-characterization，以及 fixture 的两个同名 `TestModelMapperFunctionalResponsesTerminalFields`。先保存来源原文的自有只读快照，只在新树精确删除位于 `gCPALoadNative` 后、旧 `TestModelMapperFunctionalNativeProducerFields` 前的短重复函数，保留文件末尾长矩阵、5个 tests、characterization 和全部旧 controls；原来源保持只读，其他 unknown 内容不纳入提交。
+继承来源只读 `C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/wf_43831682-e1f-2`，只包含已证明归属的三文件／hunks：`main.go` 两个 header 谓词、matched 的真实 data-only guard／单向 done alias；`stream_native_fields_regression_test.go` 的5个新增 terminal Tests 和 logical-metadata-callback-characterization；fixture 文件末尾唯一 `TestModelMapperFunctionalResponsesTerminalFields` 长矩阵及本函数局部代码。先冻结源原文／hash和继承／新增测试清单；不复制 source 的其他 unknown 改动，不从旧 `wf_e9` 继承其短重复函数，不恢复旧 owner/script，所有来源及证据永久只读。
 
-去除新树的短重复块后，先用冻结 BASE production／默认 DLL 和冻结自有 tests／overlay 逐 case 完成继承 cases 的目标 RED 或已正确 control，完成后才最小引入已归属产品 hunks 并取得同命令 GREEN，再逐条补齐 Test Scenarios 的剩余 slices。原重复声明的 native exit1 不计目标 RED，WinError5 未运行的 race／bench 不计 pass。保存 exact-byte、producer/native/HTTP/WS 的实际输出和身份，关联 native 至少两轮；恢复执行规则中的全部 owner 检查、自审修正复审和正常提交均须由同 owner 完成。
+先取得固定 BASE 旧集合及新测试的自有快照，用新 build 的 BASE／精确三谓词 DLL 和有效自有 overlay 记录实际 source、tests、cwd HEAD及 built/copy/canonical/shadow 身份。继承 cases 各自先证明 BASE 目标 RED 或正确 control，未完成 slices 继续正式 vertical TDD；新完整 metadata case 在 BASE 和三谓词版本均取得实际目标 RED后才最小 GREEN。原编译重复声明或 WinError5 不计 RED/pass，诊断 GREEN 和旧 U3 部分完成不计正式完成。关联 native 至少两轮，恢复规则的全部 root/vet/race30m/scripts/registration/29bench/计时/build/default Version/integration、旧集合与6456验收、自审修正复审、commit及提交后独立 review全部保持。
 
 **Approach：**
 
-1. 保存 BASE source／默认 DLL身份。按 error pair、error data-only、keepalive pair、keepalive data-only、done alias和dispatch/forwarder行为逐条执行 vertical slice：新增最小测试 -> 实际目标 RED -> 最小实现 -> 同命令 GREEN -> 下一行为。测试归属计划新增的 `TestFunctionalNativeSSEFieldError`、`TestFunctionalNativeSSEFieldKeepalive`、`TestFunctionalNativeSSEFieldDoneAlias`、`TestFunctionalNativeSSEFieldTerminalDispatch`、`TestFunctionalNativeSSEFieldTerminalForwarder`；复用 `gNativeParts`，不改旧 mismatch expected。已被前一共享修复覆盖的 case记录 BASE RED和当前GREEN，不制造虚假RED。
-2. F1最终修改限两个header谓词及data-only type谓词。新增无header许可须核查 `s.dataStart == s.headerStart`，精确增加error／keepalive；保留opaque discriminator控制、完整JSON验证和原恢复／派发。F2在原matched判定只增加header done／type completed这一方向，header/data.type不改。无model marker的error／keepalive同样有效。
-3. 唯一 CPA fixture 的新 `TestModelMapperFunctionalResponsesTerminalFields` 逐条添加真实 producer/native/HTTP/WS slice，每条BASE DLL目标RED、当前DLL GREEN后再下一条。复用custom wire/canonical loader/native drain等；每case请求前加锁设置或清空wire/records/fixture，实际model由case生成。对照真实非Grok单位、validator、direct／disabled／unmapped、actual Grok comments、no-keepalive和普通data-only completion；至少重复两次，实际状态/error按入口记录。
-4. 所有Test Scenarios完成后，核查完整scanner/reset/EOF/error/dispatch，运行关联unit、allocation/性能、三个scripts、全量root/vet/race和本owner真实terminal integration；旧矩阵和新cases分别核对。
-5. 同 owner 完成规格／质量审查，核对三处谓词、mismatch、opaque/generic/其他formats及chunks+error调用；修正后重测、复审和正常commit，主动回报完整diff和正式证据。
+1. 按恢复规则冻结固定 BASE 旧集合、限定 source 原文／hash、继承／新增测试清单、自有 tests／overlay，以及新 BASE／精确三谓词默认 DLL 身份。保留5个 root 名称：`TestFunctionalNativeSSEFieldError`、`TestFunctionalNativeSSEFieldKeepalive`、`TestFunctionalNativeSSEFieldDoneAlias`、`TestFunctionalNativeSSEFieldTerminalDispatch`、`TestFunctionalNativeSSEFieldTerminalForwarder`。继承 cases 先各自取得 BASE 目标 RED 或正确 control；新增 AE7 完整 comment 边界在 TerminalDispatch／TerminalForwarder 补永久 exact-byte/per-Write/Finish/error cases，分别证明 BASE 和三谓词目标 RED。余下 error pair/data-only、keepalive pair/data-only、alias 和 dispatch/forwarder slices 逐条执行最小测试 -> 目标 RED -> 最小实现 -> 同命令 GREEN -> 下一行为，复用 `gNativeParts`，不改旧 mismatch 或 characterization。前一共享修复已覆盖的 case记录冻结 BASE RED／当前 GREEN，不制造虚假 RED。
+2. 保留 F1 两个 header 谓词及 data-only type 判定，真实 data-only 许可仍以 `s.dataStart == s.headerStart` 约束，精确增加 error／keepalive；F2 在 matched 只增加 header done／type completed 单向 alias，header/data.type 不改，无 model marker 同样有效。另在 Write 处理已验证完整 data-only 前值与完整带 line-ending metadata 的边界，以现有状态、drain、rewritePendingEvent和白名单恢复器先派发前值，再处理原 comment。具体 patch 以正式 GREEN及全部保护控制为依据，不把单独删除换行 guard 当作充分修复；不普遍提前派发完整 data-only，不改无 LF ordinary/mixed metadata zero-output、generic分段或partial characterization，不扩展 scanner 算法／恢复器／生命周期／batching／公共 helpers。确需进一步范围时交协调者更新后再继续。
+3. 唯一末尾 `TestModelMapperFunctionalResponsesTerminalFields` 长矩阵逐条完成真实 producer/native/HTTP/WS slice，每条 BASE DLL 目标 RED／正确 control、当前 DLL GREEN 后再下一条；新 Grok 排列另保留三谓词 DLL 目标 RED。whole／bytewise × pair／data-only × created／no-created 的 Grok 和普通 completed，非 Grok keepalive/error/done alias、metadata 各位置、direct／disabled／enabled-unmapped两个实际 model及no-keepalive全部保持。复用custom wire/canonical loader/native drain，每case请求前加锁设置或清空wire/records/fixture，实际model由case生成；核查真实非空callback、合法JSON、数量/顺序/model/status/完整output及原请求，不依赖nil/empty或native与HTTP delimiter equality。关联 native至少两轮，状态/error按入口记录。
+4. 所有 Test Scenarios 完成后，核查完整 scanner/reset/EOF/error/dispatch，执行恢复规则全部 root/vet/race30m、三个显式 scripts、registration、29个旧 Benchmark全部展开cases及受影响性能计时、默认build和完整integration。原323/60/24/29、展开cases、6456、issue8四cases、36个旧native fields、内部timeout和所有性能门槛保持，旧矩阵和新增cases分别核对，真实integration不得Skip。
+5. 同 owner 完成规格／质量自审，核对限定谓词／alias／完整metadata边界及mismatch、opaque/generic/partial/其他formats、chunks+error、ownership／allocation／cursor／关闭顺序；修正后重测、复审和正常path-limited commit，主动交付完整diff及正式证据。协调workflow在提交后分派独立产品review；任何扩大共享位置先协调，不能把未完成步骤交主会话。
 
 **Test Scenarios：**
 
 1. Covers AE1。独立 error/error pair 与 data-only，单 terminal、created 后 error、Flush／Finish；code/message/param 原字节保持，无 model marker 也有效。
 2. Covers AE2。done/completed 单 terminal 与 created 后 completion；原 header 保留，type 为 completed，所有允许 model 恢复，完整 output／opaque 数字表示保持。
-3. Covers AE7。keepalive pair、连续 data-only 和两者合法交替后接完整 completion；native 两个 data 单位有效，HTTP/WS 获得完整 completion，keepalive 原文保持。不能只添加 pair 测试。
-4. 每次 Write 后检查累计有效 data、顺序和完整内容，metadata 不增加 data 帧，data-only 时点沿用原策略；迟到 LF/CRLF 不重复派发。
+3. Covers AE7。keepalive pair、连续 data-only 和两者合法交替后接完整 completion；native 两个 data 单位有效，HTTP/WS 获得完整 completion，keepalive 原文保持。新增真实 Grok 三 callbacks：无 LF data-only created -> 完整 `: keepalive\n\n` -> 无 LF data-only completed，永久 root 和真实 native/HTTP/WS 均要求合法 created/completed、准确 model/status、完整 output和原 comment，不合并 JSON。该新增 case 在 BASE和三谓词版本分别目标 RED，再最小 GREEN。
+4. TerminalDispatch 使用 origin spec Stream回归给定的三个 exact输入：无LF created data、完整 `: keepalive\n\n`、无LF `data: ` + `gNativeCompleted`。逐Write expected分别为零输出、`data: {"type":"response.created","response":{"model":"grok-4.6","status":"in_progress","output":[]}}\n\n: keepalive\n\n`、零新增输出；Flush/Finish只输出一次 `data: ` + `gNativeCompletedWant` + `\n\n`。累计只有两个合法 data events，零额外 data，顺序、comment bytes、所有白名单及opaque内容保持。保留 no-created／pair-created／no-comment／无LF comment控制；普通 data-only不普遍提前派发，无LF ordinary/mixed metadata期间原zero-output、迟到LF/CRLF不重复派发及partial characterization保持。
 5. Covers AE3。原 `Discriminator/mismatch-control`、reverse alias、unknown/missing/null/nonstring type；error／keepalive header 配其他 type 仍为 mismatch，opaque header 被清空的 discriminator 不获得新增许可，闲置 `event_type=17/false` 保持 opaque。
 6. LF/CR/CRLF 标准 wire，whole／全部双分片／bytewise、BOM、前置及 in-event/between-event metadata 和 opaque comment；generic callback read 不变成新增字段边界。
-7. callback/in-band 错误、Payload+Done、完整前缀+incomplete tail、16MiB 限额、完整大单位、ownership、增量游标与 batching；原错误和关闭策略不变。
-8. 真正 XAI error、非 Grok Codex keepalive、done alias 与普通 completed，field-pair/data-only、terminal-only/after-created、whole/bytewise 网络写入，direct／mapped／unmapped／disabled 两个实际 model。检查原始 callback 单位、HTTP 状态与错误、type/event/model、完整 output 和 upstream 请求；actual Grok comments 与无 keepalive 控制保持。
+7. TerminalForwarder 对新增 created/comment/completed 排列覆盖自然EOF、Payload+Done、callback/in-band/cleanup error、emit失败以及完整prefix+error；保留 valid pending输出、原primary/cleanup错误、emit失败停止、无额外读取及关闭顺序。原完整前缀+incomplete tail、16MiB限额、完整大单位、ownership、allocation、增量游标、batching和生命周期断言全部保持，不新增私有scanner状态断言。
+8. 真正 XAI error、非 Grok Codex keepalive、done alias 与普通 completed 的原矩阵保持；actual Grok comment 和普通 completed均完整覆盖whole／bytewise × field-pair／data-only × created／no-created及metadata各位置。direct／mapped／enabled-unmapped／disabled两个实际model逐项核查core／host的非空callback、native原始emit、HTTP状态／错误、WS JSON、type/event/model/status、完整output、upstream body/headers/URI/calls。无keepalive对照保持，各入口按自身framing验收，不依赖nil/empty或跨入口delimiter字节相等。
 9. error-only WS 保持 fixed direct 的 1006 边界；keepalive+completion 和 F2 mapped WS 必须收到完整 completion，与正常 direct／disabled／unmapped 对照。不得将所有路径的预期统一为 `wsErr=nil`。
 
-**Verification：**新 error／keepalive／alias root 与真实 producer/native/HTTP GREEN，keepalive 和 F2 WS 正常完成，error-only WS 边界准确；全部原控制与性能门槛保持，审查、修正、复审和提交完成。
+**Verification：**继承 cases 的 BASE RED／正确 control身份可核查，新增完整metadata边界的BASE及精确三谓词目标RED真实成立，最小实现后5个root完整cases及真实producer/native/HTTP/WS GREEN。Grok created/comment/completed和全部keepalive/F2 WS正常完成，error-only WS边界准确；至少两轮关联native及全部owner完整验收、原控制／性能门槛、自审修正复审、正常提交和提交后独立review完成，不能以诊断或旧部分完成替代。
 
 ### U6. 从修复后 GREEN 源码完成纯声明模块化
 
@@ -376,9 +378,9 @@ flowchart TB
 | --- | --- | --- |
 | U2新root和旧expected修正 | `go test . -run '^TestFunctionalInteractionsAgent(Classification|Route)$|^TestHandleModelRouteLeavesInteractionsAgentsNative$' -count=1 -v` | BASE目标RED，fixed全部GREEN，未因无关setup失败停止。 |
 | U2真实native | fixed CPA自有overlay的 `^TestModelMapperFunctionalInteractionsAgent$`，至少重复两次 | stream/nonstream model/native路径、原body、controls全部GREEN。 |
-| U3新root | `go test . -run '^TestFunctionalNativeSSEField(Error|Keepalive|DoneAlias|TerminalDispatch|TerminalForwarder)$' -count=1 -v` | BASE error、keepalive pair/连续 data-only、alias 目标 RED；修复后 exact-byte/dispatch/error 全部 GREEN。 |
-| U3原native controls | `go test . -run '^TestFunctionalNativeSSEField|^TestFunctionalLogicalEventFormatIsolation$' -count=1 -v` | discriminator/mismatch、data-only、formats、metadata/mixed/limit等原控制保持。 |
-| U3真实producer/native/HTTP/WS | fixed CPA 自有 overlay 的 `^TestModelMapperFunctionalResponsesTerminalFields$`，至少重复两次 | error native/HTTP 原错误保持，keepalive pair/连续 data-only 和 F2 完整 completion；direct／disabled／unmapped、actual Grok comments 与 no-keepalive 对照正常。 |
+| U3新root | `go test . -run '^TestFunctionalNativeSSEField(Error|Keepalive|DoneAlias|TerminalDispatch|TerminalForwarder)$' -count=1 -v` | 继承cases的BASE目标RED／正确control；新增created/full-comment/completed在BASE与精确三谓词版本分别目标RED，最小修复后exact bytes/per-Write/两条合法data/顺序/comment/model/output/Flush/Finish/error全部GREEN。 |
+| U3原native controls | `go test . -run '^TestFunctionalNativeSSEField|^TestFunctionalLogicalEventFormatIsolation$' -count=1 -v` | 原36个fields及全部展开cases，discriminator/mismatch、普通data-only等待、无LFordinary/mixed metadata zero-output、generic任意分段/LF/CR/CRLF/BOM/late delimiter、partial characterization、formats/limits/ownership/allocation/cursor原控制保持。 |
+| U3真实producer/native/HTTP/WS | fixed CPA 自有 overlay 的 `^TestModelMapperFunctionalResponsesTerminalFields$`，至少重复两次 | error native/HTTP原错误、keepalive pair/连续data-only和F2完整completion；whole／bytewise × pair／data-only × created／no-created的Grok和普通completed及全部原矩阵GREEN，direct／disabled／enabled-unmapped两个model、no-keepalive正常；各层合法内容/数量/顺序/完整output验收，不以nil/empty或跨入口delimiter equality判定。 |
 | U3性能 | 全部现存allocation tests和 `BenchmarkStreamChunkRewriterNativeFieldContinuation`／完整benchmark preflight | 原门槛、byte-exact、ownership、增量游标保持；不以allocationGREEN宣称新性能提升。 |
 
 ### 三阶段执行矩阵
@@ -501,11 +503,11 @@ fixed mixed direct/disabled HTTP的completed缺失按原fixture byte-exact控制
 
 ## Definition of Done
 
-- U1的完整覆盖、候选终态与文档审查门槛已满足，F1-F3范围及所有权明确。
-- U2/U3各自在自己的worktree完成正式TDD、最小GREEN、关联和全量验证、规格／质量审查、修正、复审和正常commit；没有留给主会话补写的半成品。
-- 两个任务的完整diff符合Exact Ownership，公共fixture/import/helper冲突已按依赖解决，协调者只合并已完成提交。
+- U1的完整覆盖、候选终态和本轮两文档五位独立审查／必要复审门槛满足，F1/R1/R4/KTD1及U3完整metadata边界、保护控制和所有权一致；文档自审不冒充独立审查，审查通过前不恢复产品写入。
+- U2已完成提交及两份fresh review保留，不重新分派；fresh U3从本轮最终已审查文档HEAD的新独立worktree，完成限定继承cases的BASE RED／正确control、完整metadata新case的BASE及三谓词目标RED、最小GREEN、至少两轮关联native和全部owner验收、自审修正复审、正常commit及提交后独立review，没有半成品交主会话。
+- 两个任务全完成，完整diff符合Exact Ownership，公共fixture/import/helper及新共享位置已按单owner依赖解决，协调者确认无位置冲突后才合并。
 - U6完成post-fix和post-module完整验收、声明等价与ABI/tests/fixture逐字证明、当前架构更新、审查修正复审和独立commit。
 - U4用包含U6的最终整合源码完成Verification Contract、R12/R13/R15-R18；所有新旧R/AE有实际证据，private诊断和已缺失原日志不替代正式验收。
 - U5经真实授权完成localmain/remote main/tag、七平台CI和Release全部资产验收，实际版本与最终SHA相符。
 - 本次新增的无用代码、重复helper、实验fallback和废弃尝试已经移除；原无关代码、配置、worktree和用户文件保持。
-- 最终报告给出真实 commit、路径、命令、exit、CI 与 Release 证据，明确未运行的外部账号、非本机 runtime 和其他限制；error-only WS 保持固定 CPA 的既存边界，keepalive+completion 和 F2 WS 满足正常完成验收。
+- 最终报告给出真实 commit、路径、命令、exit、CI 与 Release 证据，分别记录Git内容／LF和CRLF raw source、build cwd HEAD、有效overlay和built/copy/canonical/shadow身份，明确未运行的外部账号、非本机runtime和其他限制；error-only WS保持固定CPA既存边界，真实Grok created/comment/completed、全部keepalive+completion和F2 WS满足完整正常验收。
