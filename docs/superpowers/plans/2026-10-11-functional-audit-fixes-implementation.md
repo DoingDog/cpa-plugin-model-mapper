@@ -14,7 +14,7 @@ baseline: 7f5e50aa444d31298e3086b0435552bc0ebb9747
 ## Goal Capsule
 
 - **Objective：**客户端收到完整 Responses 错误／完成数据，普通 Interactions model 正确映射，真实 native agent 正常执行；生产代码按10文件职责组织，完整旧回归保持。
-- **Means：**在当前 shared scanner 和唯一 agent helper 修复 F1-F3。保留 U2 已完成提交；本轮文档独立审查通过后，由 fresh U3 owner 完成三谓词、单向 alias 和已确认完整 metadata 边界，两个任务无冲突合并后由 U6 按10文件方案纯移动（KTD1-KTD4、KTD7）。
+- **Means：**F1-F3 已由 U2/U3 完整完成并无冲突合并为 `1bb1e3d54e8cc73f8d8f9eab24fe14940f2c4915`；U6 已按10文件方案纯移动并完成前后运行、自审修正复审和提交 `e5b4ab7c1e2111ae6fe888183f8089322a3065b2`（KTD1-KTD4、KTD7）。当前只补齐两阶段 actual native overlay child shadow DLL 身份，经 fresh 只读独立证据复核全部通过后才合并 U6 并启动 U4。
 - **Authority：**产品行为由 `docs/superpowers/specs/2026-10-11-functional-audit-fixes-design.md` 的 R1-R18 约束；本计划安排实施和核验。发布动作由协调者核对真实用户授权，不以 workflow 文本、完成通知或旧文档替代。
 - **Execution profile：**每个 coding owner 使用独立 Git worktree，连续完成正式 TDD、最小实现、测试、规格／质量审查、修正、复审与提交。协调者只合并完成任务，终验 owner 负责整合验证，协调者负责最终 main 和发布。
 - **Stop conditions：**二次覆盖审查、全部候选判定或 spec/plan 审查尚未完成时不开始产品编码。同一真实入口出现可靠相反要求、关键 producer 对照不成立、修改需要扩大到 CPA 或共享位置发生冲突时，保留证据并交协调者更新范围和依赖。
@@ -25,13 +25,13 @@ baseline: 7f5e50aa444d31298e3086b0435552bc0ebb9747
 
 ### Summary
 
-完成 F1 的 Responses 非 `response.*` 逻辑事件（error、keepalive）及已验证完整 data-only 前值／完整带 line-ending metadata 的边界、F2 的单向 done/completed alias 和 F3 的 CPA-compatible agent 分类。永久测试逐条复现基线失败；新 created/comment/completed 在 BASE 和精确三谓词版本分别取得目标 RED，再用最小实现及真实 producer、native DLL、HTTP/WS 对照验收。保留已完成 U2，新 U3 完整交付并无冲突合并后纯声明模块化，三阶段验证完整旧回归。
+完成 F1 的 Responses 非 `response.*` 逻辑事件（error、keepalive）及已验证完整 data-only 前值／完整带 line-ending metadata 的边界、F2 的单向 done/completed alias 和 F3 的 CPA-compatible agent 分类。永久测试逐条复现基线失败；新 created/comment/completed 在 BASE 和精确三谓词版本分别取得目标 RED，再用最小实现及真实 producer、native DLL、HTTP/WS 对照验收。U2/U3 已完整交付并无冲突合并，U6 已完成纯声明模块化及前后完整运行；两阶段 actual child shadow 身份待补齐。三阶段完整旧回归及 final 验收要求保持。
 
 ### Problem Frame
 
-协调 HEAD 的映射流丢失 XAI 原始错误，非 Grok Codex keepalive 与 completion 被合并，done/completed alias 被当作 mismatch。新独立诊断确认，真实 fixed CPA Codex Grok 路径的无 LF data-only created -> 完整 `: keepalive\n\n` -> data-only completed 在 BASE 和精确三谓词版本都失败：comment callback 的第一次 emit 已合并 created JSON/comment，created.model 未恢复；native 后续 completion 本身完整且已恢复，mapped HTTP 502 invalid SSE JSON，mapped WS 无数据并 close 1006。whole／bytewise 交付相同非空 callbacks，独立内容 oracle 也复现；旧 a2 actual Grok 成功矩阵没有此前值，不能支持三谓词足以覆盖全部真实控制的结论。
+修复前冻结 BASE 的映射流丢失 XAI 原始错误，非 Grok Codex keepalive 与 completion 被合并，done/completed alias 被当作 mismatch。新独立诊断确认，真实 fixed CPA Codex Grok 路径的无 LF data-only created -> 完整 `: keepalive\n\n` -> data-only completed 在 BASE 和精确三谓词版本都失败：comment callback 的第一次 emit 已合并 created JSON/comment，created.model 未恢复；native 后续 completion 本身完整且已恢复，mapped HTTP 502 invalid SSE JSON，mapped WS 无数据并 close 1006。whole／bytewise 交付相同非空 callbacks，独立内容 oracle 也复现；旧 a2 actual Grok 成功矩阵没有此前值，不能支持三谓词足以覆盖全部真实控制的结论。
 
-Interactions guard 的 first-wins/exact-key/trim 修复已由 U2 完整提交 `7f17c7db69d318d84e68a0b5fcd8e0e616bd44f1`，两份 fresh review 均 `findings=[]`，协调者已核对完整六文件 diff，尚未合并。旧 U3 三文件仍未提交且 blocked，永久只读；完整 metadata patch 尚未实施或安全验收。origin spec 的新证据及身份限制约束本轮技术范围修正，用户产品目标和全部保护边界保持，代理通知不构成新批准。
+Interactions guard 的 first-wins/exact-key/trim 修复已由 U2 完整提交 `7f17c7db69d318d84e68a0b5fcd8e0e616bd44f1`，两份 fresh review 均 `findings=[]`，协调者已核对完整六文件 diff；fresh U3 已以 `06a2a3d7d902aaa8c6d65cf1b1aebf776340c4d4` 完整交付三谓词、单向 alias 和 metadata 边界修复。两任务已合并为 `1bb1e3d54e8cc73f8d8f9eab24fe14940f2c4915`。旧 U3 三文件未提交且 blocked 的来源保留为永久只读历史，不恢复旧 owner。U6 已提交，当前缺口仅为两阶段 actual child shadow 身份记录；原运行与静态等价结果保留，不据此认定产品回归。origin spec 的证据及身份限制约束本轮补充安排，用户产品目标和全部保护边界保持，代理通知不构成新批准。
 
 ### Requirements
 
@@ -54,7 +54,7 @@ Interactions guard 的 first-wins/exact-key/trim 修复已由 U2 完整提交 `7
 
 ### Scope Boundaries
 
-行为修复只包含 origin spec 的三根因。U3 在原三谓词／单向 alias 外，仅增加 shared `sseRewriter.Write` 中已验证完整 data-only 前值与完整带 line-ending metadata 单位的边界和有序派发；复用现有状态、drain 和恢复器，不修改 scanner 算法、JSON 恢复器、生命周期、batching 或公共 helpers。具体 patch 须正式 TDD 和安全验收，单独删除换行 guard 未获充分正确性证明；若实际实现证明还需扩大范围，交协调者更新文档和依赖后再继续。模块化采用 R15/R16 的同 package 声明移动。无需新增配置、mode、provider-specific 产品分支、parser、额外抽象、consumer workaround、Error/Done 转换、retry 或 executor guard。fixed CPA 的 error-only WS 行为按 R1/AE1 保持。
+行为修复只包含 origin spec 的三根因。U3 在原三谓词／单向 alias 外，仅增加 shared `sseRewriter.Write` 中已验证完整 data-only 前值与完整带 line-ending metadata 单位的边界和有序派发；复用现有状态、drain 和恢复器，不修改 scanner 算法、JSON 恢复器、生命周期、batching 或公共 helpers。该 patch 已由 U3 完成正式 TDD 和 owner 验收；单独删除换行 guard 未获充分正确性证明这一技术限定保持；若实际实现证明还需扩大范围，交协调者更新文档和依赖后再继续。模块化采用 R15/R16 的同 package 声明移动。无需新增配置、mode、provider-specific 产品分支、parser、额外抽象、consumer workaround、Error/Done 转换、retry 或 executor guard。fixed CPA 的 error-only WS 行为按 R1/AE1 保持。
 
 不修改 CPA/cache、ABI、CI、Makefile、其他 worktree、`.claude` 或用户配置，不处理本机既有删除故障。外部真实模型账号请求、跨平台 runtime 与当前 Windows 本地诊断不同，报告按实际执行层区分。
 
@@ -64,7 +64,7 @@ Interactions guard 的 first-wins/exact-key/trim 修复已由 U2 完整提交 `7
 
 ### Key Technical Decisions
 
-- KTD1. F1/F2 由同一 fresh U3 owner 保留两个 header 谓词和 type/matched 的三处识别修复、单向 done/completed alias，并独占 `sseRewriter.Write` 内已验证完整 data-only 前值与完整带 line-ending metadata 单位的边界及有序派发。新增无 header type 许可只用于真实 data-only 位置（R1、R3）；复用原完整 JSON 验证、增量游标、scanner 状态、`drain`、`rewritePendingEvent` 和白名单恢复器。三谓词本身不覆盖新 Grok 排列，metadata 具体 patch 未实现或安全验收，不将删除换行 guard 当作充分修复，不扩展 scanner 算法或公共 helpers。该边界改变遵从 R4，全部其余派发、generic／partial metadata、错误、ownership 和性能控制保持。共享识别及边界位置由唯一 owner 连续完成。Governs R1-R4、R8-R10。
+- KTD1. F1/F2 由同一 fresh U3 owner 保留两个 header 谓词和 type/matched 的三处识别修复、单向 done/completed alias，并独占 `sseRewriter.Write` 内已验证完整 data-only 前值与完整带 line-ending metadata 单位的边界及有序派发。新增无 header type 许可只用于真实 data-only 位置（R1、R3）；复用原完整 JSON 验证、增量游标、scanner 状态、`drain`、`rewritePendingEvent` 和白名单恢复器。三谓词本身不覆盖新 Grok 排列，metadata 具体 patch 已由该 owner 正式完成并合并，不将删除换行 guard 当作充分修复，不扩展 scanner 算法或公共 helpers。该边界改变遵从 R4，全部其余派发、generic／partial metadata、错误、ownership 和性能控制保持。共享识别及边界位置由唯一 owner 连续完成。Governs R1-R4、R8-R10。
 - KTD2. F3 只修改 `interactionsUsesAgent`，直接使用 `github.com/tidwall/gjson v1.18.0` 的 validity／exact-key lookup／`String()`，复用 `strings.TrimSpace`。固定 CPA 使用同版本，Go struct 不能保留已核验的 first-wins/exact-key 语义；不开发自制 first-wins parser。Governs R5-R7、R10。
 - KTD3. Interactions owner 负责 `main.go` imports/helper、旧 Agent root 用例、新独立 regression、module 文件及唯一 fixture 的 Agent 函数和必需 GJSON import。stream owner 不改这些位置，fixture 只新增独立 terminal test。Governs R11。
 - KTD4. terminal fixture 使用已有 `gCPANewLocalProducer` 的 custom `p.wire`，不改 public helpers 或 imports。每 case 在请求开始前加锁设置 fixture/wire/records；`setFixture` 不清空 wire，因此每 case 显式设置或清空，custom wire 的实际 model 由 case 自己生成。Governs R1-R4、R11。
@@ -149,39 +149,46 @@ sequenceDiagram
   Parent->>Parent: child 结束后才清理临时 library
 ```
 
-任务依赖以实际修改位置为依据。U2 已完成提交保留，U1 的本轮文档审查通过后只启动 fresh U3；两个任务全完成且无位置冲突才合并，新共享位置须先重新分配。
+任务依赖以实际修改位置为依据。修复前 U1 门槛已满足，U2/U3 已完成并无冲突合并；U6 已完成声明移动、前后运行、自审修正复审和提交。U6 actual child shadow 身份补充及 fresh 只读独立复核全部通过后才合并并启动 U4，新共享位置仍须先重新分配。
 
 ```mermaid
 flowchart TB
-  A[U1 全部候选 / 覆盖 / 更新文档门槛] --> C[fresh U3 stream owner]
-  B[U2 已完成审查提交，保留未合并] --> D[核对已提交 hunks 并合并]
+  A[U1 修复前候选 / 覆盖 / 文档门槛已满足] --> C[U3 已完成审查提交]
+  B[U2 已完成审查提交] --> D[已核对 hunks 并合并为 1bb1e3d]
   C --> D
-  D --> M[U6 post-fix验收 / 声明移动 / post-module验收]
-  M --> E[U4 独立final终验]
+  D --> M[U6 前后运行 / 声明移动 / 提交已完成]
+  M --> S[U6 child shadow 身份补充及独立复核待完成]
+  S --> E[合并 U6 后启动 U4 独立final终验]
   E --> F[U5 main / 版本复核 / 七平台 Release]
 ```
 
 ### Assumptions and Execution-Time Facts
 
 - 本计划采用已确认的固定 CPA v7.2.152 行为；将来升级 CPA 时需以新 producer/parser 重新核对，本次不升级。
-- owner 的 worktree 名称、BASE 后的整合 SHA、正式测试源码、DLL hashes、最终版本和 CI/Release IDs 由实际执行产生，不预填。
+- 已产生的整合 SHA、U6 commit/tree、两个阶段 DLL hashes 及复核状态按下文记录；后续补充负责人 worktree、observer/collector、新运行时间及身份、最终版本和 CI/Release IDs 仍由实际执行产生，不预填。
 - `v0.5.14` 是待核实占用的候选，不能在核对前写成最终发布版本。
-- 早期诊断 worktree 已有清理，其保留结果与原日志缺失分别说明。新三项独立诊断已按 origin spec 保存并核验三个 ZIP；确认绑定冻结 Git source、有效 overlay、新 build 和 canonical/shadow 链，LF／CRLF raw hash、build cwd HEAD、buildinfo VCS 和 production source 身份分别记录，不从旧采样或文件名／相同 hash 推断 source。fresh U3 仍须新的正式 RED/GREEN，任何诊断 GREEN 或旧 U3 部分完成均不充当产品完成证据。
+- 早期诊断 worktree 已有清理，其保留结果与原日志缺失分别说明。新三项独立诊断已按 origin spec 保存并核验三个 ZIP；确认绑定冻结 Git source、有效 overlay、新 build 和 canonical/shadow 链，LF／CRLF raw hash、build cwd HEAD、buildinfo VCS 和 production source 身份分别记录，不从旧采样或文件名／相同 hash 推断 source。fresh U3 已完成新的正式 RED/GREEN 及全部 owner 门槛；任何诊断 GREEN 或旧 U3 部分完成均不充当产品完成证据。
+
+本轮执行事实依据为 origin spec 所列协调记录、U6 完成及独立复核输出、入口受限输出和 collector 相关行的获准只读内容，并核对自有本地 Git 对象。U6 `e5b4ab7c1e2111ae6fe888183f8089322a3065b2` 的 parent 为 `1bb1e3d54e8cc73f8d8f9eab24fe14940f2c4915`，tree 为 `79ba809f4c48cc68b62336033c88013930e736d8`，尚未合并。静态独立复核 `complete/findings=[]`；动态独立复核只因 actual child shadow 身份缺口 `incomplete`，保留其余完整运行和等价结果。
+
+动态独立复核记录确认两个阶段 child `cpa-overlay.log` 各341条 canonical SHA256 记录，缺少实际加载成功的 shadow path/PID/hash；本轮读取复核输出，没有重新解析原始 native 日志。parent `integration.log` 每阶段6条 shadow 属于 `functionalCPAProcess` 启动的另外进程。原 `coverage.py:173-174` 接受 canonical OR shadow，不能据其通过称 child 身份已验收。此缺口不证明产品回归，原证据保持只读。原 owner `ab17366f5ece24ece` 的恢复返回 `No transcript found`，未启动；`wf_1cdc9c16-6ef` 的 EnterWorktree 被拒绝、未切换、未执行 Git/native/写入，数字 exit 未知。任何工具或 peer 均不得再次进入／写入原 U6 树，也不修改权限。
 
 ### Exact Ownership
 
 | owner／单元 | 可修改文件和位置 | 保持不改／交接条件 |
 | --- | --- | --- |
-| U1，协调者和文档审查 | 当前 spec/plan；审查结果 | 不改产品/tests；新事实须同时更新两文档，当前提交路径实际可读后由协调 workflow 分派五位独立审查，阻塞问题修正并复审通过后只分派 fresh U3；全部候选终态和二次覆盖门槛保持，自审不计独立审查。 |
-| U2，Interactions | 已完成提交 `7f17c7db69d318d84e68a0b5fcd8e0e616bd44f1` 的六文件：`main.go` 必需 GJSON import 及唯一 `interactionsUsesAgent`；`main_test.go` 原 whitespace expected；`interactions_agent_regression_test.go`；`go.mod`／`go.sum` 必要依赖；fixture 必需 GJSON import 及原 `TestModelMapperFunctionalInteractionsAgent`。 | 两份 fresh review 均 `findings=[]`，协调者已核对完整 diff；不重新分派或要求从本轮文档起点重做，保留未合并提交及完整验证。caller、executor、scanner、stream regression、公共 helpers 和其他旧断言不改。 |
+| U1，协调者和文档审查 | 当前 spec/plan；审查结果 | 不改产品/tests；先 spec 后 plan 补充当前执行事实，自审修正复审后只提交两文档。修复前五位独立审查、全部候选终态和二次覆盖门槛已满足，历史要求保持；不重派已完成 U2/U3，自审不计独立审查。 |
+| U2，Interactions | 已完成提交 `7f17c7db69d318d84e68a0b5fcd8e0e616bd44f1` 的六文件：`main.go` 必需 GJSON import 及唯一 `interactionsUsesAgent`；`main_test.go` 原 whitespace expected；`interactions_agent_regression_test.go`；`go.mod`／`go.sum` 必要依赖；fixture 必需 GJSON import 及原 `TestModelMapperFunctionalInteractionsAgent`。 | 两份 fresh review 均 `findings=[]`，协调者已核对完整 diff；不重新分派或要求从本轮文档起点重做，保留已合并提交及完整验证。caller、executor、scanner、stream regression、公共 helpers 和其他旧断言不改。 |
 | U3，fresh stream owner | `main.go` 的两个 header 谓词、matched 的真实 data-only guard／单向 done alias，另独占 `sseRewriter.Write` 内已验证完整 data-only 前值与完整带 line-ending metadata 单位的边界和有序派发；`stream_native_fields_regression_test.go` 的5个新增 terminal Tests、logical-metadata-callback-characterization及完整 metadata 边界／余下新增 cases；fixture 唯一末尾 `TestModelMapperFunctionalResponsesTerminalFields` 长矩阵及本测试专用局部代码。 | 复用现有 scanner 状态、drain 和恢复器；不改 scanner 算法、imports、Agent 函数、module、`main_test.go`、公共 producer/loader/helper、JSON 恢复器、生命周期或 batching，不新增 private scanner state 断言；全部旧 controls 保持。 |
-| U6，module | `main.go`、8份新生产文件；`CLAUDE.md`当前架构和README简短布局 | U2/U3无冲突合并后开始，不改ABI/tests/benchmark/fixture/module/Makefile/CI，不从旧源码覆盖修复。 |
+| U6，module | 原获分配的 `main.go`、8份新生产文件及 `CLAUDE.md`／README 布局已提交；补充只写新负责人自有 ignored 证据 | 不改ABI/tests/benchmark/fixture/module/Makefile/CI，不从旧源码覆盖修复。新的唯一验收负责人在新独立树连续完成 observer/严格collector、自检、两个stage完整native补跑、自审修正复审和交接；原树及证据只读，不恢复原owner。fresh只读独立证据复核全部通过才解除合并门槛。 |
 | U4，终验 | U6完成后新整合worktree的证据和验收 | 产品回归交对应 owner 在其 worktree 修正、复审、提交；主会话不补半成品代码。公共入口确需改变时先更新单 owner 所有权。 |
 | U5，协调者 | 经授权的 local main、remote main、tag、Release 验收 | 不创建 PR、force push、移动既有 tag、改 CPA 或删除其他已有工作区。 |
 
-位置以符号与实际 hunks 为准，原 BASE 行号只作参考。U2 已提交范围与 fresh U3 的待修改位置分别核对，合并前比较两个任务完整 BASE..HEAD；当前不恢复 U2 写入。fixture imports 只归 U2，U3 使用现有 imports。出现公共 helper 或同一函数共同修改需求时，先交协调者按依赖或单 owner 更新所有权，再继续。
+位置以符号与实际 hunks 为准，原 BASE 行号只作参考。U2/U3 已分别核对完整 BASE..HEAD 及位置后无冲突合并，当前不恢复两任务写入。fixture imports 只归 U2，U3 使用现有 imports。出现公共 helper 或同一函数共同修改需求时，先交协调者按依赖或单 owner 更新所有权，再继续。
 
-**恢复执行规则：**
+**历史 U3 恢复执行规则：**
+
+以下七条记录修复前的恢复安排和证据门槛，已由 fresh U3 完成并合并；其中当时尚未合并、待启动和来源 blocked 状态仅属历史，不指示本轮重启或重做。旧来源只读、权限边界、真实 RED/GREEN、完整验收和保护要求继续有效。当前 U6 身份补充安排见 U6 的 Execution note。
 
 1. 本轮按新确认事实先修改 origin spec，再修改本 plan，BASE 和原日期保持。U2 的完整提交 `7f17c7db69d318d84e68a0b5fcd8e0e616bd44f1` 及两份 fresh 无 findings 审查保留，协调者已核对六文件完整 diff，尚未合并；不重新分派或从新文档起点重做 U2。本轮最终提交的 spec/plan 路径实际可读且五位独立审查及必要修正／复审通过后，只为 U3 从该文档 HEAD 创建一个新独立 worktree 和唯一 fresh owner。原 BASE、文档起点、production/tests 身份分别记录，新共享 hunk 先由协调者更新单 owner 所有权和依赖。
 2. 已停止的 `wf_e9f307ff-9e1` 的未提交来源永久只读：U2 为 `C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/wf_e9f307ff-9e1-1`，U3 为 `C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/wf_e9f307ff-9e1-2`。因 modified-since-read 冲突停止的 `wf_f90ea0be-a21` 及其可见 owner 工作树永久保留，不读取／复制其未提交文档草稿。当前 blocked U3 来源为 `C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/wf_43831682-e1f-2`，报告 HEAD 仍为 `86a3c2ceb8d5e123015d563c5ab07eefb2670149`，三文件未提交内容和全部证据永久只读。全部旧 owner、writer、script 不恢复，来源不写、不删、不清理；fresh U3 只精确继承下述已证明归属的三文件位置，其他 unknown 内容不进入新树提交。
@@ -205,6 +212,8 @@ flowchart TB
 
 **Files：**本 spec/plan；现有全量审查的 scope/coverage 证据只读。
 
+**Execution note：**修复前全部候选判定、二次覆盖和更新后两文档的五位独立审查／必要复审门槛已满足，U2/U3 已完整完成并合并。下文 Approach 保留当时全部检查要求和历史交接，不指示重派产品 owner。本轮 U1 只先更新 spec、再更新 plan 的执行事实与 U6 身份补充安排，核验 frontmatter、R/AE/KTD/U、全部保护断言、引用和状态一致性，独自完成自审修正复审及正常英文 path-limited commit；收据保存在自有 ignored `dist/functional-audit-fixes-20261011/U6-doc-arrangement/`。不运行产品 tests，不执行 native 补跑或发布，不重写旧提交。
+
 **Approach：**
 
 1. 将全部检查域、源码与 CPA 必要路径逐项对应到已完成结果，补查缺失范围。候选均有明确终态，不能用抽样代替全面覆盖。
@@ -214,7 +223,7 @@ flowchart TB
 
 **Test expectation：**本单元不修改或运行产品 tests；核验文档 frontmatter、真实 paths/symbols/test names、diff 和证据完整性。
 
-**Verification：**全部检查范围和候选终态可核查，两文档已修正并提交，本轮五位独立审查及必要复审无阻塞问题；U2 已完成交付保留，fresh U3 只能在本单元满足后开始产品写入。
+**Verification：**修复前全部检查范围、候选终态及两文档五位独立审查／必要复审已满足，U2/U3 完整交付和合并保留。本轮只提交两文档的事实及补充安排，完整 diff、frontmatter、IDs、引用、保护断言与状态一致性自审修正复审可核查；不将自审计作 fresh 独立证据复核，不解除 U6 合并门槛。
 
 ### U2. 统一 Interactions agent 分类并保存真实 native 回归
 
@@ -222,13 +231,13 @@ flowchart TB
 
 **Requirements：**R5-R11，AE4-AE6，KTD2/KTD3/KTD5。
 
-**Dependencies：**原 U1 门槛已满足，本单元已完整提交并独立审查，保留未合并提交；本轮不重新分派 U2，等待 fresh U3 全完成及无冲突核查。
+**Dependencies：**原 U1 门槛已满足，本单元已完整提交并独立审查；U3 亦已完整完成，两任务已核对无位置冲突并合并，本轮不重新分派或重做 U2。
 
 **Files：**Exact Ownership 的 U2 文件。相关现存 tests 包括 `TestHandleModelRouteLeavesInteractionsAgentsNative`、`TestHandleModelRouteIgnoresUnusedBody`、`TestHandleModelRouteSkipsClaudeCountTokens` 和 fixture 的同名 Agent 函数。
 
 **Execution note：**本单元已在原已审查起点完成正式逐条 TDD、全部 slices 和 owner 验收，提交为 `7f17c7db69d318d84e68a0b5fcd8e0e616bd44f1`。下文 Approach／Test Scenarios 保留原完整验收要求，供核对该交付，不指示从本轮文档起点重做。按 R17 从 model_route RPC 观察分类，不新增 helper 实现耦合测试；whitespace expected 纠正及 BASE RED／当前 GREEN 属于正式证据，private overlay 不代替 TDD。
 
-已完成范围为 Exact Ownership 的六文件／hunks，包括原45个 RPC cases及补齐的 native slices。两份 fresh reviewer 均 `findings=[]`，协调 worktree 的 `dist/functional-audit-fixes-20261011/coordination/U2-host-inspection-wf_31e9e13c-e72.json` 记录完整 diff、六文件范围和正式验收核查；证据、提交及未合并状态保留。
+已完成范围为 Exact Ownership 的六文件／hunks，包括原45个 RPC cases及补齐的 native slices。两份 fresh reviewer 均 `findings=[]`，协调 worktree 的 `dist/functional-audit-fixes-20261011/coordination/U2-host-inspection-wf_31e9e13c-e72.json` 记录完整 diff、六文件范围和正式验收核查；证据及提交保留，当前已合并为 `1bb1e3d54e8cc73f8d8f9eab24fe14940f2c4915`。
 
 原 `research-agent` stream/nonstream、ASCII-tab、missing、raw body/calls/URI/headers 和完整 response/SSE 控制继续保留。U2 的两轮关联 native、完整 owner 检查、自审修正复审和正常提交结果保持；不以45个 RPC cases 或旧诊断替代完整 integration，也不重新分派本单元。
 
@@ -260,11 +269,11 @@ flowchart TB
 
 **Requirements：**R1-R4、R8-R11，AE1-AE3、AE7，KTD1/KTD4/KTD5。
 
-**Dependencies：**本轮 U1 两文档提交和五位独立审查／必要复审通过。U2 已完整提交且审查通过，保留未合并；fresh U3 在新的独立 worktree 连续完成 F1/F2，不恢复旧 owner，不并行修改同一 scanner。
+**Dependencies：**修复前 U1 两文档提交和五位独立审查／必要复审已通过。U2/U3 已完整提交、审查并无冲突合并；fresh U3 曾在新的独立 worktree 连续完成 F1/F2，不恢复旧 owner，不并行修改同一 scanner，本轮不重新分派或重做。
 
 **Files：**Exact Ownership 的 U3 文件；相关现存 controls 为 `TestFunctionalNativeSSEFieldDiscriminator/mismatch-control`、`TestFunctionalNativeSSEFieldDataOnlyTypeControl`、`TestFunctionalNativeSSEFieldFormatIsolation`、`TestFunctionalNativeSSEFieldWireControls`、ordinary/mixed metadata、limit/continuation/dispatch，以及 forwarder/error 回归。
 
-**Execution note：**每个行为连续完成最小测试、BASE目标RED和最小GREEN，再进入下一条；按 R17 从既有输出和 forwarder 入口核查新增行为，保留原状态／游标控制。重新保留exact-byte/native/HTTP证据，不批量写全部tests后再实现。
+**Execution note：**fresh U3 已连续完成正式 TDD、所有 slices、关联及全量检查、自审修正复审、正常提交 `06a2a3d7d902aaa8c6d65cf1b1aebf776340c4d4` 和提交后独立复核，并已与 U2 无冲突合并。下文继承安排、Approach／Test Scenarios 和全部目标 RED／GREEN 门槛保留为已完成交付的审计依据，不指示本轮重新继承、编码或运行。每个行为连续完成最小测试、BASE目标RED和最小GREEN，再进入下一条；按 R17 从既有输出和 forwarder 入口核查新增行为，保留原状态／游标控制。重新保留exact-byte/native/HTTP证据，不批量写全部tests后再实现。
 
 继承来源只读 `C:/Users/user/Downloads/cpa-plugin/.claude/worktrees/wf_43831682-e1f-2`，只包含已证明归属的三文件／hunks：`main.go` 两个 header 谓词、matched 的真实 data-only guard／单向 done alias；`stream_native_fields_regression_test.go` 的5个新增 terminal Tests 和 logical-metadata-callback-characterization；fixture 文件末尾唯一 `TestModelMapperFunctionalResponsesTerminalFields` 长矩阵及本函数局部代码。先冻结源原文／hash和继承／新增测试清单；不复制 source 的其他 unknown 改动，不从旧 `wf_e9` 继承其短重复函数，不恢复旧 owner/script，所有来源及证据永久只读。
 
@@ -302,7 +311,17 @@ flowchart TB
 
 **Files：**修改 `main.go`，新增 `config.go`、`model_router.go`、`rules.go`、`executor.go`、`executor_stream.go`、`json_model.go`、`sse_rewriter.go`、`stream_rewriter.go`；保持 `abi_cgo.go` 原文；只精确更新 `CLAUDE.md` 当前架构段落及 README 必要简短源码布局。全部 tests、benchmark、CPA fixture、依赖、Makefile／workflow 保持模块化起点原字节。
 
-**Execution note：**纯移动记录完整前后验收，不制造 RED。使用标准 Go AST 从实际 post-fix HEAD 重新取得全部声明，不能从 BASE 旧正文覆盖 F1-F3。
+**Execution note：**原 U6 owner 已从 `1bb1e3d54e8cc73f8d8f9eab24fe14940f2c4915` 完成下文全部声明移动、前后运行、自审修正复审和正常提交 `e5b4ab7c1e2111ae6fe888183f8089322a3065b2`（tree `79ba809f4c48cc68b62336033c88013930e736d8`），尚未合并。静态独立复核 `complete/findings=[]`；动态复核只因 actual child shadow 身份 `incomplete`。下文 Approach 保留已完成步骤及保护要求，不重做产品或模块化。纯移动记录完整前后验收，不制造 RED；标准 Go AST 已从实际 post-fix HEAD 重新取得全部声明，没有从 BASE 旧正文覆盖 F1-F3。
+
+两个阶段已运行全部 root/vet/race30m、三个显式 scripts、registration、完整 benchmark preflight、issue8/native fields/shutdown、实际性能计时、默认 Windows build 和原 `make integration`，必需命令各有 exit0。root/race 各3050个 RUN/PASS 名称、固定 BASE 旧展开2848个、29个旧 Benchmark 的86个展开 cases、native 17508个 RUN/PASS 名称及5760个 terminal leaves、Agent branches、6456精确 keys、17帧／zero bridge、完整16,842,937-byte translator 和精确默认 Version `0.0.0-dev` 的原断言均保留。scripts 四项既有条件 Skip 与无 Skip 的实际 integration 分开记录；这些结果不补足缺失的 actual child 身份。
+
+**当前身份补充安排：**
+
+1. 由新的唯一验收负责人在自己的新隔离树核查初始 HEAD/status、本地已有 `1bb1e3d`／`e5b4ab7` 对象，冻结两个 stage 的实际 source/raw/LF/hash；获准旧证据只通过 Read 读取，不执行来源程序，不操作外树 Git。原 U6 树及全部证据只读，不重试已拒绝的进入／写入，不联系或恢复旧 owner、不修改权限。此任务为独立证据补充，不称为原 owner 恢复或同原树续跑，不降低 R11。
+2. 优先取得原冻结默认 DLL：post-fix `68f01a7d15255f584035f4c446c7d1c5f561aee5304206a6674db9c43eb7183b`、post-module `e07a54f4d2bdff0654fd54eb00a06836f4d49ffb4441cb36620c253a28accd2b`。获准读取能力无法取得时，记录事实，在自有冻结相同源码重建并分别记录新旧身份，不能混称原 DLL 或 U4 final 产物。私有 observation overlay 只增加 actual child PID、实际加载成功的 shadow path/file SHA256，绑定 stage source/built/canonical/CPA/overlay；不改产品、永久 tests/fixture、CPA、Makefile、CI 或 module。
+3. 同一新负责人连续编写严格 collector 并自检：actual child 记录必须存在且 stage/source/canonical/shadow 身份匹配，原 canonical-only 日志必须判未完成。父 shadow、另外进程/Host、Version、static loader 或假数据不能代替；程序自检非零 exit 和真实验收数字 exit 分别记录。
+4. 对两个 stage 各补跑完整 native overlay 矩阵，保留原24 functional+2 bridge、新 terminal、17508 RUN/PASS、5760 terminal leaves、全部 Agent branches、6456 keys、17帧／zero bridge、完整16,842,937-byte translator 及默认 `0.0.0-dev` 断言。按真实时间另存完整原始日志、命令和源码/overlay/CPA/产物清单，准确说明与原阶段的关联，不伪造旧运行已有 child 记录。原前后其他运行和静态等价证据保留，不重复已完成产品任务。
+5. 新负责人在自己的树连续完成程序、自检、两阶段运行、自审修正复审和交接，核查全部永久源字节未变，只写自有 ignored 证据，不创建空提交。用 OS 临时 ZIP 交接并由协调者保存到任务目录，防止 clean 工作树清理证据；不派代理、启动后台任务或轮询。协调 workflow 再分派 fresh 只读独立证据复核，直接核查 actual child PID/path/hash、完整矩阵和 collector 严格性。全部范围通过后才合并 U6 和启动 U4；U4/final/package/U5 仍未开始。
 
 **Approach：**
 
@@ -318,7 +337,7 @@ flowchart TB
 2. Covers AE9。完整旧矩阵与 F1-F3 新 cases 全部执行，issue8 四 terminal cases、36 native fields、metadata/mixed/reverse/alternating、ownership/allocations 和全部 benchmarks 展开 cases 保持。
 3. Covers AE10。默认 library 的真实 init/register/reconfigure/unload/reload、canonical parent lifetime、24/2/6456 和完整大 translator 保持，注入候选版本不进入默认 integration。
 
-**Verification：**前后完整检查实际成功，AST 和字节比较无未许可差异；模块化、当前架构文档、审查、修正、复审及独立提交由本 owner 连续完成。
+**Verification：**前后完整运行、AST 和字节比较、模块化、当前架构文档、自审修正复审及独立提交已由原 owner 连续完成，静态独立复核无 findings。两阶段 actual child shadow 身份仍未完成；新的唯一补充负责人完成上述全部程序／自检／运行／自审修正复审／交接，fresh 只读独立证据复核全部通过后才满足 U6 合并和 U4 启动门槛。
 
 ### U4. 合并完成任务并执行独立整合终验
 
@@ -326,7 +345,7 @@ flowchart TB
 
 **Requirements：**R8-R13、R15-R18，AE8-AE10，KTD5-KTD9。
 
-**Dependencies：**U6全部步骤、审查、复审和提交完成，协调者核对完整差异后合并。
+**Dependencies：**U6全部步骤、审查、复审和提交完成，并补齐两个stage的actual child shadow身份，经fresh只读独立证据复核全部通过，协调者核对完整差异后合并。当前这些身份证据尚未完成，U4/final/package仍未开始。
 
 **Files：**最终整合源码；既有 `.github/scripts/smoke-local_test.go`、唯一CPA fixture、Makefile/package/compatibility、ABI/register tests只验收。证据保存在owner的专用ignored `dist/functional-audit-fixes-20261011/`，诊断Go文件使用独立module，不能污染原`./...`包集合。
 
@@ -372,7 +391,7 @@ flowchart TB
 
 ### Focused TDD and Controls
 
-以下测试名称中的新名称是计划新增，U2/U3实际实现时不得与既有符号重复；既有名称已在BASE核查。
+下表原计划新增的测试名称已由 U2/U3 正式实现并合并，既有名称已在 BASE 核查。下表保留正式 TDD 及 controls 的命令和验收要求，供核对已完成交付，不指示本轮重做。
 
 | 单元 | 命令或入口 | 必需结果 |
 | --- | --- | --- |
@@ -391,7 +410,7 @@ flowchart TB
 | post-modularization | U6，实际纯移动后HEAD／源码 | 重跑相同完整检查并比较AST/const/directive/ABI/tests/fixture；同owner修正复审及commit完成后才交U4。 |
 | final | U4，包含全部修复和U6的最终整合worktree | 重新执行全部检查并重建默认DLL／overlay；候选独立产物真实Version/package；U5核验该最终SHA的Ubuntu实际integration、七平台CI与全部Release资产。 |
 
-三阶段各自有当前源码、DLL source/copy/shadow、CPA binary和overlay SHA256、真实命令与数字exit；不复用旧DLL或上一阶段日志作为本阶段成功证据。AST只证明声明等价，不替代运行。完整race总timeout30m，内部既有时限和数据规模保持。scripts原条件Skip逐项记录；真实native/CPA integration不得Skip。默认runtime和race分层报告。
+三阶段各自有当前源码、DLL source/copy/shadow、CPA binary和overlay SHA256、真实命令与数字exit；不复用旧DLL或上一阶段日志作为本阶段成功证据。当前两阶段补跑属于各自新增身份证据，另存真实时间及原冻结 DLL／相同源码重建 DLL 的明确关联，不充当 final 结果。collector 必须要求实际加载成功的 child PID/path/file SHA256 存在并匹配；原 canonical-only 日志判未完成，父 shadow 不可代替。AST只证明声明等价，不替代运行。完整race总timeout30m，内部既有时限和数据规模保持。scripts原条件Skip逐项记录；真实native/CPA integration不得Skip。默认runtime和race分层报告。
 
 ### Full Integrated Checks
 
@@ -503,10 +522,10 @@ fixed mixed direct/disabled HTTP的completed缺失按原fixture byte-exact控制
 
 ## Definition of Done
 
-- U1的完整覆盖、候选终态和本轮两文档五位独立审查／必要复审门槛满足，F1/R1/R4/KTD1及U3完整metadata边界、保护控制和所有权一致；文档自审不冒充独立审查，审查通过前不恢复产品写入。
-- U2已完成提交及两份fresh review保留，不重新分派；fresh U3从本轮最终已审查文档HEAD的新独立worktree，完成限定继承cases的BASE RED／正确control、完整metadata新case的BASE及三谓词目标RED、最小GREEN、至少两轮关联native和全部owner验收、自审修正复审、正常commit及提交后独立review，没有半成品交主会话。
-- 两个任务全完成，完整diff符合Exact Ownership，公共fixture/import/helper及新共享位置已按单owner依赖解决，协调者确认无位置冲突后才合并。
-- U6完成post-fix和post-module完整验收、声明等价与ABI/tests/fixture逐字证明、当前架构更新、审查修正复审和独立commit。
+- 修复前U1的完整覆盖、候选终态和两文档五位独立审查／必要复审门槛已满足，F1/R1/R4/KTD1及U3完整metadata边界、保护控制和所有权一致。当前U1只补充执行事实与安排并核查两文档一致性；文档自审不冒充独立审查。
+- U2已完成提交及两份fresh review保留；fresh U3已从当时最终已审查文档HEAD的新独立worktree完成限定继承cases的BASE RED／正确control、完整metadata新case的BASE及三谓词目标RED、最小GREEN、至少两轮关联native和全部owner验收、自审修正复审、正常commit及提交后独立review。两任务不重新分派，没有半成品交主会话。
+- 两个任务全完成，完整diff符合Exact Ownership，公共fixture/import/helper及新共享位置已按单owner依赖解决，协调者确认无位置冲突后已合并为 `1bb1e3d54e8cc73f8d8f9eab24fe14940f2c4915`。
+- U6已完成post-fix和post-module完整运行、声明等价与ABI/tests/fixture逐字证明、当前架构更新、自审修正复审和独立commit `e5b4ab7c1e2111ae6fe888183f8089322a3065b2`，静态独立复核complete/findings=[]。actual child shadow身份仍未完成：新的唯一负责人在新树连续完成两阶段完整native补跑、严格collector及自检、自审修正复审和交接，fresh只读独立证据复核全部通过后才合并U6和启动U4；原树与证据只读，不恢复旧owner，不降低R11。
 - U4用包含U6的最终整合源码完成Verification Contract、R12/R13/R15-R18；所有新旧R/AE有实际证据，private诊断和已缺失原日志不替代正式验收。
 - U5经真实授权完成localmain/remote main/tag、七平台CI和Release全部资产验收，实际版本与最终SHA相符。
 - 本次新增的无用代码、重复helper、实验fallback和废弃尝试已经移除；原无关代码、配置、worktree和用户文件保持。
