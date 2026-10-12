@@ -2893,3 +2893,391 @@ func TestModelMapperFunctionalMixedShapeControls(t *testing.T) {
 		t.Errorf("missing shape controls=%v", expected)
 	}
 }
+
+func TestModelMapperFunctionalResponsesTerminalFields(t *testing.T) {
+	for _, scenario := range []struct{ provider, terminal string }{{"xai", "error"}, {"codex", "keepalive"}, {"xai", "done-alias"}, {"codex", "done-alias"}, {"xai", "completed"}, {"codex", "completed"}, {"codex", "grok-keepalive"}, {"codex", "grok-completed"}} {
+		t.Run(scenario.provider+"/"+scenario.terminal, func(t *testing.T) {
+			p := gCPANewLocalProducer(t, scenario.provider)
+			enabled := gCPALoadNative(t, p, true)
+			disabled := gCPALoadNative(t, p, false)
+			server := eResponsesServer(t, p.base)
+			shapes := []string{"pair", "data-only"}
+			if scenario.terminal == "keepalive" || scenario.terminal == "grok-keepalive" {
+				shapes = append(shapes, "alternating-pair", "alternating-data")
+			}
+			for _, shape := range shapes {
+				for _, created := range []bool{false, true} {
+					for _, transport := range []struct {
+						step     int
+						position string
+					}{{0, "none"}, {1, "none"}, {0, "before-event"}, {1, "before-event"}, {0, "in-event"}, {1, "in-event"}, {0, "between-events"}, {1, "between-events"}} {
+						step, position := transport.step, transport.position
+						t.Run(fmt.Sprintf("shape=%s/created=%v/step=%d/metadata=%s", shape, created, step, position), func(t *testing.T) {
+							build := func(model string) ([]string, []string, []byte) {
+								payloads := []string{`{"type":"error","code":"server_error","message":"failed","param":null,"opaque":{"n":1.00,"text":"grok-4.7 中文"}}`}
+								names := []string{"error"}
+								if scenario.terminal == "keepalive" || scenario.terminal == "grok-keepalive" {
+									payloads = []string{`{"type":"keepalive","opaque":{"n":1.00,"text":"grok-4.7 中文"}}`, strings.Replace(gCPACompleted, `"model":"grok-4.7"`, `"model":"`+model+`"`, 1)}
+									names = []string{"keepalive", "response.completed"}
+								} else if scenario.terminal == "done-alias" || scenario.terminal == "completed" || scenario.terminal == "grok-completed" {
+									payloads = []string{strings.Replace(gCPACompleted, `"model":"grok-4.7"`, `"model":"`+model+`"`, 1)}
+									names = []string{"response.completed"}
+									if scenario.terminal == "done-alias" {
+										names[0] = "response.done"
+									}
+								}
+								if created {
+									payloads = append([]string{`{"type":"response.created","response":{"model":"` + model + `","status":"in_progress","output":[]}}`}, payloads...)
+									names = append([]string{"response.created"}, names...)
+								}
+								var fields []string
+								var wire strings.Builder
+								metadata := []string{"id: terminal-1", "retry: 100", `: opaque event: error data: {"type":"keepalive"} grok-4.7 中文`}
+								for i, payload := range payloads {
+									if position == "before-event" || position == "between-events" && i > 0 {
+										for _, field := range metadata {
+											fields = append(fields, field)
+											wire.WriteString(field + "\n")
+										}
+									}
+									dataOnly := shape == "data-only" || shape == "alternating-data" && i%2 == 0 || shape == "alternating-pair" && i%2 == 1
+									if !dataOnly {
+										fields = append(fields, "event: "+names[i])
+										wire.WriteString("event: " + names[i] + "\n")
+									}
+									if position == "in-event" {
+										for _, field := range metadata {
+											fields = append(fields, field)
+											wire.WriteString(field + "\n")
+										}
+									}
+									fields = append(fields, "data: "+payload)
+									wire.WriteString("data: " + payload + "\n\n")
+								}
+								return fields, payloads, []byte(wire.String())
+							}
+							set := func(model string) {
+								_, _, wire := build(model)
+								p.mu.Lock()
+								p.fixture = gCPAFieldsFixture{contentType: "text/event-stream", eol: "\n", count: 1, step: step}
+								p.wire, p.records = wire, nil
+								p.mu.Unlock()
+							}
+							for _, kind := range []string{"core", "host", "abi-host-read", "mapped-native", "direct-.6-http", "direct-.7-http", "mapped-http", "enabled-unmapped-http", "enabled-unmapped-.6-http", "disabled-.6-http", "disabled-.7-http", "direct-.6-ws", "direct-.7-ws", "mapped-ws", "enabled-unmapped-ws", "enabled-unmapped-.6-ws", "disabled-.6-ws", "disabled-.7-ws"} {
+								t.Run(kind, func(t *testing.T) {
+									p.base.SetPluginHost(nil)
+									p.base.SetModelRouterHost(nil)
+									model, upstream := "grok-4.7", "grok-4.7"
+									if strings.HasPrefix(kind, "mapped") {
+										model = "grok-4.6"
+									} else if strings.Contains(kind, ".6-") {
+										model, upstream = "grok-4.6", "grok-4.6"
+									}
+									if strings.HasPrefix(kind, "enabled-unmapped-.6-") {
+										apply := func(rules string) {
+											t.Helper()
+											pluginDir := filepath.Dir(filepath.Dir(filepath.Dir(os.Getenv("CPA_SMOKE_PLUGIN"))))
+											var cfg config.Config
+											data := fmt.Sprintf("plugins:\n  enabled: true\n  dir: %q\n  configs:\n    model-mapper:\n      enabled: true\n      priority: 1\n      global_rules: %q\n", filepath.ToSlash(pluginDir), rules)
+											if err := yaml.Unmarshal([]byte(data), &cfg); err != nil {
+												t.Fatal(err)
+											}
+											enabled.ApplyConfig(context.Background(), &cfg)
+											if len(enabled.activeRecords()) != 1 {
+												t.Fatal("reconfigured native executor is not active")
+											}
+										}
+										apply("")
+										defer apply("grok-4.6=>grok-4.7")
+									}
+									if strings.HasPrefix(kind, "mapped") || strings.HasPrefix(kind, "enabled-unmapped") {
+										p.base.SetPluginHost(enabled)
+										p.base.SetModelRouterHost(enabled)
+									} else if strings.HasPrefix(kind, "disabled") {
+										p.base.SetPluginHost(disabled)
+										p.base.SetModelRouterHost(disabled)
+									}
+									set(upstream)
+									fields, _, originalWire := build(upstream)
+									_, wantPayloads, wantWire := build(model)
+									if scenario.provider == "xai" && scenario.terminal == "done-alias" && position != "in-event" {
+										// XAI producer 在相邻 event/data 行之间按 data.type 规范化 header。
+										for i, field := range fields {
+											if field == "event: response.done" {
+												fields[i] = "event: response.completed"
+											}
+										}
+										wantWire = bytes.ReplaceAll(wantWire, []byte("event: response.done\n"), []byte("event: response.completed\n"))
+									}
+									actualGrok := strings.HasPrefix(scenario.terminal, "grok-")
+									if scenario.terminal == "grok-keepalive" {
+										keepalive := `{"type":"keepalive","opaque":{"n":1.00,"text":"grok-4.7 中文"}}`
+										for i, field := range fields {
+											if field == "event: keepalive" || field == "data: "+keepalive {
+												fields[i] = ": keepalive\n\n"
+											}
+										}
+										wantWire = bytes.ReplaceAll(wantWire, []byte("event: keepalive\n"), []byte(": keepalive\n\n"))
+										wantWire = bytes.ReplaceAll(wantWire, []byte("data: "+keepalive+"\n\n"), []byte(": keepalive\n\n"))
+										index := 0
+										if created {
+											index = 1
+										}
+										wantPayloads = append(wantPayloads[:index], wantPayloads[index+1:]...)
+									}
+									ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+									defer cancel()
+									if actualGrok {
+										ctx = context.WithValue(ctx, "gin", &gin.Context{Request: &http.Request{Header: http.Header{"User-Agent": []string{"grok-shell/0.2.119"}}}})
+									}
+									var raw []byte
+									var ws []string
+									switch kind {
+									case "core", "host":
+										var got []string
+										if kind == "core" {
+											got = gCPACoreFields(t, p, ctx)
+										} else {
+											got = gCPAHostFields(t, p, ctx)
+										}
+										if !reflect.DeepEqual(got, fields) {
+											t.Errorf("actual callbacks=%q want=%q", got, fields)
+										}
+									case "abi-host-read":
+										request, err := json.Marshal(pluginapi.HostModelExecutionRequest{EntryProtocol: "openai-response", ExitProtocol: "openai-response", Model: model, Stream: true, Body: gCPARequest(model, true)})
+										if err != nil {
+											t.Fatal(err)
+										}
+										opened, err := enabled.callHostModelExecuteStream(ctx, request)
+										if err != nil {
+											t.Fatal(err)
+										}
+										var stream struct {
+											Result pluginapi.HostModelStreamResponse `json:"result"`
+										}
+										if err := json.Unmarshal(opened, &stream); err != nil || stream.Result.StreamID == "" {
+											t.Fatalf("host stream=%s error=%v", opened, err)
+										}
+										readRequest, err := json.Marshal(pluginapi.HostModelStreamReadRequest{StreamID: stream.Result.StreamID})
+										if err != nil {
+											t.Fatal(err)
+										}
+										var got []string
+										empty, done := 0, 0
+										for i := 0; i <= len(fields); i++ {
+											read, err := enabled.callHostModelStreamRead(ctx, readRequest)
+											if err != nil {
+												t.Fatal(err)
+											}
+											var chunk struct {
+												Result pluginapi.HostModelStreamReadResponse `json:"result"`
+											}
+											if err := json.Unmarshal(read, &chunk); err != nil || chunk.Result.Error != "" {
+												t.Fatalf("host read=%s error=%v", read, err)
+											}
+											if chunk.Result.Done {
+												done++
+												if len(chunk.Result.Payload) != 0 {
+													t.Fatalf("Done payload=%q", chunk.Result.Payload)
+												}
+												break
+											}
+											if len(chunk.Result.Payload) == 0 {
+												empty++
+											} else {
+												got = append(got, string(chunk.Result.Payload))
+											}
+										}
+										closeRequest, err := json.Marshal(pluginapi.HostModelStreamCloseRequest{StreamID: stream.Result.StreamID})
+										if err != nil {
+											t.Fatal(err)
+										}
+										if _, err := enabled.callHostModelStreamClose(closeRequest); err != nil {
+											t.Fatal(err)
+										}
+										if !reflect.DeepEqual(got, fields) || empty != 0 || done != 1 {
+											t.Fatalf("ABI fields=%q want=%q host empty=%d Done=%d", got, fields, empty, done)
+										}
+										t.Logf("ABI nonempty=%d filtered empty reads=%d Done=%d fields=%q", len(got), empty, done, got)
+									case "mapped-native":
+										result, err := enabled.activeRecords()[0].plugin.Capabilities.Executor.ExecuteStream(ctx, eNativeRequest(model, "openai-response", true))
+										if err != nil {
+											t.Fatal(err)
+										}
+										var errs []string
+										raw, errs = eNativeDrain(t, result.Chunks)
+										if len(errs) != 0 {
+											t.Errorf("native errors=%q", errs)
+										}
+										if !bytes.Equal(raw, wantWire) {
+											t.Errorf("native bytes=%q want=%q", raw, wantWire)
+										}
+										eRequireData(t, raw, wantPayloads)
+									default:
+										if strings.HasSuffix(kind, "-http") {
+											var status int
+											var headers http.Header
+											if !actualGrok {
+												status, headers, raw = eHTTP(t, server, "/v1/responses", gCPARequest(model, true))
+											} else {
+												requestCtx, requestCancel := context.WithTimeout(context.Background(), 30*time.Second)
+												defer requestCancel()
+												request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, server.URL+"/v1/responses", bytes.NewReader(gCPARequest(model, true)))
+												if err != nil {
+													t.Fatal(err)
+												}
+												request.Header.Set("Content-Type", "application/json")
+												request.Header.Set("User-Agent", "grok-shell/0.2.119")
+												response, err := http.DefaultClient.Do(request)
+												if err != nil {
+													t.Fatal(err)
+												}
+												raw, err = io.ReadAll(response.Body)
+												closeErr := response.Body.Close()
+												if err != nil || closeErr != nil {
+													t.Fatalf("read=%v close=%v", err, closeErr)
+												}
+												status, headers = response.StatusCode, response.Header
+											}
+											if status != 200 || !strings.HasPrefix(headers.Get("Content-Type"), "text/event-stream") {
+												t.Errorf("HTTP status=%d headers=%v bytes=%q", status, headers, raw)
+											}
+											httpPayloads := append([]string(nil), wantPayloads...)
+											if scenario.terminal == "error" {
+												// 固定 CPA HTTP handler 保留 code/message，过滤 null param 和 opaque 字段。
+												httpPayloads[len(httpPayloads)-1] = `{"type":"error","code":"server_error","message":"failed","sequence_number":0}`
+											}
+											mixedControl := !strings.HasPrefix(kind, "mapped") && scenario.terminal == "keepalive" && (shape == "alternating-data" && !created || shape == "alternating-pair" && created)
+											if mixedControl {
+												// 固定 CPA direct/disabled mixed HTTP 原字节控制；mapped 仍必须保留完整 terminal。
+												wantControl := bytes.Clone(wantWire)
+												previous := wantPayloads[len(wantPayloads)-2]
+												wantControl = bytes.Replace(wantControl, []byte("data: "+previous+"\n\n"), []byte("data: "+previous+"\n"), 1)
+												terminalData := "data: " + wantPayloads[len(wantPayloads)-1] + "\n\n"
+												if position == "in-event" {
+													terminalData = "id: terminal-1\nretry: 100\n: opaque event: error data: {\"type\":\"keepalive\"} grok-4.7 中文\n" + terminalData
+												}
+												wantControl = bytes.Replace(wantControl, []byte(terminalData), []byte("\n\n"), 1)
+												httpPayloads = httpPayloads[:len(httpPayloads)-1]
+												if !bytes.Equal(raw, wantControl) {
+													t.Errorf("fixed mixed HTTP bytes=%q want=%q", raw, wantControl)
+												}
+											}
+											eRequireData(t, raw, httpPayloads)
+										} else {
+											var err error
+											if !actualGrok {
+												ws, err = eWS(t, server, model)
+											} else {
+												wsCtx, wsCancel := context.WithTimeout(context.Background(), 5*time.Second)
+												defer wsCancel()
+												conn, _, dialErr := websocket.DefaultDialer.DialContext(wsCtx, "ws"+strings.TrimPrefix(server.URL, "http")+"/v1/responses/ws", http.Header{"User-Agent": []string{"grok-shell/0.2.119"}})
+												if dialErr != nil {
+													t.Fatal(dialErr)
+												}
+												defer conn.Close()
+												if deadlineErr := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); deadlineErr != nil {
+													t.Fatal(deadlineErr)
+												}
+												if writeErr := conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.create","model":%q,"input":[]}`, model))); writeErr != nil {
+													t.Fatal(writeErr)
+												}
+												for {
+													kind, payload, readErr := conn.ReadMessage()
+													if readErr != nil {
+														err = readErr
+														break
+													}
+													var event struct{ Type string }
+													if kind != websocket.TextMessage || json.Unmarshal(payload, &event) != nil {
+														t.Fatalf("WS kind=%d payload=%q", kind, payload)
+													}
+													ws = append(ws, string(payload))
+													if event.Type == "response.completed" || event.Type == "error" || event.Type == "response.failed" {
+														break
+													}
+												}
+											}
+											if scenario.terminal == "error" {
+												wantWS := append([]string(nil), wantPayloads[:len(wantPayloads)-1]...)
+												if !websocket.IsCloseError(err, websocket.CloseAbnormalClosure) || len(ws) != len(wantWS) || len(ws) > 0 && !reflect.DeepEqual(ws, wantWS) {
+													t.Errorf("existing error WS=%q error=%v want prefix=%q and close=1006", ws, err, wantWS)
+												}
+											} else if err != nil || !reflect.DeepEqual(ws, wantPayloads) {
+												t.Errorf("completion WS=%q error=%v want=%q", ws, err, wantPayloads)
+											}
+										}
+									}
+									p.mu.Lock()
+									records := append([]gCPAUpstreamRecord(nil), p.records...)
+									p.mu.Unlock()
+									if len(records) != 1 || records[0].model != upstream || records[0].path != "/v1/responses" || !bytes.Equal(records[0].response, originalWire) {
+										t.Fatalf("upstream route/calls=%+v want model=%s wire=%q", records, upstream, originalWire)
+									}
+									var wantBody string
+									if kind == "mapped-native" {
+										wantBody = `{"model":"` + upstream + `","stream":true`
+									} else {
+										input := `[{"type":"message","role":"user","content":[{"type":"input_text","text":"say ok"}]}]`
+										if strings.HasSuffix(kind, "-ws") {
+											input = "[]"
+										}
+										wantBody = `{"model":"` + upstream + `","input":` + input + `,"stream":true`
+										if !strings.HasSuffix(kind, "-ws") {
+											wantBody += `,"prompt_cache_key":"task-g-local"`
+										}
+									}
+									wantBody += `,"store":false`
+									if scenario.provider == "codex" {
+										wantBody += `,"parallel_tool_calls":true`
+									}
+									wantBody += `,"include":["reasoning.encrypted_content"],"instructions":""`
+									if scenario.provider == "codex" {
+										wantBody += `,"tools":[{"type":"image_generation","output_format":"png"}]`
+									}
+									if strings.HasSuffix(kind, "-ws") {
+										var body struct {
+											PromptCacheKey string `json:"prompt_cache_key"`
+										}
+										if err := json.Unmarshal(records[0].body, &body); err != nil || body.PromptCacheKey == "" {
+											t.Fatalf("WS session request=%q error=%v", records[0].body, err)
+										}
+										key, err := json.Marshal(body.PromptCacheKey)
+										if err != nil {
+											t.Fatal(err)
+										}
+										wantBody += `,"prompt_cache_key":` + string(key)
+									}
+									wantBody += "}"
+									wantHeaders := http.Header{"Accept": {"text/event-stream"}, "Accept-Encoding": {"gzip"}, "Authorization": {"Bearer fake-upstream-key"}, "Connection": {"Keep-Alive"}, "Content-Length": {fmt.Sprint(len(wantBody))}, "Content-Type": {"application/json"}, "User-Agent": {"Go-http-client/1.1"}}
+									var session struct {
+										PromptCacheKey string `json:"prompt_cache_key"`
+									}
+									if err := json.Unmarshal([]byte(wantBody), &session); err != nil {
+										t.Fatal(err)
+									}
+									if scenario.provider == "codex" {
+										wantHeaders.Set("User-Agent", "codex-tui/0.153.3 (Mac OS 26.5.1; arm64) iTerm.app/3.6.11 (codex-tui; 0.153.3)")
+										wantHeaders.Set("Originator", "codex-tui")
+										if session.PromptCacheKey != "" {
+											wantHeaders.Set("Session-Id", session.PromptCacheKey)
+										}
+									} else if session.PromptCacheKey != "" {
+										wantHeaders.Set("X-Grok-Conv-Id", session.PromptCacheKey)
+									}
+									if !reflect.DeepEqual(records[0].headers, wantHeaders) {
+										t.Fatalf("upstream headers=%v want=%v", records[0].headers, wantHeaders)
+									}
+									if string(records[0].body) != wantBody {
+										t.Fatalf("upstream body=%q want=%q headers=%v", records[0].body, wantBody, records[0].headers)
+									}
+									t.Logf("terminal=%s provider=%s kind=%s model=%s upstream=%s networkStep=%d request=%s headers=%v URI=%s callbacks=%q native/HTTP=%q WS=%q", scenario.terminal, scenario.provider, kind, model, upstream, step, records[0].body, records[0].headers, records[0].path, fields, raw, ws)
+								})
+							}
+						})
+					}
+				}
+			}
+		})
+	}
+}

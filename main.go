@@ -220,10 +220,11 @@ func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
 			p = nil
 		}
 	}
-	if r.logicalEventFormat == "openai-response" && (bytes.HasPrefix(p, []byte("data:")) || bytes.HasPrefix(p, []byte("event:"))) {
+	if r.logicalEventFormat == "openai-response" && (bytes.HasPrefix(p, []byte("data:")) || bytes.HasPrefix(p, []byte("event:")) ||
+		isResponsesMetadataField(p) && completeSSEEvents(p)) {
 		s := &r.delimiterless
 		if !s.disabled && s.completeEnd > 0 && (s.completeEnd == len(r.buf) || s.metadataEnd == len(r.buf)) && s.dataStart == s.headerStart {
-			// 下一独立 event/data 单位确认前值边界，metadata 保留给下一事件。
+			// 下一独立 event/data 或完整 metadata 单位确认前值边界，metadata 保留给下一事件。
 			nextFields := r.buf[s.completeEnd:]
 			r.buf = r.buf[:s.completeEnd]
 			var err error
@@ -235,7 +236,7 @@ func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
 			r.delimiterless.metadataEnd = len(nextFields)
 		} else if bytes.HasPrefix(p, []byte("data:")) && !s.disabled && s.headerPrefixChecked && !s.headerComplete && s.headerScan == len(r.buf) {
 			eventType := strings.TrimSpace(string(r.buf[s.headerStart+len("event:") : s.headerScan]))
-			if strings.HasPrefix(eventType, "response.") {
+			if strings.HasPrefix(eventType, "response.") || eventType == "error" || eventType == "keepalive" {
 				// dataStart == headerScan 记录 callback 间缺少的 LF；验证后才补写。
 				s.eventType, s.dataStart, s.headerComplete = eventType, s.headerScan, true
 				if strings.IndexFunc(eventType, unicode.IsSpace) >= 0 {
@@ -638,7 +639,7 @@ func (r *sseRewriter) findDelimiterlessResponsesEventEnd(eof bool) (int, bool) {
 			s.eventType = strings.TrimSpace(string(buf[s.headerStart+len("event:") : s.headerScan]))
 			switch r.logicalEventFormat {
 			case "openai-response":
-				if !strings.HasPrefix(s.eventType, "response.") {
+				if !strings.HasPrefix(s.eventType, "response.") && s.eventType != "error" && s.eventType != "keepalive" {
 					s.disabled = true
 					return 0, false
 				}
@@ -742,7 +743,10 @@ func (r *sseRewriter) findDelimiterlessResponsesEventEnd(eof bool) (int, bool) {
 			var typed struct {
 				Type string `json:"type"`
 			}
-			matched = json.Unmarshal(value, &typed) == nil && (s.eventType != "" && typed.Type == s.eventType || s.eventType == "" && strings.HasPrefix(typed.Type, "response."))
+			matched = json.Unmarshal(value, &typed) == nil && (s.eventType != "" && typed.Type == s.eventType ||
+				s.eventType == "response.done" && typed.Type == "response.completed" ||
+				s.eventType == "" && (strings.HasPrefix(typed.Type, "response.") ||
+					s.dataStart == s.headerStart && (typed.Type == "error" || typed.Type == "keepalive")))
 		case "interactions":
 			if s.eventType == "done" {
 				matched = bytes.Equal(bytes.TrimSpace(value), []byte("[DONE]"))
