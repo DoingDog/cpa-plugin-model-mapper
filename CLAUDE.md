@@ -22,7 +22,22 @@ Do not run `go test ./.github/scripts`; that directory contains multiple `packag
 
 This is a single-package Go `c-shared` CLIProxyAPI native plugin. `abi_cgo.go` is the C ABI bridge: it exports `cliproxy_plugin_init`, `cliproxyPluginCall`, `cliproxyPluginFree`, and `cliproxyPluginShutdown`, then forwards plugin method calls into `handleMethod` in `main.go`.
 
-`main.go` contains the plugin logic:
+All ten production files share `package main` and build into the same dynamic library:
+
+| File | Responsibility |
+| --- | --- |
+| `main.go` | Entry point, `pluginVersion`, registration, RPC dispatch, host callbacks, and structured error envelopes. |
+| `abi_cgo.go` | C ABI bridge, exports, length validation, and buffer ownership. |
+| `config.go` | Config decoding, compilation, lifecycle payloads, and configuration snapshots. |
+| `model_router.go` | Rule selection, model routing, Interactions agent classification, authenticated caller recovery, and caller pattern cache. |
+| `rules.go` | Rule DSL parsing, ASCII case operations, caller conditions, and ordered replacement. |
+| `executor.go` | Shared executor request types, headers, and non-streaming execution. |
+| `executor_stream.go` | Stream preparation, admission, forwarding, terminal errors, closing, and shutdown. |
+| `json_model.go` | Top-level request model rewriting, whitelisted response restoration, and JSON byte edits. |
+| `sse_rewriter.go` | SSE events, metadata, delimiterless logical events, model restoration, and framing. |
+| `stream_rewriter.go` | Chunk classification, raw JSON values and arrays, pending data, Flush, and Finish. |
+
+Plugin behavior:
 
 - `pluginRegistration` advertises `model_router`, `executor`, and `executor.execute_stream` support for `openai`, `openai-response`, `claude`, `gemini`, and `interactions`. Logo is registration metadata and has no configuration field.
 - `decodeLifecycleConfig` and `decodeConfig` load plugin config from CPA lifecycle payloads. Plugin-owned config fields are `global_rules`, `claude_messages_rules`, `codex_responses_rules`, `openai_completions_rules`, and `rules_stack_mode`; CPA owns global and per-instance `enabled` plus per-instance `priority`.

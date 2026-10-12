@@ -218,6 +218,15 @@ Use wildcard mappings when several Client-Requested Models should execute as one
 
 Add a scoped mapping for that inbound client API key before an unscoped mapping. The rewrite happens inside CPA and supported response model fields are restored to the Client-Requested Model. Other response fields, logs, and errors can still contain upstream model information. Actual cost depends on provider and model pricing.
 
+## Source layout
+
+The ten production files share `package main` and build into one dynamic library:
+
+- `main.go` contains the entry point, registration, RPC dispatch, host callbacks, and structured errors; `abi_cgo.go` provides the C ABI bridge.
+- `config.go`, `model_router.go`, and `rules.go` handle configuration, routing and caller identity, and the rule DSL.
+- `executor.go` and `executor_stream.go` handle non-streaming execution and stream lifecycle/forwarding.
+- `json_model.go`, `sse_rewriter.go`, and `stream_rewriter.go` handle JSON model fields, SSE events, and raw stream chunks.
+
 ## Build
 
 ```powershell
