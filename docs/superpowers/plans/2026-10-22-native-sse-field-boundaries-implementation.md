@@ -17,8 +17,8 @@ baseline: f80b97505edfb50c4d72a634da7c54a44bbe75e8
 - **Means:** Confirm field boundaries in the shared incremental rewriter, preserving unresolved bytes and reusing current restoration and lifecycle code (KTD1-KTD3).
 - **Authority:** The [design spec](../specs/2026-10-22-native-sse-field-boundaries-design.md) owns R1-R13 and AE1-AE6. This plan defines implementation and verification without changing that scope.
 - **Execution:** One coding owner completes TDD, minimal implementation, tests, specification/quality review, corrections, re-review, and commit in one independent worktree. The coordinator merges only completed, reviewed work after checking conflicts.
-- **Start gate:** The coordinator must receive all twelve audit scopes and independent verification, resolve all candidates, incorporate any other confirmed plugin-owned defect into both documents, and complete document review before production or test edits. This documentation task leaves that gate unasserted.
-- **Stop conditions:** A same-input protocol conflict, failed producer control, required CPA/ABI change, or overlapping writer returns to the coordinator with evidence. Push, tag, and release require the user's actual authorization; this plan grants none.
+- **Start state:** The twelve-scope audit and focused verification are complete. F-SSE-001 is the sole implementation scope; review the corrected documents, freeze their existing evidence and controls, then begin U2. Do not reopen the audit or source-signal investigation.
+- **Escalation conditions:** Report a newly demonstrated failure of an established supported input, a failed healthy-direct control, a required CPA/ABI change, or an overlapping writer with concrete evidence. The documented custom raw/native same-sequence ambiguity is an existing limit handled by native precedence, not an unresolved start gate. Push, tag, and release require the user's actual authorization; this plan grants none.
 
 ---
 
@@ -26,11 +26,11 @@ baseline: f80b97505edfb50c4d72a634da7c54a44bbe75e8
 
 ### Summary
 
-Implement F-SSE-001 for the confirmed native fields, with exact framed-partition controls and real CPA producer/native/HTTP verification. Preserve the current plugin's model, protocol, resource, and error behavior.
+Implement F-SSE-001 for all confirmed native fields, with exact existing framed/partition controls at their actual formats, focused new-field continuations, and real CPA producer/native/HTTP/WS verification. Preserve the current plugin's model, protocol, limit/ownership, dispatch, and error behavior. Responses keeps its established native-output-unit precedence; an identical unmarked callback sequence cannot also be guaranteed a conflicting raw-wire interpretation.
 
 ### Problem Frame
 
-The retained audit shows bare `id`/`retry`, extension metadata, bare `data`/`event`, empty `event:`, and Codex empty `data: ` concatenated with later native fields. The independent real-consumer replay turns direct HTTP 200 into mapped HTTP 502 for the first three shapes. Current metadata recovery also inserts LF inside split standard fields/comments. The spec's evidence table distinguishes these observations from the rebuilt-DLL acceptance still required.
+The retained audit shows bare `id`/`retry`, extension metadata, bare `data`/`event`, empty `event:`, and Codex empty `data: ` concatenated with later native fields. Independent baseline native-DLL/real-HTTP verification confirms six metadata regressions and 98 healthy-direct empty-field regressions in the complete 222-case matrix. Event names, JSON type/status/model, output text, and opaque content establish health; HTTP status alone does not. Codex empty-data acceptance uses its confirmed data-only positions. The spec identifies the exact evidence and the custom raw/native interpretation limit. Rebuilt-DLL GREEN acceptance is still required.
 
 ### Requirements
 
@@ -40,9 +40,9 @@ Product Contract preserved from the origin spec. The trace below locates verific
 | --- | --- | --- |
 | R1-R2, confirmed fields and empty-field semantics | U2, rounds S1-S4 | AE1-AE2; exact root bytes and actual producer/native/HTTP cases |
 | R3-R4, complete lifecycle and dispatch | U2, rounds S1-S5 | AE1-AE2; per-Write output, single/two/nine events, mixed shapes, late delimiters |
-| R5-R6, framed partitions and ambiguity | U2, rounds S1-S5 | AE3; no speculative LF, all splits/BOM/endings, opaque controls |
+| R5-R6, existing partitions and native precedence | U2, rounds S1-S5 | AE3; new-field continuations, unchanged old oracles, opaque/resegmented/native and generic-format split/BOM/ending controls |
 | R7-R8, discriminator and whitelist preservation | U2-U3 | AE3-AE4; existing error/keepalive/alias, Interactions and JSON controls |
-| R9-R11, resources/raw formats/lifecycle/errors | U2, rounds S5-S6; U3 | AE4-AE5; bounds/ownership/allocations, raw/Gemini, terminal/error/shutdown suites |
+| R9-R11, limits/ownership/raw formats/lifecycle/errors | U2, rounds S5-S6; U3 | AE4-AE5; existing bounds/ownership/allocation, raw/Gemini, terminal/error/shutdown suites |
 | R12, unchanged public surfaces and real seams | U2-U3 | AE6; actual RPC envelopes, cgo/native loader, registration and full integration |
 | R13, owner completion and patch delivery | U1-U4 | Baseline RED/current GREEN, completed owner commit, independent review, final-SHA CI and authorized release |
 
@@ -50,7 +50,7 @@ Product Contract preserved from the origin spec. The trace below locates verific
 
 Production edits are confined to `sse_rewriter.go` and necessary boundary classification/retention changes in `stream_rewriter.go`. Tests use the files and callers in the origin's Change reach table. All ten production files remain in the same package; dependencies, configuration, exports, schema, routing, and five formats remain unchanged.
 
-Gemini `countTokens` and host error information missing from the current ABI remain host limitations. This task adds no host patch, new parser, provider branch, mode, retry, or migration. README, `CONCEPTS.md`, historical planning documents, CI/Makefile, packaging scripts, and global/project instructions need no edits.
+Work is limited to F-SSE-001 and ordinary regression. Do not perform cybersecurity scanning or repair, authentication/credential or digest-integrity investigations, vulnerability or resource-exhaustion investigations, unrelated fixes, or CPA changes. Run existing limit/ownership/performance regressions without adding stress or benchmark campaigns. This task adds no parser, provider branch, mode, retry, migration, dependency, or public interface. README, `CONCEPTS.md`, historical planning documents, CI/Makefile, packaging scripts, and global/project instructions need no edits.
 
 ---
 
@@ -58,8 +58,8 @@ Gemini `countTokens` and host error information missing from the current ABI rem
 
 ### Key Technical Decisions
 
-- KTD1. Use tentative boundary offsets/state in the existing rewriter, with byte-preserving retention until the native sequence is validated. Widening `isResponsesMetadataField` and immediately appending LF fails the `id` + `: cursor` and `retry` + `: 100` controls. Governs R1-R2, R5-R6, R9.
-- KTD2. Reuse the current incremental scanner, `encoding/json`, `drain`, model restorer, and reset paths. Keep ordinary framed parsing and existing logical dispatch distinct; no global native-mode guess from the first callback. Governs R3-R8, R10.
+- KTD1. Record tentative offsets only at observed callback boundaries for new fields, retaining their bytes until real framing or a complete validated native sequence confirms missing separators. Widening `isResponsesMetadataField` and immediately appending LF fails `id` + `: cursor` and `retry` + `: 100`. Preserve existing recognized-metadata behavior and old oracles. Governs R1-R2, R5-R6, R9.
+- KTD2. Reuse the current incremental scanner, `encoding/json`, `drain`, model restorer, and reset paths. Apply existing type/event/alias checks before confirming new boundaries; preserve repeated/empty event and empty-data semantics. Responses native-shaped units keep native precedence, while whole opaque units and generic-format partitions keep their existing interpretation. No interior-text search, source-marker guess, provider branch, or new mode. Governs R3-R8, R10.
 - KTD3. Keep `executor_stream.go`, `main.go`, and `abi_cgo.go` production callers unchanged. Verify complete chunks plus errors and lifecycle effects through their existing interfaces. Governs R9-R12.
 - KTD4. Add behavioral root cases in `stream_native_fields_regression_test.go` and one new matrix in the sole CPA fixture, `.github/scripts/testdata/cpa-functional-regression_test.go`. Reuse existing helpers; add no second permanent fixture or smoke entry point. Governs R12-R13.
 - KTD5. Keep one parent-lifetime canonical library and sequential enabled Hosts. Record source/build/canonical/actual-loaded identities, including the actual overlay child's Windows shadow DLL PID/path/hash; canonical-only records are incomplete native identity evidence. Governs R12-R13.
@@ -69,8 +69,8 @@ Gemini `countTokens` and host error information missing from the current ABI rem
 
 ```mermaid
 flowchart TB
-  A[Host output bytes and existing exit format] --> B[Existing chunk classification]
-  B --> C[Retain real bytes and tentative field offsets]
+  A[Host output bytes and existing exit format] --> B[Existing classification and native precedence]
+  B --> C[Retain bytes and observed callback offsets]
   C --> D{Boundary evidence}
   D -->|Real framed separators| E[Existing SSE event rewriting]
   D -->|Validated native sequence and complete typed data| F[Commit only missing separators]
@@ -82,34 +82,33 @@ flowchart TB
 
 ### Assumptions and execution-time facts
 
-The pinned CPA is the compatibility target; local fake upstreams isolate external model services while actual producers, translators, validator, host callbacks, loader, and HTTP/WS consumers run. The exact minimal state changes are determined by the vertical tests. Gate completion, the eventual implementation commit, benchmark results, final patch version, CI run, and release identity are facts to record when they occur.
+The pinned CPA is the compatibility target; local controlled upstreams isolate external model services while actual producers, translators, validator, host callbacks, loader, and HTTP/WS consumers run. Stock XAI/Codex whole and bytewise upstream writes yield the same native output units, and complete opaque lines stay whole. The existing ABI has no trusted source marker; custom raw callbacks that collide with native shapes receive the established native interpretation. Do not promise both interpretations or repeat the completed feasibility investigation.
 
-The current partial-metadata characterization has one incompatible expected byte sequence, identified explicitly in the spec. Correct that oracle only with its focused framed RED/GREEN proof. Preserve every other baseline case, assertion, size, and internal timeout; add Responses to partition tables that currently cover metadata only through `claude`.
+Keep every baseline case, assertion, oracle, size, allocation threshold, and internal timeout, including the partial-metadata characterization and NativeDelimiter. Existing literal-event/all-split generic tables retain their current formats. New continuation tests target bare `id`/`retry`, extensions, and empty-field prefixes without introducing an unconditional Responses wire-partition requirement. Record the eventual implementation commit, existing benchmark results, patch version, CI run, and release identity when they occur.
 
 ---
 
 ## Implementation Units
 
-### U1. Close the audit and planning gate
+### U1. Freeze the reviewed F-SSE-001 inputs
 
-**Goal:** Establish the complete reviewed implementation scope before a coding owner starts.
+**Goal:** Give the coding owner the corrected scope, fixed acceptance cases, and unchanged compatibility oracles. The audit and focused verification are already complete.
 
-**Requirements:** R13; Start gate.
+**Requirements:** R1-R13; completed start state.
 
-**Dependencies:** All twelve audit returns and independent verification, delivered to the coordinator by completion notifications.
+**Dependencies:** Existing local evidence named in the spec; no new audit or feasibility work.
 
-**Files:** The origin spec and this plan; retained audit artifacts are read-only inputs.
+**Files:** The origin spec and this plan; retained evidence is read-only input.
 
 **Approach:**
 
-1. Match all twelve named audit scopes to complete results and resolve each candidate. Investigate missing coverage without replacing it with sampling.
-2. Confirm F-SSE-001 evidence and any additional confirmed plugin-owned issue; update spec first and plan second if scope changes.
-3. Review both documents against current callers, fixtures, commands, R/AE/KTD references, and the ambiguity constraints. Correct and re-review blocking issues.
-4. Give one owner the reviewed document commit and an independent worktree whose production baseline is the specified SHA or a coordinator-verified descendant with equivalent relevant code.
+1. Review spec first, then plan against the existing scanner, callers, fixture, and commands. Confirm native precedence, the custom raw interpretation limit, all old oracles, and the F-only scope.
+2. Freeze the six healthy-direct metadata HTTP regressions from `verify-F-reproduction` and all 222 empty-field case identities/classifications from `verify-F-empty-native/coverage.json` and `results.json`. The 98 confirmed healthy-direct empty-field regressions are a fixed success set; the remaining cases retain their recorded control classifications. Do not choose acceptance cases dynamically after observing repaired output.
+3. Give one owner the reviewed document commit and an independent worktree based on the specified production SHA or a coordinator-verified descendant with equivalent relevant code. Freeze baseline sources/tests/fixture membership as described below, then proceed to U2.
 
-**Test expectation:** Documentation checks only. No product tests, builds, production edits, or test edits during this document-only unit.
+**Test expectation:** This document-only revision checks local paths, commands, consistency, and Git diff. It changes no production or test file and claims no runtime GREEN.
 
-**Verification:** The coordinator has a coverage-complete audit and review record. The present document task's commit contains only the two requested Markdown files.
+**Verification:** The corrected documents contain only F-SSE-001 implementation work and ordinary regression/delivery gates. The present document commit contains exactly the two requested Markdown files.
 
 ### U2. Complete the shared boundary fix through vertical TDD
 
@@ -117,7 +116,7 @@ The current partial-metadata characterization has one incompatible expected byte
 
 **Dependencies:** U1. One owner holds the overlapping scanner, classification, root-test, and CPA-fixture scope.
 
-**Files:** `sse_rewriter.go`, necessary portions of `stream_rewriter.go`, `stream_native_fields_regression_test.go`, and the sole CPA fixture. Necessary partition-table extensions may touch `main_test.go` or `stream_protocol_regression_test.go`. Existing performance/lifecycle files are verification targets; add only a focused boundary case if needed, without altering thresholds or unrelated assertions.
+**Files:** `sse_rewriter.go`, only necessary classification/retention portions of `stream_rewriter.go`, `stream_native_fields_regression_test.go`, and the sole CPA fixture. A focused new-field continuation case may use `main_test.go` or `stream_protocol_regression_test.go`; do not broaden existing generic partition tables to Responses. Existing performance, limits, ownership, and lifecycle files are unchanged verification targets.
 
 **Patterns:** `gNativeParts`, `gNativeSequence`, `gNativeCompleted`, `gNativeCompletedWant`; existing forwarder callbacks and `runExecutorStreamTestWithHostContentTypeAndForwarded`; `handleMethod`/`setHostCallbackForTest` for real RPC envelopes; the origin's listed CPA helpers for native and HTTP/WS.
 
@@ -125,27 +124,27 @@ The current partial-metadata characterization has one incompatible expected byte
 
 | Round | Add first, then obtain baseline RED | Minimal GREEN and required controls |
 | --- | --- | --- |
-| S1, bare metadata and standard continuations | `TestFunctionalNativeSSEBoundaryMetadata/bare-id`, then `bare-retry`; add each corresponding producer/native/HTTP case. Add `TestFunctionalNativeSSEBoundaryWirePartitions` for `id` + `: cursor`, `retry` + `: 100`, split `id:`/`retry:`, and split comments before broadening recognition. | Retain candidate bytes and confirm boundaries at the shared source. Run every split, bytewise, BOM and line-ending controls with Responses active. Correct the one documented characterization oracle after its target RED; keep all other assertions. |
-| S2, opaque extensions | `TestFunctionalNativeSSEBoundaryMetadata/extension`; real `x-request-id: trace-123` before event, in event, and between events for both producers. | Preserve extension bytes and recover the later data. Split extension names/values and metadata containing canonical field text must remain opaque. |
-| S3, colonless empty fields | Add `TestFunctionalNativeSSEBoundaryEmptyFields/bare-data`, then `bare-event`, with real producer/native/HTTP cases. | Preserve empty fields without adding non-empty data or disabling the next completion. Include repeated empty fields, standalone empty-field groups, and split field names. |
-| S4, colon-form empty fields | Add `TestFunctionalNativeSSEBoundaryEmptyFields/empty-event`, then `codex-empty-data`; capture actual `event:` and Codex `data: ` units. | Recover standalone empty event, repeated/empty event headers, and empty data followed by valid JSON. XAI filtered empty `data:` stays an actual producer control. Partial `event:`/`data:` values retain ordinary framed bytes. |
-| S5, sequence and dispatch | `TestFunctionalNativeSSEBoundaryDispatch` and `TestFunctionalNativeSSEBoundaryAmbiguity`; extend the CPA matrix to every confirmed field at applicable positions and single/created-completed/nine-event, pair/data-only/alternating shapes. | Verify exact cumulative output after every Write, natural EOF, repeated Flush/Finish, late delimiters, existing complete-comment flush, and no duplicate data. Preserve mismatches, markerless and opaque canonical-text controls. |
-| S6, failures and resources | `TestFunctionalNativeSSEBoundaryForwarder`, `TestFunctionalNativeSSEBoundaryRPC`, and `TestFunctionalNativeSSEBoundaryResources`; use a representative newly failing field for target RED and all remaining fields as regression cases. | Preserve complete-prefix-plus-error, terminal payloads, callback/decode/in-band/rewrite/emit/cleanup errors, close order/counts, no extra reads, no replay, bounds, ownership and allocations. Run real native controlled error/close cases as well as happy-path HTTP. |
+| S1, bare metadata and continuations | `TestFunctionalNativeSSEBoundaryMetadata/bare-id`, then `bare-retry`; add corresponding real producer/native/healthy-direct HTTP cases. Add `TestFunctionalNativeSSEBoundaryContinuations` for `id` + `: cursor\n` and `retry` + `: 100\n`, including bytewise prefix/value continuations. | Retain new candidates and confirm only observed boundaries at the shared scanner. Bare prefixes followed by colon/value remain original fields. Keep the existing partial-metadata characterization, NativeDelimiter, BOM/endings, generic partitions, and all other old assertions unchanged. |
+| S2, opaque extensions | `TestFunctionalNativeSSEBoundaryMetadata/extension`; actual `x-request-id: trace-123` before event, in event, and between events for both producers. | Preserve extension bytes and recover later data. Cover split extension names/values, whole opaque event/data text, and all existing Responses metadata-resegmented controls. Never search a field value for boundaries. |
+| S3, colonless empty fields | Add `TestFunctionalNativeSSEBoundaryEmptyFields/bare-data`, then `bare-event`, with real producer/native/HTTP cases from the frozen healthy-direct set. | Preserve empty fields without adding non-empty data or disabling the next completion. Include standalone groups, repeated fields, split prefixes, later named-header override, and last-empty-header default `message` semantics. |
+| S4, colon-form empty fields | Add `TestFunctionalNativeSSEBoundaryEmptyFields/empty-event`, then `codex-empty-data`; test `event:` and `event: `, plus upstream `data:` and `data: ` spellings as actual producer units. Codex empty-data HTTP acceptance covers its six confirmed data-only positions for each spelling. | Preserve repeated/empty event headers and default names, separate empty data from later JSON, and retain prefix/value continuations. Keep all 98 archived healthy-direct empty-field regressions and their exact case identities. XAI filtered empty data remains a producer control; unhealthy direct explicit-event cases stay separately classified. |
+| S5, sequence and dispatch | `TestFunctionalNativeSSEBoundaryDispatch` and `TestFunctionalNativeSSEBoundaryAmbiguity`; complete root/native coverage for confirmed fields at applicable positions and single/created-completed/nine-event, pair/data-only/alternating shapes. Map the full archived matrix to permanent acceptance/control cases. | Assert exact cumulative output after every Write, natural EOF, repeated Flush/Finish, late delimiters, existing complete-comment flush, and no duplicate data. Preserve mismatches, discriminator/alias, markerless, whole opaque and metadata-resegmented controls. Use only healthy-direct shapes for new HTTP success claims. |
+| S6, forwarding and ordinary regression | Add `TestFunctionalNativeSSEBoundaryForwarder` and `TestFunctionalNativeSSEBoundaryRPC`; use a representative newly failing field for target RED and other confirmed fields as regressions. | Check terminal payloads, flush-before-close, error precedence, close order/counts, no extra reads, and emit failure without replay through current interfaces. Run existing native controlled-error/close, limit, prefix-plus-error, ownership, allocation, and continuation suites unchanged. Add no resource-stress or performance matrix. |
 
 The names above and `TestModelMapperFunctionalNativeSSEBoundaries` are proposed permanent additions, not baseline tests. Give metadata/empty-field subtests the exact slugs in this table so focused commands select real cases. The CPA test uses `provider/field/position/shape/lifecycle/transport/consumer` subtest components, with `provider` equal to `xai` or `codex` and the same field slugs as the root tests.
 
 **Test scenarios and assertions:**
 
 1. Covers AE1-AE2. Capture core and host non-empty units from both actual providers before asserting what the plugin receives. For every confirmed field, exercise before-event, event/data, between-events, and standalone-empty positions where applicable; test whole and bytewise upstream writes, which must pass through the real Scanner.
-2. Covers AE1. Run native mapped execution and real `/v1/responses` streaming plus non-streaming completion where supported by the existing fixture. Require valid JSON, exact data count/order, completed status, full output, model restoration, Content-Type, EOF, and original request/call/header/URI checks. HTTP 200 or a model substring alone is insufficient.
+2. Covers AE1. Run native mapped execution and real `/v1/responses` streaming plus non-streaming completion where supported by the existing fixture and healthy-direct control. Require expected event names, valid JSON, exact non-empty data count/order, type/status/model, full output, unchanged opaque values and text, Content-Type, EOF, and original request/call/header/URI checks. HTTP 200 or a substring alone is insufficient. Retain all 222 archived case classifications: 98 fixed healthy-direct regressions, 78 healthy controls, and 46 unhealthy-direct cases that do not establish plugin-only success requirements.
 3. Covers AE1-AE2. Run direct, enabled-unmapped, and disabled controls for both actual model names. Build each custom wire with the appropriate model; `setFixture` does not clear `p.wire`, so explicitly set or clear `wire` and `records` under `p.mu` before each request.
-4. Covers AE3-AE4. Standard framed controls cover LF/CRLF/CR/mixed endings, BOM, every split, bytewise and irregular partitions, multi-data JSON, escaped keys, unknown/colonless fields, metadata after complete JSON, embedded canonical strings, and raw-looking continuations. Keep exact output bytes, not merely decoded equality.
-5. Covers AE2-AE5. Root tests assert known exact wire. Use existing JSON assertions only on real data frames; `requireValidResponsesSSE` assumes every frame carries JSON and is unsuitable for metadata-only/empty frames. The CPA fixture uses its existing `sse.Decode` plus JSON validation of non-empty data, retaining metadata/empty-frame bytes for separate exact assertions. Add no parser or root dependency.
+4. Covers AE3-AE4. Run existing LF/CRLF/CR/mixed-ending, BOM, all-split/bytewise, multi-data JSON, escaped-key, metadata-after-JSON, raw-continuation, and embedded-text controls at their existing formats. New Responses continuation tests cover the new bare/empty/extension candidates without changing old expectations or adding a universal wire-partition requirement. Keep exact output bytes for whole opaque units, Responses metadata-resegmented cases, generic partitions, and genuine mismatches.
+5. Covers AE2-AE5. Root tests assert known exact wire and use JSON assertions only on real data frames; `requireValidResponsesSSE` assumes every frame carries JSON and is unsuitable for metadata-only/empty frames. The CPA fixture uses mature `github.com/gin-contrib/sse.Decode` and `encoding/json` to check event name, type/status/model, complete output, opaque values, and text on non-empty data. Assert default `message` for data-only or last-empty-header cases, and the last explicit header where applicable; do not always require event name == JSON type. Keep original metadata/empty-field bytes for exact checks and normalize known line endings only for the LF-only decoder. Add no parser or root dependency.
 6. Covers AE5. RPC coverage calls `handleMethod(executor.execute_stream)` with actual encoded envelopes and host callbacks, checks the outbound Upstream Model and supported headers, waits for worker closure, and validates emitted terminal bytes/errors. Keep forwarder tests for precise cleanup/emit ordering. In-process callbacks isolate the host boundary; they do not replace DLL loading.
 7. Covers AE4-AE6. Real C ABI coverage loads the rebuilt library through existing `Host`/native loader, exercises registration, execution, reconfigure, unload and reload, and observes the actual producer/validator/HTTP consumer. Preserve WS completion controls and fixed CPA's existing error-only WS limitation.
-8. Covers AE5. Bound incomplete JSON, incomplete fields, ambiguous candidate chains, and incomplete suffixes at and above 16 MiB. Preserve complete units/batches above the limit, completed metadata before a near-limit JSON unit, valid prefixes on failure, and clearing after overflow. Mutate input buffers and issue later writes to prove output ownership.
+8. Covers AE5. Run existing incomplete-unit limit, complete-large-unit/batch, prefix-plus-error, clearing-after-error, metadata-before-near-limit JSON, incremental-cursor, and ownership tests unchanged. Preserve the existing checks that mutate input and perform later writes. Review that new tentative state uses the same buffer accounting and reset paths; do not add a resource-exhaustion investigation.
 
-**Verification:** All slices have genuine assertion-level RED/GREEN evidence, exact framed controls, and real native/HTTP results. The owner completes full checks below, specification/quality self-review, corrections, affected retests, re-review, and a normal path-limited commit before handoff. No incomplete implementation or owner checks pass to the coordinator.
+**Verification:** Each newly failing field has genuine assertion-level baseline RED/current GREEN evidence, all old compatibility assertions remain GREEN, and the fixed healthy-direct matrix has rebuilt native/HTTP results. Record already-correct continuation/control cases as GREEN without manufacturing failures. The owner completes the full checks below, specification/quality self-review, corrections, affected retests, re-review, and a normal path-limited commit before handoff. No incomplete implementation or owner checks pass to the coordinator.
 
 ### U3. Review and verify the final integrated change
 
@@ -160,9 +159,9 @@ The names above and `TestModelMapperFunctionalNativeSSEBoundaries` are proposed 
 **Approach:**
 
 1. Review the entire baseline-to-final change for protocol correctness, scope, duplicate logic, bounded state, input/output ownership, and incremental scan/copy costs. Independent reviewers return findings; the coding owner fixes and re-reviews them in its worktree.
-2. Verify that the one corrected oracle follows R5 and no unrelated test, table case, expected key, limit, or deadline was removed, skipped, weakened, or replaced.
-3. Rebuild and rerun the full command matrix on the final integrated source. Run the new focused native matrix at least twice. Preserve all four baseline capture key sets and all expanded legacy cases, with new cases listed separately.
-4. Compare affected benchmark runs against frozen baseline on the same toolchain/host/policy. Investigate repeatable regressions; retain existing allocation limits and incremental behavior. A one-iteration preflight establishes runnable cases only.
+2. Verify that every old oracle remains unchanged, including partial-metadata characterization, NativeDelimiter, metadata-resegmented, discriminator/alias, dispatch, opaque, and generic partition cases. No test, table case, expected key, limit, or deadline may be removed, skipped, weakened, or replaced to obtain GREEN.
+3. Rebuild and rerun the full command matrix on the final integrated source. Run the new focused native matrix at least twice. Preserve all four baseline capture key sets and expanded legacy cases, with new cases listed separately. Reconcile all 222 archived empty-field identities/classifications and the fixed 98-case success set.
+4. Run existing affected benchmarks against frozen baseline on the same toolchain/host/policy as ordinary performance regression. Correct regressions introduced by this fix while retaining allocation limits and incremental behavior. A one-iteration preflight establishes runnable cases only; add no benchmark or performance campaign.
 5. Verify default registration and a separate patch-injected artifact through actual init/register, then package and inspect its bytes using the existing tooling.
 
 **Verification:** Every required command has its real exit status and source/artifact identities. Blocking review findings are corrected and re-reviewed; final-source checks pass with limits reported by execution layer.
@@ -204,7 +203,7 @@ Record baseline/current source hashes, tests/fixture/overlay hashes, command/cwd
 The uppercase path variables below are absolute paths resolved and recorded by the owner: `BASELINE_OVERLAY` maps to frozen baseline production; `CPA_COPY` and `FIXTURE_OVERLAY` come from the existing `prepareFunctionalCPAOverlay` mechanism; `BASELINE_PLUGIN` and `GREEN_PLUGIN` are separate persistent canonical paths shaped as `plugins/<host-goos>/<host-goarch>/model-mapper.<ext>`. Both libraries stay alive until their test process exits. Set `ROOT_CASE` and `NATIVE_CASE` to the new case being added, using the S1-S6 slugs.
 
 ```bash
-export CGO_ENABLED=1
+export CGO_ENABLED=1 GOWORK=off
 # Example S1 selection; change to the actual next slice, never to a non-existent test.
 ROOT_CASE='^TestFunctionalNativeSSEBoundaryMetadata$/^bare-id$'
 NATIVE_CASE='^TestModelMapperFunctionalNativeSSEBoundaries$/^xai$/^bare-id$'
@@ -218,14 +217,14 @@ CPA_SMOKE_PLUGIN="$GREEN_PLUGIN" go -C "$CPA_COPY" test -mod=readonly -overlay "
 go test . -run '^TestFunctionalNativeSSEBoundary|^TestFunctionalNativeSSEField|^TestStreamChunkRewriterDoesNotTreatReadBoundaryAsLineEnding$' -count=1 -v
 ```
 
-Verify each selected test actually RUNs. Compilation/setup failure, missing DLL, zero selected tests, or a skip is not target RED. Native failure must be the completion/JSON/model assertion while direct controls succeed. The same test/fixture assertions and compiler policy apply to RED and GREEN. Also select `codex` and each new field; keep XAI's filtered-data control GREEN. For framed controls already broken at baseline, record their own assertion-level RED before changing the boundary logic.
+Verify each selected test actually RUNs. Compilation/setup failure, missing DLL, zero selected tests, or a skip is not target RED. Native failure must be an event-name/completion/JSON/model assertion while the frozen direct control succeeds. The same test/fixture assertions and compiler policy apply to RED and GREEN. Also select `codex` and each new field; keep XAI's filtered-data control GREEN. Existing-correct continuations and compatibility controls stay GREEN; no old oracle is changed.
 
-Bootstrap the existing CPA copy/overlay and baseline integration controls with `make integration VERSION=` before adding cases, retaining the generated paths through `CPA_FUNCTIONAL_EVIDENCE`. The focused matrix runs only the new native fixture, so it needs no unrelated binary-capture client state. Full integration uses the original parent entry point below.
+Bootstrap existing default-version integration with `CPA_FUNCTIONAL_EVIDENCE="$BOOTSTRAP_EVIDENCE_DIR" make integration VERSION=` before adding cases; use a fresh absolute evidence directory. The parent integration log's `CPA version=... copy=... overlay=...` line identifies `CPA_COPY` and `FIXTURE_OVERLAY` created by `prepareFunctionalCPAOverlay` under that directory; these are distinct from Makefile's `dist/integration/cpa-src` checkout. The fixture overlay points to the current permanent fixture, so subsequent focused cases reuse it. Keep default, baseline-overlay, and repaired canonical library paths separate. The new focused matrix requires no unrelated binary-capture client state. Full integration uses the original parent entry point below.
 
 ### Full local and integration checks
 
 ```bash
-export CGO_ENABLED=1
+export CGO_ENABLED=1 GOWORK=off
 go test -json -count=1 ./...
 go vet ./...
 go test -json -race -count=1 -timeout=30m ./...
@@ -276,10 +275,10 @@ gh release download "v$PATCH" --repo DoingDog/cpa-plugin-model-mapper --dir "$RE
 
 ## Definition of Done
 
-- U1's full audit, independent verification, and document-review gate is recorded before production/test edits.
-- Every confirmed field and required position/shape is represented by permanent tests with actual baseline RED/current GREEN or existing-correct control evidence; ambiguity and framed-partition assertions remain exact.
-- The sole CPA fixture proves actual producer -> C ABI/native -> real HTTP terminal delivery, with direct/disabled/unmapped controls, actual upstream request checks, and complete output. RPC mocks and consumer replay are identified separately.
-- Bounds, complete-prefix-plus-error, ownership, allocation, raw/Gemini/Interactions behavior, dispatch and error/lifecycle conditions satisfy R3-R12. The one corrected oracle and every added case are traceable; legacy assertions and capture membership are preserved.
+- U1 freezes the corrected F-only documents, existing evidence, baseline membership, and fixed healthy-direct acceptance cases. The completed audit is not reopened.
+- Every confirmed field and required position/shape has permanent baseline RED/current GREEN or existing-correct control evidence. All old oracles and actual-format partition assertions remain unchanged, including characterization, NativeDelimiter, metadata-resegmented, opaque, discriminator/alias, and per-Write dispatch.
+- The sole CPA fixture proves actual producer -> C ABI/native -> real HTTP terminal delivery, with direct/disabled/unmapped controls, expected event names, JSON type/status/model, complete output, unchanged opaque/text values, and actual upstream request checks. All 222 archived empty-field case identities/classifications are accounted for, including the fixed 98 healthy-direct regressions and Codex data-only empty-data positions. RPC callbacks and consumer replay are identified separately from DLL loading.
+- Existing bounds, complete-prefix-plus-error, ownership, allocation, raw/Gemini/Interactions, dispatch, and error/lifecycle suites satisfy R3-R12 unchanged. Every added case is traceable; legacy assertions and capture membership are preserved. No cybersecurity scan/repair, new resource-stress matrix, or performance campaign is performed.
 - The same coding owner completes review, corrections, retests, re-review and the implementation commit in its worktree. The coordinator integrates only completed, conflict-checked work; final integrated checks and independent review pass.
 - Default and patch-injected artifacts have actual registration evidence. Authorized CI/release checks bind final SHA, seven-platform packages, checksums, root contents and version; unexecuted runtime platforms and host limitations are explicit.
 - Abandoned implementation attempts, duplicate helpers and task-created disposable files are removed without deleting user files. This document-only delivery stages and commits exactly the two requested planning documents, with no runtime or publication claim.
