@@ -21,6 +21,8 @@ type sseRewriter struct {
 	logicalEventFormat string
 	rawJSONPrefix      int
 	delimiterless      delimiterlessResponsesEventScanner
+	nativeBoundaries   []int
+	nativeFields       bool
 }
 
 type delimiterlessResponsesEventScanner struct {
@@ -42,6 +44,8 @@ type delimiterlessResponsesEventScanner struct {
 	inString            bool
 	escaped             bool
 	completeEnd         int
+	fieldSeparators     []int
+	candidateEnd        int
 }
 
 func newSSERewriter(originalModel string) *sseRewriter {
@@ -51,6 +55,20 @@ func newSSERewriter(originalModel string) *sseRewriter {
 func (r *sseRewriter) resetDelimiterlessResponsesEventScanner() {
 	r.delimiterless = delimiterlessResponsesEventScanner{}
 	r.rawJSONPrefix = 0
+	if len(r.buf) == 0 {
+		r.nativeBoundaries = nil
+		r.nativeFields = false
+	}
+}
+
+func (r *sseRewriter) consumeNativeBoundaries(n int) {
+	kept := r.nativeBoundaries[:0]
+	for _, boundary := range r.nativeBoundaries {
+		if boundary > n {
+			kept = append(kept, boundary-n)
+		}
+	}
+	r.nativeBoundaries = kept
 }
 
 var utf8SSEBOM = [...]byte{0xef, 0xbb, 0xbf}
@@ -126,6 +144,39 @@ func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
 		r.started = true
 	}
 	var out [][]byte
+	if r.logicalEventFormat == "openai-response" && len(p) > 0 {
+		s := &r.delimiterless
+		candidate := isResponsesEmptyField(p) || !couldStartJSONValue(p) && !bytes.ContainsAny(p, "\r\n") &&
+			!bytes.HasPrefix(p, []byte("event:")) && !bytes.HasPrefix(p, []byte("data:")) && !isResponsesMetadataField(p) ||
+			isResponsesExtensionField(p) && !isResponsesMetadataField(p)
+		if s.jsonStarted {
+			candidate = isResponsesEmptyField(p) || bytes.Equal(p, []byte("id")) || bytes.Equal(p, []byte("retry")) || isResponsesExtensionField(p) && !isResponsesMetadataField(p)
+			if bytes.Equal(p, []byte("event")) && s.dataStart != s.headerStart {
+				candidate = false
+			}
+		}
+		if !s.jsonStarted || s.completeEnd > 0 {
+			r.nativeFields = r.nativeFields || candidate
+			if r.nativeFields && len(r.buf) > 0 && (bytes.HasPrefix(p, []byte("event:")) || bytes.HasPrefix(p, []byte("data:")) ||
+				bytes.Equal(p, []byte("id")) || bytes.Equal(p, []byte("retry")) || isResponsesEmptyField(p) || isResponsesExtensionField(p)) {
+				// 只记录 field-shaped callback 的起点，完整 typed data 验证前不补写分隔符。
+				r.nativeBoundaries = append(r.nativeBoundaries, len(r.buf))
+			}
+			if candidate && s.completeEnd > 0 && (s.completeEnd == len(r.buf) || s.candidateEnd == len(r.buf) || s.metadataEnd == len(r.buf)) {
+				s.candidateEnd = len(r.buf) + len(p)
+			}
+		}
+		if (candidate && isResponsesNativeField(p) || bytes.HasPrefix(p, []byte("event:"))) && !s.disabled && s.headerPrefixChecked && !s.headerComplete && s.headerScan == len(r.buf) {
+			eventType := strings.TrimSpace(string(r.buf[s.headerStart+len("event:") : s.headerScan]))
+			if isResponsesNativeEventType(eventType) {
+				s.eventType, s.dataStart, s.headerComplete, s.nativeHeader = eventType, s.headerScan, true, true
+				s.fieldSeparators = append(s.fieldSeparators, s.headerScan)
+				if bytes.HasPrefix(p, []byte("event:")) {
+					r.nativeFields = true
+				}
+			}
+		}
+	}
 	if r.logicalEventFormat == "openai-response" && isResponsesMetadataField(p) && bytes.IndexAny(p, "\r\n") < 0 {
 		s := &r.delimiterless
 		fieldBoundary := len(r.buf) == 0 || s.metadataEnd == len(r.buf) || s.headerPrefixChecked &&
@@ -144,17 +195,30 @@ func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
 	}
 	if r.logicalEventFormat == "openai-response" {
 		s := &r.delimiterless
-		if !s.disabled && s.completeEnd > 0 && (s.completeEnd == len(r.buf) || s.metadataEnd == len(r.buf)) && s.dataStart == s.headerStart &&
-			(bytes.HasPrefix(p, []byte("data:")) || bytes.HasPrefix(p, []byte("event:")) || isResponsesMetadataField(p) && completeSSEEvents(p)) {
+		if !s.disabled && s.completeEnd > 0 && (s.completeEnd == len(r.buf) || s.metadataEnd == len(r.buf) || s.candidateEnd == len(r.buf)) && !s.nativeHeader && s.dataStart != s.headerScan &&
+			!isResponsesEmptyField(p) && (bytes.HasPrefix(p, []byte("data:")) || bytes.HasPrefix(p, []byte("event:")) || isResponsesMetadataField(p) && completeSSEEvents(p)) {
 			// 下一独立 event/data 或完整 metadata 单位确认前值边界，metadata 保留给下一事件。
-			nextFields := r.buf[s.completeEnd:]
-			r.buf = r.buf[:s.completeEnd]
+			end := s.completeEnd
+			completeMetadata := s.candidateEnd == len(r.buf) && isResponsesMetadataField(p) && completeSSEEvents(p)
+			nativeFields := r.nativeFields
+			nextFields := r.buf[end:]
+			r.consumeNativeBoundaries(end)
+			nextBoundaries := r.nativeBoundaries
+			r.nativeBoundaries = nil
+			r.buf = r.buf[:end]
 			var err error
 			out, err = r.drain(true)
 			if err != nil {
 				return out, err
 			}
+			if completeMetadata && len(nextFields) > 0 {
+				// 完整 comment 确认已验证 data 与其后独立字段的派发边界。
+				nextFields = appendSSEFieldSeparators(nextFields, nextBoundaries, true)
+				nextBoundaries = nil
+			}
 			r.buf = nextFields
+			r.nativeBoundaries = nextBoundaries
+			r.nativeFields = nativeFields && len(nextFields) > 0
 			r.delimiterless.metadataEnd = len(nextFields)
 		} else if bytes.HasPrefix(p, []byte("data:")) && !s.disabled && s.headerPrefixChecked && !s.headerComplete && s.headerScan == len(r.buf) {
 			eventType := strings.TrimSpace(string(r.buf[s.headerStart+len("event:") : s.headerScan]))
@@ -213,6 +277,7 @@ func (r *sseRewriter) drain(eof bool) ([][]byte, error) {
 		if logical && (n == 0 || logicalEnd < standardEnd) {
 			event := r.buf[:logicalEnd]
 			r.buf = r.buf[logicalEnd:]
+			r.consumeNativeBoundaries(logicalEnd)
 			r.scanFrom = 0
 			consumed = true
 			var err error
@@ -222,7 +287,7 @@ func (r *sseRewriter) drain(eof bool) ([][]byte, error) {
 				return out, err
 			}
 			out = append(out, []byte("\n\n"))
-			if eof && len(r.buf) < len("event:") && bytes.HasPrefix([]byte("event:"), r.buf) {
+			if eof && len(r.buf) < len("event:") && bytes.HasPrefix([]byte("event:"), r.buf) && !r.nativeFields {
 				r.buf = nil
 			}
 			continue
@@ -237,6 +302,7 @@ func (r *sseRewriter) drain(eof bool) ([][]byte, error) {
 			delimiter = bytes.Clone(delimiter)
 		}
 		r.buf = r.buf[standardEnd+n:]
+		r.consumeNativeBoundaries(standardEnd + n)
 		r.scanFrom = 0
 		consumed = true
 		var err error
@@ -268,16 +334,30 @@ func (r *sseRewriter) drain(eof bool) ([][]byte, error) {
 	return out, nil
 }
 
+func appendSSEFieldSeparators(p []byte, boundaries []int, finalLF bool) []byte {
+	out := make([]byte, 0, len(p)+len(boundaries)+1)
+	start := 0
+	for _, end := range boundaries {
+		out = append(out, p[start:end]...)
+		out = append(out, '\n')
+		start = end
+	}
+	out = append(out, p[start:]...)
+	if finalLF {
+		out = append(out, '\n')
+	}
+	return out
+}
+
 func (r *sseRewriter) rewritePendingEvent(out [][]byte, event []byte) ([][]byte, error) {
 	s := &r.delimiterless
-	if s.completeEnd == 0 || s.dataStart == 0 || s.dataStart != s.headerScan {
+	missingHeaderLF := s.dataStart > 0 && s.dataStart == s.headerScan
+	if s.completeEnd == 0 || !missingHeaderLF && len(s.fieldSeparators) == 0 {
 		return r.rewriteEvent(out, event)
 	}
-	// 完整值已验证，仅补写 header 的 LF，不复制整个 JSON。
+	// 完整值已验证，仅补写已确认的字段 LF，不复制整个 JSON。
 	originalOutLen := len(out)
-	header := make([]byte, s.dataStart+1)
-	copy(header, event[:s.dataStart])
-	header[s.dataStart] = '\n'
+	header := appendSSEFieldSeparators(event[:s.dataStart], s.fieldSeparators, missingHeaderLF)
 	out = append(out, header)
 	out, err := r.rewriteEvent(out, event[s.dataStart:])
 	if err != nil {
@@ -503,6 +583,80 @@ func isResponsesMetadataField(p []byte) bool {
 	return bytes.HasPrefix(p, []byte("id:")) || bytes.HasPrefix(p, []byte("retry:")) || bytes.HasPrefix(p, []byte(":"))
 }
 
+func isResponsesEmptyField(p []byte) bool {
+	switch string(p) {
+	case "data", "event", "event:", "event: ", "data:", "data: ":
+		return true
+	}
+	return false
+}
+
+func isResponsesExtensionField(p []byte) bool {
+	colon := bytes.IndexByte(p, ':')
+	if colon <= 0 {
+		return false
+	}
+	name := p[:colon]
+	return !bytes.Equal(name, []byte("event")) && !bytes.Equal(name, []byte("data")) &&
+		bytes.IndexAny(name, " \t\r\n{}[]\"") < 0
+}
+
+func isResponsesNativeEventType(eventType string) bool {
+	return (strings.HasPrefix(eventType, "response.") || eventType == "error" || eventType == "keepalive") && strings.IndexFunc(eventType, unicode.IsSpace) < 0
+}
+
+func isResponsesNativeField(p []byte) bool {
+	return bytes.HasPrefix(p, []byte("event:")) || bytes.HasPrefix(p, []byte("data:")) ||
+		bytes.Equal(p, []byte("id")) || bytes.Equal(p, []byte("retry")) || isResponsesEmptyField(p) || isResponsesMetadataField(p) || isResponsesExtensionField(p)
+}
+
+func (r *sseRewriter) responsesMetadataEnd(start int, eof bool) (int, bool, bool) {
+	field := r.buf[start:]
+	end, n, _ := sseLineEnding(r.buf, start, eof)
+	if isResponsesMetadataField(field) && n > 0 {
+		return end + n, true, false
+	}
+	missing := false
+	for _, boundary := range r.nativeBoundaries {
+		if boundary <= start || n > 0 && boundary > end {
+			continue
+		}
+		part := r.buf[start:boundary]
+		if !isResponsesNativeField(part) || bytes.HasPrefix(part, []byte("data:")) && !isResponsesEmptyField(part) {
+			continue
+		}
+		if isResponsesNativeField(r.buf[boundary:]) {
+			end, n, missing = boundary, 0, true
+			break
+		}
+	}
+	if n > 0 || missing {
+		part := r.buf[start:end]
+		metadata := bytes.Equal(part, []byte("id")) || bytes.Equal(part, []byte("retry")) || isResponsesExtensionField(part) || isResponsesEmptyField(part)
+		if bytes.Equal(part, []byte("event")) || bytes.HasPrefix(part, []byte("event:")) && (r.nativeFields || r.delimiterless.headerComplete) {
+			typ := ""
+			if bytes.HasPrefix(part, []byte("event:")) {
+				typ = strings.TrimSpace(string(part[len("event:"):]))
+			}
+			if typ == "" || isResponsesNativeEventType(typ) {
+				r.delimiterless.eventType = typ
+				r.delimiterless.nativeHeader = r.delimiterless.nativeHeader || typ != "" && missing
+				metadata = true
+			}
+		}
+		if metadata {
+			if missing {
+				r.delimiterless.fieldSeparators = append(r.delimiterless.fieldSeparators, end)
+			}
+			return end + n, true, false
+		}
+	}
+	eventHeader := bytes.HasPrefix(field, []byte("event:"))
+	waitingHeader := eventHeader && isResponsesNativeEventType(strings.TrimSpace(string(field[len("event:"):])))
+	return start, false, isResponsesEmptyField(field) || bytes.HasPrefix([]byte("id"), field) || bytes.HasPrefix([]byte("retry"), field) ||
+		r.nativeFields && n == 0 && !bytes.HasPrefix(field, []byte("data:")) && (!eventHeader || waitingHeader)
+}
+
 func (r *sseRewriter) findDelimiterlessResponsesEventEnd(eof bool) (int, bool) {
 	buf := r.buf
 	s := &r.delimiterless
@@ -511,12 +665,15 @@ func (r *sseRewriter) findDelimiterlessResponsesEventEnd(eof bool) (int, bool) {
 	}
 	if !s.headerPrefixChecked {
 		if r.logicalEventFormat == "openai-response" {
-			for isResponsesMetadataField(buf[s.headerScan:]) {
-				end, n, _ := sseLineEnding(buf, s.headerScan, eof)
-				if n == 0 {
+			for {
+				end, metadata, waiting := r.responsesMetadataEnd(s.headerScan, eof)
+				if waiting {
 					return 0, false
 				}
-				s.headerScan = end + n
+				if !metadata {
+					break
+				}
+				s.headerScan = end
 			}
 		}
 		s.headerStart = s.headerScan
@@ -582,12 +739,15 @@ func (r *sseRewriter) findDelimiterlessResponsesEventEnd(eof bool) (int, bool) {
 	}
 	if !s.dataPrefixChecked {
 		if r.logicalEventFormat == "openai-response" {
-			for isResponsesMetadataField(buf[s.dataStart:]) {
-				end, n, _ := sseLineEnding(buf, s.dataStart, eof)
-				if n == 0 {
+			for {
+				end, metadata, waiting := r.responsesMetadataEnd(s.dataStart, eof)
+				if waiting {
 					return 0, false
 				}
-				s.dataStart = end + n
+				if !metadata {
+					break
+				}
+				s.dataStart = end
 			}
 		}
 		const dataField = "data:"
@@ -688,6 +848,9 @@ func (r *sseRewriter) findDelimiterlessResponsesEventEnd(eof bool) (int, bool) {
 	suffix := buf[s.completeEnd:]
 	if len(suffix) == 0 {
 		return s.completeEnd, eof || s.nativeHeader || s.dataStart > 0 && s.dataStart == s.headerScan
+	}
+	if s.candidateEnd == len(buf) && s.candidateEnd > s.completeEnd {
+		return s.completeEnd, eof
 	}
 	if s.metadataEnd == len(buf) && s.metadataEnd > s.completeEnd {
 		// data-only 后的 metadata 留给下一事件，不提前派发前值。

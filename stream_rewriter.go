@@ -150,6 +150,10 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 	if r.frameRawJSONAsSSE && isColonlessSSEChunk(p) {
 		return r.sse.Write(p)
 	}
+	if r.format == "openai-response" && isResponsesExtensionField(p) {
+		r.batchSSEOutput = true
+		return r.sse.Write(p)
+	}
 	trimmed := bytes.TrimSpace(p)
 	if len(trimmed) > 0 && trimmed[0] != '{' && trimmed[0] != '[' && couldStartJSONValue(p) {
 		if r.sse.started || isSSEChunk(p) {

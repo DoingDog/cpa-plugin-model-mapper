@@ -67,6 +67,7 @@ type gCPAFieldsFixture struct {
 	step                             int
 	dataOnly                         bool
 	count                            int
+	expectTerminalClose              bool
 }
 
 func gCPAFieldsFixtures() []gCPAFieldsFixture {
@@ -179,6 +180,11 @@ func gCPANewLocalProducer(t *testing.T, name string) *gCPALocalProducer {
 		}
 		for start := 0; start < len(wire); start += step {
 			if _, err := w.Write(wire[start:min(start+step, len(wire))]); err != nil {
+				// Codex 已交付 completed 后会关闭 upstream，尾字段不再进入 Scanner。
+				if f.expectTerminalClose && r.Context().Err() != nil {
+					t.Logf("expected terminal upstream close after %d/%d bytes: %v", start, len(wire), err)
+					return
+				}
 				t.Error(err)
 				return
 			}
@@ -3085,6 +3091,777 @@ func TestModelMapperFunctionalMixedShapeControls(t *testing.T) {
 	}
 	if len(expected) != 0 {
 		t.Errorf("missing shape controls=%v", expected)
+	}
+}
+
+func gCPARequireBoundaryEvents(t *testing.T, raw []byte, names, payloads []string) {
+	t.Helper()
+	normalized := bytes.ReplaceAll(bytes.ReplaceAll(raw, []byte("\r\n"), []byte("\n")), []byte("\r"), []byte("\n"))
+	events, err := sse.Decode(bytes.NewReader(normalized))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotNames, gotPayloads []string
+	for _, event := range events {
+		data, ok := event.Data.(string)
+		if !ok {
+			t.Fatalf("SSE data type=%T", event.Data)
+		}
+		if strings.TrimSpace(data) == "" {
+			continue
+		}
+		var value map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(data), &value); err != nil {
+			t.Fatalf("SSE JSON=%q error=%v", data, err)
+		}
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, []byte(data)); err != nil {
+			t.Fatal(err)
+		}
+		gotNames = append(gotNames, event.Event)
+		gotPayloads = append(gotPayloads, compact.String())
+	}
+	if !reflect.DeepEqual(gotNames, names) || !reflect.DeepEqual(gotPayloads, payloads) {
+		t.Fatalf("SSE names=%q payloads=%q want names=%q payloads=%q wire=%q", gotNames, gotPayloads, names, payloads, raw)
+	}
+}
+
+type gCPABoundaryArchiveCase struct {
+	classification, fields, nativeNames, directNames string
+	status                                           int
+	direct                                           string
+}
+
+// 这些固定身份和期望来自修复前的 222 项归档；分类不随本次输出变化。
+var gCPABoundaryArchive = map[string]gCPABoundaryArchiveCase{
+	"xai-field0-none-prefix-isolated-terminal-only-dataOnly=false":        {"healthy-http-control", "event: response.completed|@1", "response.completed", "response.completed", 200, ""},
+	"xai-field0-none-prefix-isolated-dataOnly=false":                      {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field0-none-prefix-isolated-dataOnly=true":                       {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"xai-field1-data-prefix-isolated-terminal-only-dataOnly=false":        {"confirmed-http-regression", "data|event: response.completed|@1", "response.completed", "response.completed", 200, ""},
+	"xai-field1-data-prefix-isolated-dataOnly=false":                      {"confirmed-http-regression", "data|event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field1-data-prefix-isolated-dataOnly=true":                       {"confirmed-http-regression", "data|@0|@1", "message|message", "message|message", 200, ""},
+	"xai-field1-data-prefix-inline-dataOnly=false":                        {"confirmed-http-regression", "data|event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field1-data-prefix-inline-dataOnly=true":                         {"confirmed-http-regression", "data|@0|@1", "message|message", "message|message", 200, ""},
+	"xai-field1-data-before-each-event-dataOnly=false":                    {"confirmed-http-regression", "data|event: response.created|@0|data|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field1-data-before-each-event-dataOnly=true":                     {"native-failure-with-unhealthy-direct-control", "data|@0|data|@1", "message|message", "", 502, "{\"error\":{\"message\":\"upstream stream closed before first payload\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}"},
+	"xai-field1-data-between-events-isolated-dataOnly=false":              {"confirmed-http-regression", "event: response.created|@0|data|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field1-data-between-events-isolated-dataOnly=true":               {"native-failure-with-unhealthy-direct-control", "@0|data|@1", "message|message", "", 502, "{\"error\":{\"message\":\"upstream stream closed before first payload\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}"},
+	"xai-field1-data-before-terminal-header-dataOnly=false":               {"confirmed-http-regression", "event: response.created|@0|data|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field1-data-before-terminal-header-dataOnly=true":                {"native-failure-with-unhealthy-direct-control", "@0|data|@1", "message|message", "", 502, "{\"error\":{\"message\":\"upstream stream closed before first payload\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}"},
+	"xai-field1-data-between-terminal-event-and-data-dataOnly=false":      {"native-failure-with-unhealthy-direct-control", "event: response.created|@0|event: response.completed|data|@1", "response.created|response.completed", "response.created|response.completeddata", 200, "event: response.created\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\n\nevent: response.completeddata\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"plain grok-4.7 output, event: response.completed data: remains opaque\",\"type\":\"output_text\"}],\"id\":\"msg-verify-f\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\"},\"sequence_number\":1,\"type\":\"response.completed\"}\n\n\n"},
+	"xai-field1-data-after-created-data-dataOnly=false":                   {"confirmed-http-regression", "event: response.created|@0|data|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field1-data-after-created-data-dataOnly=true":                    {"native-failure-with-unhealthy-direct-control", "@0|data|@1", "message|message", "", 502, "{\"error\":{\"message\":\"upstream stream closed before first payload\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}"},
+	"xai-field1-data-after-terminal-data-dataOnly=false":                  {"healthy-http-control", "event: response.created|@0|event: response.completed|@1|data", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field1-data-after-terminal-data-dataOnly=true":                   {"native-failure-with-unhealthy-direct-control", "@0|@1|data", "message|message", "message|error", 200, "data: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\n\n\nevent: error\ndata: {\"type\":\"error\",\"code\":\"internal_server_error\",\"message\":\"upstream stream closed before a terminal event (last event: response.created)\",\"sequence_number\":0}\n\n"},
+	"xai-field1-data-suffix-isolated-dataOnly=false":                      {"healthy-http-control", "event: response.created|@0|event: response.completed|@1|data", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field1-data-suffix-isolated-dataOnly=true":                       {"native-failure-with-unhealthy-direct-control", "@0|@1|data", "message|message", "message|error", 200, "data: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\n\n\nevent: error\ndata: {\"type\":\"error\",\"code\":\"internal_server_error\",\"message\":\"upstream stream closed before a terminal event (last event: response.created)\",\"sequence_number\":0}\n\n"},
+	"xai-field2-data_-prefix-isolated-terminal-only-dataOnly=false":       {"healthy-http-control", "event: response.completed|@1", "response.completed", "response.completed", 200, ""},
+	"xai-field2-data_-prefix-isolated-dataOnly=false":                     {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field2-data_-prefix-isolated-dataOnly=true":                      {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"xai-field2-data_-prefix-inline-dataOnly=false":                       {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field2-data_-prefix-inline-dataOnly=true":                        {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"xai-field2-data_-before-each-event-dataOnly=false":                   {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field2-data_-before-each-event-dataOnly=true":                    {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"xai-field2-data_-between-events-isolated-dataOnly=false":             {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field2-data_-between-events-isolated-dataOnly=true":              {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"xai-field2-data_-before-terminal-header-dataOnly=false":              {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field2-data_-before-terminal-header-dataOnly=true":               {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"xai-field2-data_-between-terminal-event-and-data-dataOnly=false":     {"unhealthy-direct-control", "event: response.created|@0|@1", "response.created|message", "response.created|message", 200, "event: response.created\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\n\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"plain grok-4.7 output, event: response.completed data: remains opaque\",\"type\":\"output_text\"}],\"id\":\"msg-verify-f\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\"},\"sequence_number\":1,\"type\":\"response.completed\"}\n\n\n"},
+	"xai-field2-data_-after-created-data-dataOnly=false":                  {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field2-data_-after-created-data-dataOnly=true":                   {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"xai-field2-data_-after-terminal-data-dataOnly=false":                 {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field2-data_-after-terminal-data-dataOnly=true":                  {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"xai-field2-data_-suffix-isolated-dataOnly=false":                     {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field2-data_-suffix-isolated-dataOnly=true":                      {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"xai-field3-data__-prefix-isolated-terminal-only-dataOnly=false":      {"healthy-http-control", "event: response.completed|@1", "response.completed", "response.completed", 200, ""},
+	"xai-field3-data__-prefix-isolated-dataOnly=false":                    {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field3-data__-prefix-isolated-dataOnly=true":                     {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"xai-field3-data__-prefix-inline-dataOnly=false":                      {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field3-data__-prefix-inline-dataOnly=true":                       {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"xai-field3-data__-before-each-event-dataOnly=false":                  {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field3-data__-before-each-event-dataOnly=true":                   {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"xai-field3-data__-between-events-isolated-dataOnly=false":            {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field3-data__-between-events-isolated-dataOnly=true":             {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"xai-field3-data__-before-terminal-header-dataOnly=false":             {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field3-data__-before-terminal-header-dataOnly=true":              {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"xai-field3-data__-between-terminal-event-and-data-dataOnly=false":    {"unhealthy-direct-control", "event: response.created|@0|@1", "response.created|message", "response.created|message", 200, "event: response.created\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\n\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"plain grok-4.7 output, event: response.completed data: remains opaque\",\"type\":\"output_text\"}],\"id\":\"msg-verify-f\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\"},\"sequence_number\":1,\"type\":\"response.completed\"}\n\n\n"},
+	"xai-field3-data__-after-created-data-dataOnly=false":                 {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field3-data__-after-created-data-dataOnly=true":                  {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"xai-field3-data__-after-terminal-data-dataOnly=false":                {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field3-data__-after-terminal-data-dataOnly=true":                 {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"xai-field3-data__-suffix-isolated-dataOnly=false":                    {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field3-data__-suffix-isolated-dataOnly=true":                     {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"xai-field4-event-prefix-isolated-terminal-only-dataOnly=false":       {"confirmed-http-regression", "event|event: response.completed|@1", "response.completed", "response.completed", 200, ""},
+	"xai-field4-event-prefix-isolated-dataOnly=false":                     {"confirmed-http-regression", "event|event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field4-event-prefix-isolated-dataOnly=true":                      {"confirmed-http-regression", "event|@0|@1", "message|message", "message|message", 200, ""},
+	"xai-field4-event-prefix-inline-dataOnly=false":                       {"confirmed-http-regression", "event|event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field4-event-prefix-inline-dataOnly=true":                        {"confirmed-http-regression", "event|@0|@1", "message|message", "message|message", 200, ""},
+	"xai-field4-event-before-each-event-dataOnly=false":                   {"confirmed-http-regression", "event|event: response.created|@0|event|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field4-event-before-each-event-dataOnly=true":                    {"native-failure-with-unhealthy-direct-control", "event|@0|event|@1", "message|message", "", 502, "{\"error\":{\"message\":\"upstream stream closed before first payload\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}"},
+	"xai-field4-event-between-events-isolated-dataOnly=false":             {"confirmed-http-regression", "event: response.created|@0|event|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field4-event-between-events-isolated-dataOnly=true":              {"native-failure-with-unhealthy-direct-control", "@0|event|@1", "message|message", "", 502, "{\"error\":{\"message\":\"upstream stream closed before first payload\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}"},
+	"xai-field4-event-before-terminal-header-dataOnly=false":              {"confirmed-http-regression", "event: response.created|@0|event|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field4-event-before-terminal-header-dataOnly=true":               {"native-failure-with-unhealthy-direct-control", "@0|event|@1", "message|message", "", 502, "{\"error\":{\"message\":\"upstream stream closed before first payload\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}"},
+	"xai-field4-event-between-terminal-event-and-data-dataOnly=false":     {"native-failure-with-unhealthy-direct-control", "event: response.created|@0|event: response.completed|event|@1", "response.created|message", "response.created|response.completedevent", 200, "event: response.created\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\n\nevent: response.completedevent\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"plain grok-4.7 output, event: response.completed data: remains opaque\",\"type\":\"output_text\"}],\"id\":\"msg-verify-f\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\"},\"sequence_number\":1,\"type\":\"response.completed\"}\n\n\n"},
+	"xai-field4-event-after-created-data-dataOnly=false":                  {"confirmed-http-regression", "event: response.created|@0|event|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field4-event-after-created-data-dataOnly=true":                   {"native-failure-with-unhealthy-direct-control", "@0|event|@1", "message|message", "", 502, "{\"error\":{\"message\":\"upstream stream closed before first payload\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}"},
+	"xai-field4-event-after-terminal-data-dataOnly=false":                 {"healthy-http-control", "event: response.created|@0|event: response.completed|@1|event", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field4-event-after-terminal-data-dataOnly=true":                  {"unhealthy-direct-control", "@0|@1|event", "message|message", "message|error", 200, "data: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\n\n\nevent: error\ndata: {\"type\":\"error\",\"code\":\"internal_server_error\",\"message\":\"upstream stream closed before a terminal event (last event: response.created)\",\"sequence_number\":0}\n\n"},
+	"xai-field4-event-suffix-isolated-dataOnly=false":                     {"healthy-http-control", "event: response.created|@0|event: response.completed|@1|event", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field4-event-suffix-isolated-dataOnly=true":                      {"unhealthy-direct-control", "@0|@1|event", "message|message", "message|error", 200, "data: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\n\n\nevent: error\ndata: {\"type\":\"error\",\"code\":\"internal_server_error\",\"message\":\"upstream stream closed before a terminal event (last event: response.created)\",\"sequence_number\":0}\n\n"},
+	"xai-field5-event_-prefix-isolated-terminal-only-dataOnly=false":      {"confirmed-http-regression", "event:|event: response.completed|@1", "response.completed", "response.completed", 200, ""},
+	"xai-field5-event_-prefix-isolated-dataOnly=false":                    {"confirmed-http-regression", "event:|event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field5-event_-prefix-isolated-dataOnly=true":                     {"confirmed-http-regression", "event:|@0|@1", "message|message", "message|message", 200, ""},
+	"xai-field5-event_-prefix-inline-dataOnly=false":                      {"confirmed-http-regression", "event:|event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field5-event_-prefix-inline-dataOnly=true":                       {"unhealthy-direct-control", "event: response.created|@0|@1", "response.created|message", "response.created|message", 200, "event: response.created\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\n\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"plain grok-4.7 output, event: response.completed data: remains opaque\",\"type\":\"output_text\"}],\"id\":\"msg-verify-f\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\"},\"sequence_number\":1,\"type\":\"response.completed\"}\n\n\n"},
+	"xai-field5-event_-before-each-event-dataOnly=false":                  {"confirmed-http-regression", "event:|event: response.created|@0|event:|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field5-event_-before-each-event-dataOnly=true":                   {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field5-event_-between-events-isolated-dataOnly=false":            {"confirmed-http-regression", "event: response.created|@0|event:|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field5-event_-between-events-isolated-dataOnly=true":             {"confirmed-http-regression", "@0|event:|@1", "message|message", "message|message", 200, ""},
+	"xai-field5-event_-before-terminal-header-dataOnly=false":             {"confirmed-http-regression", "event: response.created|@0|event:|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field5-event_-before-terminal-header-dataOnly=true":              {"unhealthy-direct-control", "@0|event: response.completed|@1", "message|response.completed", "response.completed", 200, "data: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\nevent: response.completed\n\n\n"},
+	"xai-field5-event_-between-terminal-event-and-data-dataOnly=false":    {"confirmed-http-regression", "event: response.created|@0|event: response.completed|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field5-event_-after-created-data-dataOnly=false":                 {"confirmed-http-regression", "event: response.created|@0|event:|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field5-event_-after-created-data-dataOnly=true":                  {"confirmed-http-regression", "@0|event:|@1", "message|message", "message|message", 200, ""},
+	"xai-field5-event_-after-terminal-data-dataOnly=false":                {"healthy-http-control", "event: response.created|@0|event: response.completed|@1|event:", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field5-event_-after-terminal-data-dataOnly=true":                 {"healthy-http-control", "@0|@1|event:", "message|message", "message|message", 200, ""},
+	"xai-field5-event_-suffix-isolated-dataOnly=false":                    {"healthy-http-control", "event: response.created|@0|event: response.completed|@1|event:", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field5-event_-suffix-isolated-dataOnly=true":                     {"healthy-http-control", "@0|@1|event:", "message|message", "message|message", 200, ""},
+	"xai-field6-event__-prefix-isolated-terminal-only-dataOnly=false":     {"confirmed-http-regression", "event: |event: response.completed|@1", "response.completed", "response.completed", 200, ""},
+	"xai-field6-event__-prefix-isolated-dataOnly=false":                   {"confirmed-http-regression", "event: |event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field6-event__-prefix-isolated-dataOnly=true":                    {"confirmed-http-regression", "event: |@0|@1", "message|message", "message|message", 200, ""},
+	"xai-field6-event__-prefix-inline-dataOnly=false":                     {"confirmed-http-regression", "event: |event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field6-event__-prefix-inline-dataOnly=true":                      {"unhealthy-direct-control", "event: response.created|@0|@1", "response.created|message", "response.created|message", 200, "event: response.created\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\n\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"plain grok-4.7 output, event: response.completed data: remains opaque\",\"type\":\"output_text\"}],\"id\":\"msg-verify-f\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\"},\"sequence_number\":1,\"type\":\"response.completed\"}\n\n\n"},
+	"xai-field6-event__-before-each-event-dataOnly=false":                 {"confirmed-http-regression", "event: |event: response.created|@0|event: |event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field6-event__-before-each-event-dataOnly=true":                  {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field6-event__-between-events-isolated-dataOnly=false":           {"confirmed-http-regression", "event: response.created|@0|event: |event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field6-event__-between-events-isolated-dataOnly=true":            {"confirmed-http-regression", "@0|event: |@1", "message|message", "message|message", 200, ""},
+	"xai-field6-event__-before-terminal-header-dataOnly=false":            {"confirmed-http-regression", "event: response.created|@0|event: |event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field6-event__-before-terminal-header-dataOnly=true":             {"unhealthy-direct-control", "@0|event: response.completed|@1", "message|response.completed", "response.completed", 200, "data: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\nevent: response.completed\n\n\n"},
+	"xai-field6-event__-between-terminal-event-and-data-dataOnly=false":   {"confirmed-http-regression", "event: response.created|@0|event: response.completed|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field6-event__-after-created-data-dataOnly=false":                {"confirmed-http-regression", "event: response.created|@0|event: |event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field6-event__-after-created-data-dataOnly=true":                 {"confirmed-http-regression", "@0|event: |@1", "message|message", "message|message", 200, ""},
+	"xai-field6-event__-after-terminal-data-dataOnly=false":               {"healthy-http-control", "event: response.created|@0|event: response.completed|@1|event: ", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field6-event__-after-terminal-data-dataOnly=true":                {"healthy-http-control", "@0|@1|event: ", "message|message", "message|message", 200, ""},
+	"xai-field6-event__-suffix-isolated-dataOnly=false":                   {"healthy-http-control", "event: response.created|@0|event: response.completed|@1|event: ", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"xai-field6-event__-suffix-isolated-dataOnly=true":                    {"healthy-http-control", "@0|@1|event: ", "message|message", "message|message", 200, ""},
+	"codex-field0-none-prefix-isolated-terminal-only-dataOnly=false":      {"healthy-http-control", "event: response.completed|@1", "response.completed", "response.completed", 200, ""},
+	"codex-field0-none-prefix-isolated-dataOnly=false":                    {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field0-none-prefix-isolated-dataOnly=true":                     {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field1-data-prefix-isolated-terminal-only-dataOnly=false":      {"confirmed-http-regression", "data|event: response.completed|@1", "response.completed", "response.completed", 200, ""},
+	"codex-field1-data-prefix-isolated-dataOnly=false":                    {"confirmed-http-regression", "data|event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field1-data-prefix-isolated-dataOnly=true":                     {"confirmed-http-regression", "data|@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field1-data-prefix-inline-dataOnly=false":                      {"confirmed-http-regression", "data|event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field1-data-prefix-inline-dataOnly=true":                       {"confirmed-http-regression", "data|@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field1-data-before-each-event-dataOnly=false":                  {"confirmed-http-regression", "data|event: response.created|@0|data|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field1-data-before-each-event-dataOnly=true":                   {"native-failure-with-unhealthy-direct-control", "data|@0|data|@1", "message|message", "", 502, "{\"error\":{\"message\":\"upstream stream closed before first payload\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}"},
+	"codex-field1-data-between-events-isolated-dataOnly=false":            {"confirmed-http-regression", "event: response.created|@0|data|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field1-data-between-events-isolated-dataOnly=true":             {"native-failure-with-unhealthy-direct-control", "@0|data|@1", "message|message", "", 502, "{\"error\":{\"message\":\"upstream stream closed before first payload\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}"},
+	"codex-field1-data-before-terminal-header-dataOnly=false":             {"confirmed-http-regression", "event: response.created|@0|data|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field1-data-before-terminal-header-dataOnly=true":              {"native-failure-with-unhealthy-direct-control", "@0|data|@1", "message|message", "", 502, "{\"error\":{\"message\":\"upstream stream closed before first payload\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}"},
+	"codex-field1-data-between-terminal-event-and-data-dataOnly=false":    {"native-failure-with-unhealthy-direct-control", "event: response.created|@0|event: response.completed|data|@1", "response.created|response.completed", "response.created|response.completeddata", 200, "event: response.created\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\n\nevent: response.completeddata\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"plain grok-4.7 output, event: response.completed data: remains opaque\",\"type\":\"output_text\"}],\"id\":\"msg-verify-f\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\"},\"sequence_number\":1,\"type\":\"response.completed\"}\n\n\n"},
+	"codex-field1-data-after-created-data-dataOnly=false":                 {"confirmed-http-regression", "event: response.created|@0|data|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field1-data-after-created-data-dataOnly=true":                  {"native-failure-with-unhealthy-direct-control", "@0|data|@1", "message|message", "", 502, "{\"error\":{\"message\":\"upstream stream closed before first payload\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}"},
+	"codex-field1-data-after-terminal-data-dataOnly=false":                {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field1-data-after-terminal-data-dataOnly=true":                 {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field1-data-suffix-isolated-dataOnly=false":                    {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field1-data-suffix-isolated-dataOnly=true":                     {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field2-data_-prefix-isolated-terminal-only-dataOnly=false":     {"native-failure-with-unhealthy-direct-control", "data: |event: response.completed|@1", "response.completed", "message", 200, "data: \nevent: response.completed\n\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"plain grok-4.7 output, event: response.completed data: remains opaque\",\"type\":\"output_text\"}],\"id\":\"msg-verify-f\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\"},\"sequence_number\":1,\"type\":\"response.completed\"}\n\n"},
+	"codex-field2-data_-prefix-isolated-dataOnly=false":                   {"native-failure-with-unhealthy-direct-control", "data: |event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.completed", 200, "data: \nevent: response.created\n\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\nevent: response.completed\n\n\n"},
+	"codex-field2-data_-prefix-isolated-dataOnly=true":                    {"confirmed-http-regression", "data: |@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field2-data_-prefix-inline-dataOnly=false":                     {"native-failure-with-unhealthy-direct-control", "data: |event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.completed", 200, "data: \nevent: response.created\n\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\nevent: response.completed\n\n\n"},
+	"codex-field2-data_-prefix-inline-dataOnly=true":                      {"confirmed-http-regression", "data: |@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field2-data_-before-each-event-dataOnly=false":                 {"native-failure-with-unhealthy-direct-control", "data: |event: response.created|@0|data: |event: response.completed|@1", "response.created|response.completed", "message|message", 200, "data: \nevent: response.created\n\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\n\ndata: \nevent: response.completed\n\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"plain grok-4.7 output, event: response.completed data: remains opaque\",\"type\":\"output_text\"}],\"id\":\"msg-verify-f\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\"},\"sequence_number\":1,\"type\":\"response.completed\"}\n\n\n"},
+	"codex-field2-data_-before-each-event-dataOnly=true":                  {"confirmed-http-regression", "data: |@0|data: |@1", "message|message", "message|message", 200, ""},
+	"codex-field2-data_-between-events-isolated-dataOnly=false":           {"native-failure-with-unhealthy-direct-control", "event: response.created|@0|data: |event: response.completed|@1", "response.created|response.completed", "response.created|message", 200, "event: response.created\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\n\ndata: \nevent: response.completed\n\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"plain grok-4.7 output, event: response.completed data: remains opaque\",\"type\":\"output_text\"}],\"id\":\"msg-verify-f\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\"},\"sequence_number\":1,\"type\":\"response.completed\"}\n\n\n"},
+	"codex-field2-data_-between-events-isolated-dataOnly=true":            {"confirmed-http-regression", "@0|data: |@1", "message|message", "message|message", 200, ""},
+	"codex-field2-data_-before-terminal-header-dataOnly=false":            {"native-failure-with-unhealthy-direct-control", "event: response.created|@0|data: |event: response.completed|@1", "response.created|response.completed", "response.created|message", 200, "event: response.created\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\n\ndata: \nevent: response.completed\n\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"plain grok-4.7 output, event: response.completed data: remains opaque\",\"type\":\"output_text\"}],\"id\":\"msg-verify-f\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\"},\"sequence_number\":1,\"type\":\"response.completed\"}\n\n\n"},
+	"codex-field2-data_-before-terminal-header-dataOnly=true":             {"confirmed-http-regression", "@0|data: |@1", "message|message", "message|message", 200, ""},
+	"codex-field2-data_-between-terminal-event-and-data-dataOnly=false":   {"native-failure-with-unhealthy-direct-control", "event: response.created|@0|event: response.completed|data: |@1", "response.created|response.completed", "response.created|message", 200, "event: response.created\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\n\nevent: response.completed\ndata: \n\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"plain grok-4.7 output, event: response.completed data: remains opaque\",\"type\":\"output_text\"}],\"id\":\"msg-verify-f\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\"},\"sequence_number\":1,\"type\":\"response.completed\"}\n\n\n"},
+	"codex-field2-data_-after-created-data-dataOnly=false":                {"native-failure-with-unhealthy-direct-control", "event: response.created|@0|data: |event: response.completed|@1", "response.created|response.completed", "response.created|message", 200, "event: response.created\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\n\ndata: \nevent: response.completed\n\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"plain grok-4.7 output, event: response.completed data: remains opaque\",\"type\":\"output_text\"}],\"id\":\"msg-verify-f\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\"},\"sequence_number\":1,\"type\":\"response.completed\"}\n\n\n"},
+	"codex-field2-data_-after-created-data-dataOnly=true":                 {"confirmed-http-regression", "@0|data: |@1", "message|message", "message|message", 200, ""},
+	"codex-field2-data_-after-terminal-data-dataOnly=false":               {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field2-data_-after-terminal-data-dataOnly=true":                {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field2-data_-suffix-isolated-dataOnly=false":                   {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field2-data_-suffix-isolated-dataOnly=true":                    {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field3-data__-prefix-isolated-terminal-only-dataOnly=false":    {"native-failure-with-unhealthy-direct-control", "data: |event: response.completed|@1", "response.completed", "message", 200, "data: \nevent: response.completed\n\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"plain grok-4.7 output, event: response.completed data: remains opaque\",\"type\":\"output_text\"}],\"id\":\"msg-verify-f\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\"},\"sequence_number\":1,\"type\":\"response.completed\"}\n\n"},
+	"codex-field3-data__-prefix-isolated-dataOnly=false":                  {"native-failure-with-unhealthy-direct-control", "data: |event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.completed", 200, "data: \nevent: response.created\n\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\nevent: response.completed\n\n\n"},
+	"codex-field3-data__-prefix-isolated-dataOnly=true":                   {"confirmed-http-regression", "data: |@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field3-data__-prefix-inline-dataOnly=false":                    {"native-failure-with-unhealthy-direct-control", "data: |event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.completed", 200, "data: \nevent: response.created\n\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\nevent: response.completed\n\n\n"},
+	"codex-field3-data__-prefix-inline-dataOnly=true":                     {"confirmed-http-regression", "data: |@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field3-data__-before-each-event-dataOnly=false":                {"native-failure-with-unhealthy-direct-control", "data: |event: response.created|@0|data: |event: response.completed|@1", "response.created|response.completed", "message|message", 200, "data: \nevent: response.created\n\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\n\ndata: \nevent: response.completed\n\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"plain grok-4.7 output, event: response.completed data: remains opaque\",\"type\":\"output_text\"}],\"id\":\"msg-verify-f\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\"},\"sequence_number\":1,\"type\":\"response.completed\"}\n\n\n"},
+	"codex-field3-data__-before-each-event-dataOnly=true":                 {"confirmed-http-regression", "data: |@0|data: |@1", "message|message", "message|message", 200, ""},
+	"codex-field3-data__-between-events-isolated-dataOnly=false":          {"native-failure-with-unhealthy-direct-control", "event: response.created|@0|data: |event: response.completed|@1", "response.created|response.completed", "response.created|message", 200, "event: response.created\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\n\ndata: \nevent: response.completed\n\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"plain grok-4.7 output, event: response.completed data: remains opaque\",\"type\":\"output_text\"}],\"id\":\"msg-verify-f\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\"},\"sequence_number\":1,\"type\":\"response.completed\"}\n\n\n"},
+	"codex-field3-data__-between-events-isolated-dataOnly=true":           {"confirmed-http-regression", "@0|data: |@1", "message|message", "message|message", 200, ""},
+	"codex-field3-data__-before-terminal-header-dataOnly=false":           {"native-failure-with-unhealthy-direct-control", "event: response.created|@0|data: |event: response.completed|@1", "response.created|response.completed", "response.created|message", 200, "event: response.created\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\n\ndata: \nevent: response.completed\n\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"plain grok-4.7 output, event: response.completed data: remains opaque\",\"type\":\"output_text\"}],\"id\":\"msg-verify-f\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\"},\"sequence_number\":1,\"type\":\"response.completed\"}\n\n\n"},
+	"codex-field3-data__-before-terminal-header-dataOnly=true":            {"confirmed-http-regression", "@0|data: |@1", "message|message", "message|message", 200, ""},
+	"codex-field3-data__-between-terminal-event-and-data-dataOnly=false":  {"native-failure-with-unhealthy-direct-control", "event: response.created|@0|event: response.completed|data: |@1", "response.created|response.completed", "response.created|message", 200, "event: response.created\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\n\nevent: response.completed\ndata: \n\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"plain grok-4.7 output, event: response.completed data: remains opaque\",\"type\":\"output_text\"}],\"id\":\"msg-verify-f\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\"},\"sequence_number\":1,\"type\":\"response.completed\"}\n\n\n"},
+	"codex-field3-data__-after-created-data-dataOnly=false":               {"native-failure-with-unhealthy-direct-control", "event: response.created|@0|data: |event: response.completed|@1", "response.created|response.completed", "response.created|message", 200, "event: response.created\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\n\ndata: \nevent: response.completed\n\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"plain grok-4.7 output, event: response.completed data: remains opaque\",\"type\":\"output_text\"}],\"id\":\"msg-verify-f\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\"},\"sequence_number\":1,\"type\":\"response.completed\"}\n\n\n"},
+	"codex-field3-data__-after-created-data-dataOnly=true":                {"confirmed-http-regression", "@0|data: |@1", "message|message", "message|message", 200, ""},
+	"codex-field3-data__-after-terminal-data-dataOnly=false":              {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field3-data__-after-terminal-data-dataOnly=true":               {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field3-data__-suffix-isolated-dataOnly=false":                  {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field3-data__-suffix-isolated-dataOnly=true":                   {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field4-event-prefix-isolated-terminal-only-dataOnly=false":     {"confirmed-http-regression", "event|event: response.completed|@1", "response.completed", "response.completed", 200, ""},
+	"codex-field4-event-prefix-isolated-dataOnly=false":                   {"confirmed-http-regression", "event|event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field4-event-prefix-isolated-dataOnly=true":                    {"confirmed-http-regression", "event|@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field4-event-prefix-inline-dataOnly=false":                     {"confirmed-http-regression", "event|event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field4-event-prefix-inline-dataOnly=true":                      {"confirmed-http-regression", "event|@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field4-event-before-each-event-dataOnly=false":                 {"confirmed-http-regression", "event|event: response.created|@0|event|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field4-event-before-each-event-dataOnly=true":                  {"native-failure-with-unhealthy-direct-control", "event|@0|event|@1", "message|message", "", 502, "{\"error\":{\"message\":\"upstream stream closed before first payload\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}"},
+	"codex-field4-event-between-events-isolated-dataOnly=false":           {"confirmed-http-regression", "event: response.created|@0|event|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field4-event-between-events-isolated-dataOnly=true":            {"native-failure-with-unhealthy-direct-control", "@0|event|@1", "message|message", "", 502, "{\"error\":{\"message\":\"upstream stream closed before first payload\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}"},
+	"codex-field4-event-before-terminal-header-dataOnly=false":            {"confirmed-http-regression", "event: response.created|@0|event|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field4-event-before-terminal-header-dataOnly=true":             {"native-failure-with-unhealthy-direct-control", "@0|event|@1", "message|message", "", 502, "{\"error\":{\"message\":\"upstream stream closed before first payload\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}"},
+	"codex-field4-event-between-terminal-event-and-data-dataOnly=false":   {"native-failure-with-unhealthy-direct-control", "event: response.created|@0|event: response.completed|event|@1", "response.created|message", "response.created|response.completedevent", 200, "event: response.created\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\n\nevent: response.completedevent\ndata: {\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"plain grok-4.7 output, event: response.completed data: remains opaque\",\"type\":\"output_text\"}],\"id\":\"msg-verify-f\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\"},\"sequence_number\":1,\"type\":\"response.completed\"}\n\n\n"},
+	"codex-field4-event-after-created-data-dataOnly=false":                {"confirmed-http-regression", "event: response.created|@0|event|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field4-event-after-created-data-dataOnly=true":                 {"native-failure-with-unhealthy-direct-control", "@0|event|@1", "message|message", "", 502, "{\"error\":{\"message\":\"upstream stream closed before first payload\",\"type\":\"server_error\",\"code\":\"internal_server_error\"}}"},
+	"codex-field4-event-after-terminal-data-dataOnly=false":               {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field4-event-after-terminal-data-dataOnly=true":                {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field4-event-suffix-isolated-dataOnly=false":                   {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field4-event-suffix-isolated-dataOnly=true":                    {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field5-event_-prefix-isolated-terminal-only-dataOnly=false":    {"confirmed-http-regression", "event:|event: response.completed|@1", "response.completed", "response.completed", 200, ""},
+	"codex-field5-event_-prefix-isolated-dataOnly=false":                  {"confirmed-http-regression", "event:|event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field5-event_-prefix-isolated-dataOnly=true":                   {"confirmed-http-regression", "event:|@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field5-event_-prefix-inline-dataOnly=false":                    {"confirmed-http-regression", "event:|event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field5-event_-prefix-inline-dataOnly=true":                     {"confirmed-http-regression", "event:|@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field5-event_-before-each-event-dataOnly=false":                {"confirmed-http-regression", "event:|event: response.created|@0|event:|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field5-event_-before-each-event-dataOnly=true":                 {"confirmed-http-regression", "event:|@0|event:|@1", "message|message", "message|message", 200, ""},
+	"codex-field5-event_-between-events-isolated-dataOnly=false":          {"confirmed-http-regression", "event: response.created|@0|event:|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field5-event_-between-events-isolated-dataOnly=true":           {"confirmed-http-regression", "@0|event:|@1", "message|message", "message|message", 200, ""},
+	"codex-field5-event_-before-terminal-header-dataOnly=false":           {"confirmed-http-regression", "event: response.created|@0|event:|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field5-event_-before-terminal-header-dataOnly=true":            {"confirmed-http-regression", "@0|event:|@1", "message|message", "message|message", 200, ""},
+	"codex-field5-event_-between-terminal-event-and-data-dataOnly=false":  {"confirmed-http-regression", "event: response.created|@0|event: response.completed|event:|@1", "response.created|message", "response.created|message", 200, ""},
+	"codex-field5-event_-after-created-data-dataOnly=false":               {"confirmed-http-regression", "event: response.created|@0|event:|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field5-event_-after-created-data-dataOnly=true":                {"confirmed-http-regression", "@0|event:|@1", "message|message", "message|message", 200, ""},
+	"codex-field5-event_-after-terminal-data-dataOnly=false":              {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field5-event_-after-terminal-data-dataOnly=true":               {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field5-event_-suffix-isolated-dataOnly=false":                  {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field5-event_-suffix-isolated-dataOnly=true":                   {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field6-event__-prefix-isolated-terminal-only-dataOnly=false":   {"confirmed-http-regression", "event: |event: response.completed|@1", "response.completed", "response.completed", 200, ""},
+	"codex-field6-event__-prefix-isolated-dataOnly=false":                 {"confirmed-http-regression", "event: |event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field6-event__-prefix-isolated-dataOnly=true":                  {"confirmed-http-regression", "event: |@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field6-event__-prefix-inline-dataOnly=false":                   {"confirmed-http-regression", "event: |event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field6-event__-prefix-inline-dataOnly=true":                    {"confirmed-http-regression", "event: |@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field6-event__-before-each-event-dataOnly=false":               {"confirmed-http-regression", "event: |event: response.created|@0|event: |event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field6-event__-before-each-event-dataOnly=true":                {"confirmed-http-regression", "event: |@0|event: |@1", "message|message", "message|message", 200, ""},
+	"codex-field6-event__-between-events-isolated-dataOnly=false":         {"confirmed-http-regression", "event: response.created|@0|event: |event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field6-event__-between-events-isolated-dataOnly=true":          {"confirmed-http-regression", "@0|event: |@1", "message|message", "message|message", 200, ""},
+	"codex-field6-event__-before-terminal-header-dataOnly=false":          {"confirmed-http-regression", "event: response.created|@0|event: |event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field6-event__-before-terminal-header-dataOnly=true":           {"confirmed-http-regression", "@0|event: |@1", "message|message", "message|message", 200, ""},
+	"codex-field6-event__-between-terminal-event-and-data-dataOnly=false": {"confirmed-http-regression", "event: response.created|@0|event: response.completed|event: |@1", "response.created|message", "response.created|message", 200, ""},
+	"codex-field6-event__-after-created-data-dataOnly=false":              {"confirmed-http-regression", "event: response.created|@0|event: |event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field6-event__-after-created-data-dataOnly=true":               {"confirmed-http-regression", "@0|event: |@1", "message|message", "message|message", 200, ""},
+	"codex-field6-event__-after-terminal-data-dataOnly=false":             {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field6-event__-after-terminal-data-dataOnly=true":              {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+	"codex-field6-event__-suffix-isolated-dataOnly=false":                 {"healthy-http-control", "event: response.created|@0|event: response.completed|@1", "response.created|response.completed", "response.created|response.completed", 200, ""},
+	"codex-field6-event__-suffix-isolated-dataOnly=true":                  {"healthy-http-control", "@0|@1", "message|message", "message|message", 200, ""},
+}
+
+const gCPABoundaryCreated = "{\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}"
+const gCPABoundaryCompleted = "{\"opaque\":{\"model\":\"grok-4.7\"},\"response\":{\"id\":\"resp-verify-f\",\"model\":\"grok-4.7\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"plain grok-4.7 output, event: response.completed data: remains opaque\",\"type\":\"output_text\"}],\"id\":\"msg-verify-f\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\"},\"sequence_number\":1,\"type\":\"response.completed\"}"
+
+func gCPABoundaryPayloads(model string) []string {
+	replace := strings.NewReplacer(`"model":"grok-4.7","object":"response"`, `"model":"`+model+`","object":"response"`)
+	return []string{replace.Replace(gCPABoundaryCreated), replace.Replace(gCPABoundaryCompleted)}
+}
+
+func gCPABoundaryArchiveWire(field, position, model string, dataOnly bool) []byte {
+	var events []string
+	for i, payload := range gCPABoundaryPayloads(model) {
+		header := ""
+		if !dataOnly {
+			header = "event: " + []string{"response.created", "response.completed"}[i] + "\n"
+		}
+		events = append(events, header+"data: "+payload+"\n\n")
+	}
+	if field == "" {
+		if position == "prefix-isolated-terminal-only" {
+			return []byte(events[1])
+		}
+		return []byte(strings.Join(events, ""))
+	}
+	line := field + "\n"
+	var wire string
+	switch position {
+	case "prefix-isolated-terminal-only":
+		wire = line + "\n" + events[1]
+	case "prefix-isolated":
+		wire = line + "\n" + events[0] + events[1]
+	case "prefix-inline":
+		wire = line + events[0] + events[1]
+	case "before-each-event":
+		wire = line + events[0] + line + events[1]
+	case "between-events-isolated":
+		wire = events[0] + line + "\n" + events[1]
+	case "before-terminal-header":
+		wire = events[0] + line + events[1]
+	case "between-terminal-event-and-data":
+		wire = events[0] + strings.Replace(events[1], "data:", line+"data:", 1)
+	case "after-created-data":
+		wire = strings.TrimSuffix(events[0], "\n") + line + "\n" + events[1]
+	case "after-terminal-data":
+		wire = events[0] + strings.TrimSuffix(events[1], "\n") + line + "\n"
+	case "suffix-isolated":
+		wire = events[0] + events[1] + line + "\n"
+	default:
+		panic(position)
+	}
+	return []byte(wire)
+}
+
+func gCPABoundaryArchiveFields(f gCPABoundaryArchiveCase, model string) ([]string, []byte) {
+	payloads := gCPABoundaryPayloads(model)
+	fields := strings.Split(f.fields, "|")
+	var wire strings.Builder
+	var pending []string
+	for i, field := range fields {
+		switch field {
+		case "@0", "@1":
+			fields[i] = "data: " + payloads[int(field[1]-'0')]
+			pending = append(pending, fields[i])
+			wire.WriteString(strings.Join(pending, "\n") + "\n\n")
+			pending = nil
+		default:
+			pending = append(pending, field)
+		}
+	}
+	wire.WriteString(strings.Join(pending, ""))
+	return fields, []byte(wire.String())
+}
+
+func gCPARunBoundaryArchive(t *testing.T, provider string, p *gCPALocalProducer, host *Host, server *httptest.Server) {
+	t.Helper()
+	disabled := gCPALoadNative(t, p, false)
+	var evidence []map[string]any
+	for fieldIndex, field := range []string{"", "data", "data:", "data: ", "event", "event:", "event: "} {
+		for _, position := range []string{"prefix-isolated-terminal-only", "prefix-isolated", "prefix-inline", "before-each-event", "between-events-isolated", "before-terminal-header", "between-terminal-event-and-data", "after-created-data", "after-terminal-data", "suffix-isolated"} {
+			if field == "" && position != "prefix-isolated" && position != "prefix-isolated-terminal-only" {
+				continue
+			}
+			for _, dataOnly := range []bool{false, true} {
+				if dataOnly && (position == "between-terminal-event-and-data" || position == "prefix-isolated-terminal-only") {
+					continue
+				}
+				label := strings.NewReplacer(":", "_", " ", "_").Replace(field)
+				if label == "" {
+					label = "none"
+				}
+				id := fmt.Sprintf("%s-field%d-%s-%s-dataOnly=%v", provider, fieldIndex, label, position, dataOnly)
+				f, ok := gCPABoundaryArchive[id]
+				if !ok {
+					t.Fatalf("unfrozen archive identity=%s", id)
+				}
+				slug := []string{"none", "bare-data", "codex-empty-data", "codex-empty-data-space", "bare-event", "empty-event", "empty-event-space"}[fieldIndex]
+				shape, lifecycle := "pair", "created-completed"
+				if dataOnly {
+					shape = "data-only"
+				}
+				if position == "prefix-isolated-terminal-only" {
+					lifecycle = "single"
+				}
+				for _, step := range []int{0, 1} {
+					transport := "whole"
+					if step == 1 {
+						transport = "bytewise"
+					}
+					t.Run(slug+"/"+position+"/"+shape+"/"+lifecycle+"/"+transport, func(t *testing.T) {
+						ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+						defer cancel()
+						set := func(model string) []byte {
+							wire := gCPABoundaryArchiveWire(field, position, model, dataOnly)
+							p.mu.Lock()
+							p.fixture = gCPAFieldsFixture{name: id, contentType: "text/event-stream", eol: "\n", count: 1, step: step, expectTerminalClose: provider == "codex" && (position == "after-terminal-data" || position == "suffix-isolated")}
+							p.wire, p.records = bytes.Clone(wire), nil
+							p.mu.Unlock()
+							return wire
+						}
+						p.base.SetPluginHost(nil)
+						p.base.SetModelRouterHost(nil)
+						set("grok-4.7")
+						fields, _ := gCPABoundaryArchiveFields(f, "grok-4.7")
+						if core, hostFields := gCPACoreFields(t, p, ctx), gCPAHostFields(t, p, ctx); !reflect.DeepEqual(core, fields) || !reflect.DeepEqual(hostFields, fields) {
+							t.Fatalf("archive=%s core=%q host=%q want=%q", id, core, hostFields, fields)
+						}
+						var directRequest []byte
+						for _, consumer := range []string{"direct-http", "direct-.6-http", "enabled-unmapped-http", "disabled-http", "disabled-.6-http", "mapped-native", "mapped-http", "mapped-nonstream", "direct-nonstream"} {
+							if strings.HasSuffix(consumer, "nonstream") && f.classification != "confirmed-http-regression" && f.classification != "healthy-http-control" {
+								continue
+							}
+							t.Run(consumer, func(t *testing.T) {
+								p.base.SetPluginHost(nil)
+								p.base.SetModelRouterHost(nil)
+								model, upstream := "grok-4.7", "grok-4.7"
+								mapped := strings.HasPrefix(consumer, "mapped")
+								if mapped {
+									model = "grok-4.6"
+									p.base.SetPluginHost(host)
+									p.base.SetModelRouterHost(host)
+								} else if strings.Contains(consumer, ".6-") {
+									model, upstream = "grok-4.6", "grok-4.6"
+								}
+								if consumer == "enabled-unmapped-http" {
+									p.base.SetPluginHost(host)
+									p.base.SetModelRouterHost(host)
+								} else if strings.HasPrefix(consumer, "disabled") {
+									p.base.SetPluginHost(disabled)
+									p.base.SetModelRouterHost(disabled)
+								}
+								wire := set(upstream)
+								payloads := gCPABoundaryPayloads(model)
+								if lifecycle == "single" {
+									payloads = payloads[1:]
+								}
+								var raw []byte
+								status := 200
+								if consumer == "mapped-native" {
+									request := eNativeRequest(model, "openai-response", true)
+									request.Payload, request.OriginalRequest = gCPARequest(model, true), gCPARequest(model, true)
+									result, err := host.activeRecords()[0].plugin.Capabilities.Executor.ExecuteStream(ctx, request)
+									if err != nil {
+										t.Fatal(err)
+									}
+									var errs []string
+									raw, errs = eNativeDrain(t, result.Chunks)
+									_, want := gCPABoundaryArchiveFields(f, model)
+									if len(errs) != 0 || !bytes.Equal(raw, want) {
+										t.Errorf("archive=%s native=%q want=%q errors=%q", id, raw, want, errs)
+									}
+									gCPARequireBoundaryEvents(t, raw, strings.Split(f.nativeNames, "|"), payloads)
+								} else {
+									stream := !strings.HasSuffix(consumer, "nonstream")
+									var headers http.Header
+									status, headers, raw = eHTTP(t, server, "/v1/responses", gCPARequest(model, stream))
+									healthy := f.classification == "confirmed-http-regression" || f.classification == "healthy-http-control"
+									if !mapped || healthy {
+										wantStatus := f.status
+										if !stream {
+											wantStatus = 200
+										}
+										if status != wantStatus {
+											t.Fatalf("archive=%s classification=%s status=%d want=%d bytes=%q", id, f.classification, status, wantStatus, raw)
+										}
+										if !stream {
+											var completed struct{ Response json.RawMessage }
+											if err := json.Unmarshal([]byte(payloads[len(payloads)-1]), &completed); err != nil || !bytes.Equal(raw, completed.Response) {
+												t.Fatalf("completed body=%s want=%s error=%v", raw, completed.Response, err)
+											}
+										} else if healthy {
+											if !strings.HasPrefix(headers.Get("Content-Type"), "text/event-stream") {
+												t.Fatal(headers)
+											}
+											gCPARequireBoundaryEvents(t, raw, strings.Split(f.directNames, "|"), payloads)
+										} else {
+											want := strings.NewReplacer(`"model":"grok-4.7","object":"response"`, `"model":"`+model+`","object":"response"`, `\"model\":\"grok-4.7\",\"object\":\"response\"`, `\"model\":\"`+model+`\",\"object\":\"response\"`).Replace(f.direct)
+											if string(raw) != want {
+												t.Fatalf("fixed unhealthy direct=%q want=%q", raw, want)
+											}
+										}
+									}
+								}
+								p.mu.Lock()
+								records := append([]gCPAUpstreamRecord(nil), p.records...)
+								p.mu.Unlock()
+								if len(records) != 1 || records[0].path != "/v1/responses" || records[0].model != upstream || !bytes.Equal(records[0].response, wire) || records[0].headers.Get("Content-Type") != "application/json" || records[0].headers.Get("Accept") != "text/event-stream" {
+									t.Fatalf("archive=%s upstream=%+v", id, records)
+								}
+								if consumer == "direct-http" {
+									directRequest = bytes.Clone(records[0].body)
+								} else if consumer == "mapped-http" && !bytes.Equal(directRequest, records[0].body) {
+									t.Fatalf("archive=%s mapped/direct upstream body differ", id)
+								}
+								evidence = append(evidence, map[string]any{"id": id, "classification": f.classification, "transport": transport, "consumer": consumer, "status": status, "raw": string(raw), "request": string(records[0].body), "uri": records[0].path, "headers": records[0].headers, "producer_units": fields})
+							})
+						}
+					})
+				}
+			}
+		}
+	}
+	hCPASaveEvidence(t, "boundary-archive-"+provider+".json", evidence)
+}
+
+func gCPABoundarySequence(provider, field, position, shape, model string, count int) ([]string, []string, []string, []byte, []byte) {
+	payloads := gCPAPayloads(model, 9)
+	if count == 2 {
+		payloads = []string{payloads[0], payloads[8]}
+	}
+	var fields, names []string
+	var wire, expected strings.Builder
+	for i, payload := range payloads {
+		var typed struct{ Type string }
+		if err := json.Unmarshal([]byte(payload), &typed); err != nil {
+			panic(err)
+		}
+		dataOnly := shape == "data-only" || shape == "alternating-data" && i%2 == 0 || shape == "alternating-pair" && i%2 == 1
+		active := ""
+		add := func(value string, inEvent bool) {
+			wire.WriteString(value + "\n")
+			if provider == "xai" && strings.HasPrefix(value, "data:") {
+				return
+			}
+			if provider == "codex" && strings.HasPrefix(value, "data:") {
+				value = "data: "
+			}
+			if inEvent && provider == "xai" && strings.HasPrefix(value, "event:") {
+				value = "event: " + typed.Type
+			}
+			fields = append(fields, value)
+			expected.WriteString(value + "\n")
+			if value == "event" {
+				active = ""
+			} else if strings.HasPrefix(value, "event:") {
+				active = strings.TrimPrefix(value, "event:")
+				active = strings.TrimPrefix(active, " ")
+			}
+		}
+		if position == "before-event" || position == "between-events" && i > 0 {
+			add(field, dataOnly)
+		}
+		if !dataOnly {
+			if provider == "xai" && position == "in-event" && strings.HasPrefix(field, "data:") {
+				// XAI 过滤空 data 时也清除其 pending event header。
+				wire.WriteString("event: " + typed.Type + "\n")
+			} else {
+				add("event: "+typed.Type, false)
+			}
+		}
+		if position == "in-event" {
+			add(field, true)
+		}
+		if active == "" {
+			active = "message"
+		}
+		names = append(names, active)
+		fields = append(fields, "data: "+payload)
+		wire.WriteString("data: " + payload + "\n\n")
+		expected.WriteString("data: " + payload + "\n\n")
+	}
+	return fields, names, payloads, []byte(wire.String()), []byte(expected.String())
+}
+
+func gCPARunBoundarySequences(t *testing.T, provider string, p *gCPALocalProducer, host *Host, server *httptest.Server) {
+	t.Helper()
+	disabled := gCPALoadNative(t, p, false)
+	var evidence []map[string]any
+	for _, field := range []struct{ name, value string }{{"bare-id", "id"}, {"bare-retry", "retry"}, {"extension", "x-request-id: trace-123"}, {"bare-data", "data"}, {"bare-event", "event"}, {"empty-event", "event:"}, {"empty-event-space", "event: "}, {"codex-empty-data", "data:"}, {"codex-empty-data-space", "data: "}} {
+		for _, position := range []string{"before-event", "in-event", "between-events"} {
+			for _, shape := range []string{"pair", "data-only", "alternating-data", "alternating-pair"} {
+				for _, count := range []int{2, 9} {
+					lifecycle := "created-completed-sequence"
+					if count == 9 {
+						lifecycle = "nine-events"
+					}
+					for _, step := range []int{0, 1} {
+						transport := "whole"
+						if step == 1 {
+							transport = "bytewise"
+						}
+						t.Run(field.name+"/"+position+"/"+shape+"/"+lifecycle+"/"+transport, func(t *testing.T) {
+							ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+							defer cancel()
+							p.base.SetPluginHost(nil)
+							p.base.SetModelRouterHost(nil)
+							set := func(model string) ([]string, []string, []string, []byte, []byte) {
+								fields, names, payloads, wire, want := gCPABoundarySequence(provider, field.value, position, shape, model, count)
+								p.mu.Lock()
+								p.fixture = gCPAFieldsFixture{name: t.Name(), eol: "\n", contentType: "text/event-stream", count: count, step: step}
+								p.wire, p.records = wire, nil
+								p.mu.Unlock()
+								return fields, names, payloads, wire, want
+							}
+							fields, _, _, _, _ := set("grok-4.7")
+							if core, hostFields := gCPACoreFields(t, p, ctx), gCPAHostFields(t, p, ctx); !reflect.DeepEqual(core, fields) || !reflect.DeepEqual(hostFields, fields) {
+								t.Fatalf("sequence core=%q host=%q want=%q", core, hostFields, fields)
+							}
+							consumers := []string{"mapped-native"}
+							if shape == "pair" && position != "in-event" && (field.name == "bare-id" || field.name == "bare-retry" || field.name == "extension") {
+								consumers = append(consumers, "direct-http", "mapped-http", "enabled-unmapped-http", "disabled-http", "disabled-.6-http", "direct-ws", "mapped-ws", "enabled-unmapped-ws", "disabled-ws", "disabled-.6-ws")
+							}
+							var directRequest []byte
+							for _, consumer := range consumers {
+								t.Run(consumer, func(t *testing.T) {
+									p.base.SetPluginHost(nil)
+									p.base.SetModelRouterHost(nil)
+									model, upstream := "grok-4.7", "grok-4.7"
+									if strings.HasPrefix(consumer, "mapped") {
+										model = "grok-4.6"
+										p.base.SetPluginHost(host)
+										p.base.SetModelRouterHost(host)
+									} else if strings.Contains(consumer, ".6-") {
+										model, upstream = "grok-4.6", "grok-4.6"
+									}
+									if strings.HasPrefix(consumer, "enabled-unmapped") {
+										p.base.SetPluginHost(host)
+										p.base.SetModelRouterHost(host)
+									} else if strings.HasPrefix(consumer, "disabled") {
+										p.base.SetPluginHost(disabled)
+										p.base.SetModelRouterHost(disabled)
+									}
+									_, _, _, wire, _ := set(upstream)
+									_, names, payloads, _, want := gCPABoundarySequence(provider, field.value, position, shape, model, count)
+									var raw []byte
+									if consumer == "mapped-native" {
+										request := eNativeRequest(model, "openai-response", true)
+										request.Payload, request.OriginalRequest = gCPARequest(model, true), gCPARequest(model, true)
+										result, err := host.activeRecords()[0].plugin.Capabilities.Executor.ExecuteStream(ctx, request)
+										if err != nil {
+											t.Fatal(err)
+										}
+										var errs []string
+										raw, errs = eNativeDrain(t, result.Chunks)
+										if len(errs) != 0 || !bytes.Equal(raw, want) {
+											t.Fatalf("sequence native=%q want=%q errors=%q", raw, want, errs)
+										}
+									} else if strings.HasSuffix(consumer, "-ws") {
+										ws, err := eWS(t, server, model)
+										if err != nil || !reflect.DeepEqual(ws, payloads) {
+											t.Fatalf("sequence WS=%q want=%q error=%v", ws, payloads, err)
+										}
+										raw = []byte(strings.Join(ws, "\n"))
+									} else {
+										status, headers, body := eHTTP(t, server, "/v1/responses", gCPARequest(model, true))
+										raw = body
+										if status != 200 || !strings.HasPrefix(headers.Get("Content-Type"), "text/event-stream") {
+											t.Fatalf("sequence HTTP status=%d headers=%v raw=%q", status, headers, raw)
+										}
+									}
+									if !strings.HasSuffix(consumer, "-ws") {
+										gCPARequireBoundaryEvents(t, raw, names, payloads)
+									}
+									p.mu.Lock()
+									records := append([]gCPAUpstreamRecord(nil), p.records...)
+									p.mu.Unlock()
+									if len(records) != 1 || records[0].model != upstream || records[0].path != "/v1/responses" || !bytes.Equal(records[0].response, wire) || records[0].headers.Get("Content-Type") != "application/json" || records[0].headers.Get("Accept") != "text/event-stream" {
+										t.Fatalf("sequence upstream=%+v", records)
+									}
+									if consumer == "direct-http" {
+										directRequest = bytes.Clone(records[0].body)
+									} else if consumer == "mapped-http" && !bytes.Equal(directRequest, records[0].body) {
+										t.Fatal("sequence mapped/direct upstream request differs")
+									}
+									evidence = append(evidence, map[string]any{"case": t.Name(), "consumer": consumer, "producer_units": fields, "raw": string(raw), "request": string(records[0].body), "headers": records[0].headers})
+								})
+							}
+						})
+					}
+				}
+			}
+		}
+	}
+	hCPASaveEvidence(t, "boundary-sequences-"+provider+".json", evidence)
+}
+
+func TestModelMapperFunctionalNativeSSEBoundaries(t *testing.T) {
+	for _, provider := range []string{"xai", "codex"} {
+		t.Run(provider, func(t *testing.T) {
+			p := gCPANewLocalProducer(t, provider)
+			host := gCPALoadNative(t, p, true)
+			if runtime.GOOS == "windows" {
+				host.mu.Lock()
+				client := reflect.ValueOf(host.loaded["model-mapper"].client.(*guardedPluginClient).inner).Elem()
+				host.mu.Unlock()
+				dll := client.FieldByName("dll").Elem()
+				path := dll.FieldByName("Name").String()
+				library, err := os.ReadFile(path)
+				if err != nil || dll.FieldByName("Handle").Uint() == 0 || path != client.FieldByName("tempPath").String() {
+					t.Fatalf("actual loaded DLL=%s error=%v", path, err)
+				}
+				canonical, err := os.ReadFile(os.Getenv("CPA_SMOKE_PLUGIN"))
+				if err != nil || !bytes.Equal(library, canonical) {
+					t.Fatalf("loaded DLL differs from canonical: %v", err)
+				}
+				hCPASaveEvidence(t, "boundary-loaded-"+provider+".json", map[string]any{"pid": os.Getpid(), "path": path, "sha256": fmt.Sprintf("%x", sha256.Sum256(library)), "canonical": os.Getenv("CPA_SMOKE_PLUGIN")})
+				t.Logf("actual loaded DLL pid=%d path=%s SHA256=%x", os.Getpid(), path, sha256.Sum256(library))
+			}
+			server := eResponsesServer(t, p.base)
+			for _, field := range []struct{ name, value string }{{"bare-id", "id"}, {"bare-retry", "retry"}, {"extension", "x-request-id: trace-123"}, {"bare-data", "data"}, {"bare-event", "event"}, {"empty-event", "event:"}, {"empty-event-space", "event: "}, {"codex-empty-data", "data:"}, {"codex-empty-data-space", "data: "}} {
+				shape := "pair"
+				if strings.HasPrefix(field.name, "codex-empty-data") {
+					shape = "data-only"
+				}
+				t.Run(field.name+"/before-event/"+shape+"/single/whole", func(t *testing.T) {
+					dataOnly := shape == "data-only"
+					header, eventName := "event: response.completed\n", "response.completed"
+					if dataOnly {
+						header, eventName = "", "message"
+					}
+					wire := []byte(field.value + "\n" + header + "data: " + gCPACompleted + "\n\n")
+					prefix := field.value + "\n"
+					if dataOnly {
+						prefix = "data: \n"
+						if provider == "xai" {
+							prefix = ""
+						}
+					}
+					set := func() {
+						p.mu.Lock()
+						p.fixture = gCPAFieldsFixture{name: t.Name(), contentType: "text/event-stream", eol: "\n", count: 1}
+						p.wire, p.records = bytes.Clone(wire), nil
+						p.mu.Unlock()
+					}
+					set()
+					ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+					defer cancel()
+					var fields []string
+					if prefix != "" {
+						fields = append(fields, strings.TrimSuffix(prefix, "\n"))
+					}
+					if header != "" {
+						fields = append(fields, strings.TrimSuffix(header, "\n"))
+					}
+					fields = append(fields, "data: "+gCPACompleted)
+					if core, hostFields := gCPACoreFields(t, p, ctx), gCPAHostFields(t, p, ctx); !reflect.DeepEqual(core, fields) || !reflect.DeepEqual(hostFields, fields) {
+						t.Fatalf("producer core=%q host=%q want=%q", core, hostFields, fields)
+					}
+					for _, consumer := range []string{"direct-http", "mapped-native", "mapped-http"} {
+						t.Run(consumer, func(t *testing.T) {
+							set()
+							p.base.SetPluginHost(nil)
+							p.base.SetModelRouterHost(nil)
+							model := "grok-4.7"
+							var raw []byte
+							if consumer == "mapped-native" {
+								model = "grok-4.6"
+								result, err := host.activeRecords()[0].plugin.Capabilities.Executor.ExecuteStream(ctx, eNativeRequest(model, "openai-response", true))
+								if err != nil {
+									t.Fatal(err)
+								}
+								var errs []string
+								raw, errs = eNativeDrain(t, result.Chunks)
+								if len(errs) != 0 {
+									t.Fatal(errs)
+								}
+								want := []byte(prefix + header + "data: " + strings.Replace(gCPACompleted, `"model":"grok-4.7"`, `"model":"grok-4.6"`, 1) + "\n\n")
+								if !bytes.Equal(raw, want) {
+									t.Errorf("native fields=%q want=%q", raw, want)
+								}
+							} else {
+								if consumer == "mapped-http" {
+									model = "grok-4.6"
+									p.base.SetPluginHost(host)
+									p.base.SetModelRouterHost(host)
+								}
+								status, headers, body := eHTTP(t, server, "/v1/responses", gCPARequest(model, true))
+								raw = body
+								if status != 200 || !strings.HasPrefix(headers.Get("Content-Type"), "text/event-stream") {
+									t.Fatalf("HTTP status=%d headers=%v body=%q", status, headers, raw)
+								}
+							}
+							gCPARequireBoundaryEvents(t, raw, []string{eventName}, []string{strings.Replace(gCPACompleted, `"model":"grok-4.7"`, `"model":"`+model+`"`, 1)})
+							p.mu.Lock()
+							records := append([]gCPAUpstreamRecord(nil), p.records...)
+							p.mu.Unlock()
+							if len(records) != 1 || records[0].model != "grok-4.7" || records[0].path != "/v1/responses" || !bytes.Equal(records[0].response, wire) {
+								t.Fatalf("upstream calls/route=%+v", records)
+							}
+						})
+					}
+				})
+			}
+			gCPARunBoundaryArchive(t, provider, p, host, server)
+			gCPARunBoundarySequences(t, provider, p, host, server)
+		})
 	}
 }
 

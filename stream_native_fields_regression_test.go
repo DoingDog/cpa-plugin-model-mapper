@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	pluginabi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	pluginapi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -2105,6 +2108,477 @@ func TestFunctionalNativeSSEFieldMixedMetadataCursorAndTraffic(t *testing.T) {
 		if err != nil || !bytes.Equal(output, want) {
 			t.Fatalf("complete cumulative traffic repeat=%d bytes=%d error=%v", repeat, len(output), err)
 		}
+	}
+}
+
+func TestFunctionalNativeSSEBoundaryMetadata(t *testing.T) {
+	for _, field := range []struct{ name, value string }{{"bare-id", "id"}, {"bare-retry", "retry"}, {"extension", "x-request-id: trace-123"}} {
+		t.Run(field.name, func(t *testing.T) {
+			got := gNativeParts(t, "openai-response", true, []byte(field.value), []byte("event: response.completed"), []byte("data: "+gNativeCompleted))
+			want := []byte(field.value + "\nevent: response.completed\ndata: " + gNativeCompletedWant + "\n\n")
+			if !bytes.Equal(got, want) {
+				t.Fatalf("native fields=%q want=%q", got, want)
+			}
+			gRequireNativeFrames(t, got, []string{"response.completed"}, false)
+		})
+	}
+}
+
+func TestFunctionalNativeSSEBoundaryEmptyFields(t *testing.T) {
+	for _, field := range []struct{ name, value string }{{"bare-data", "data"}, {"bare-event", "event"}, {"empty-event", "event:"}, {"empty-event-space", "event: "}, {"codex-empty-data", "data:"}, {"codex-empty-data-space", "data: "}} {
+		t.Run(field.name, func(t *testing.T) {
+			got := gNativeParts(t, "openai-response", true, []byte(field.value), []byte("event: response.completed"), []byte("data: "+gNativeCompleted))
+			want := []byte(field.value + "\nevent: response.completed\ndata: " + gNativeCompletedWant + "\n\n")
+			if !bytes.Equal(got, want) {
+				t.Fatalf("empty fields=%q want=%q", got, want)
+			}
+			gRequireNativeFrames(t, got, []string{"response.completed"}, false)
+		})
+	}
+}
+
+func TestFunctionalNativeSSEBoundaryContinuations(t *testing.T) {
+	for _, field := range []string{"id: cursor", "retry: 100", "x-request-id: trace-123", "false-field: opaque event: response.created data: grok-4.7 中文"} {
+		for _, bytewise := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/bytewise=%v", field, bytewise), func(t *testing.T) {
+				var parts [][]byte
+				if bytewise {
+					for i := 0; i < len(field); i++ {
+						parts = append(parts, []byte(field[i:i+1]))
+					}
+				} else {
+					name, value, ok := strings.Cut(field, ":")
+					if !ok {
+						t.Fatal("fixture missing colon")
+					}
+					parts = [][]byte{[]byte(name), []byte(":" + value)}
+				}
+				parts = append(parts, []byte("\nevent: response.completed\ndata: "+gNativeCompleted+"\n\n"))
+				want := []byte(field + "\nevent: response.completed\ndata: " + gNativeCompletedWant + "\n\n")
+				if got := gNativeParts(t, "openai-response", true, parts...); !bytes.Equal(got, want) {
+					t.Fatalf("continued field=%q want=%q", got, want)
+				}
+			})
+		}
+	}
+}
+
+func gBoundaryFields(fields []string, position, shape string, count int) ([][]byte, []string, string) {
+	names, payloads := gNativeSequence()
+	indices := []int{8}
+	if count == 2 {
+		indices = []int{0, 8}
+	} else if count == 9 {
+		indices = []int{0, 1, 2, 3, 4, 5, 6, 7, 8}
+	}
+	var parts [][]byte
+	var after []string
+	var emitted, pending string
+	write := func(part string) {
+		parts = append(parts, []byte(part))
+		after = append(after, emitted)
+	}
+	for n, i := range indices {
+		dataOnly := shape == "data-only" || shape == "alternating-data" && n%2 == 0 || shape == "alternating-pair" && n%2 == 1
+		unit := ""
+		hasHeader := !dataOnly
+		metadata := func() {
+			for _, field := range fields {
+				if strings.HasPrefix(field, "event:") && strings.TrimSpace(strings.TrimPrefix(field, "event:")) != "" {
+					emitted += pending
+					pending = ""
+					hasHeader = true
+				}
+				write(field)
+				unit += field + "\n"
+			}
+		}
+		if position == "before-event" || position == "between-events" && n > 0 {
+			metadata()
+		}
+		if !dataOnly {
+			emitted += pending
+			pending = ""
+			write("event: " + names[i])
+			unit += "event: " + names[i] + "\n"
+		}
+		if position == "in-event" {
+			metadata()
+		}
+		emitted += pending
+		pending = ""
+		unit += "data: " + strings.Replace(payloads[i], `"model":"grok-4.7"`, `"model":"grok-4.6"`, 1) + "\n\n"
+		if !hasHeader {
+			pending = unit
+		} else {
+			emitted += unit
+		}
+		write("data: " + payloads[i])
+	}
+	return parts, after, emitted + pending
+}
+
+func TestFunctionalNativeSSEBoundaryDispatch(t *testing.T) {
+	for _, fields := range [][]string{{"id"}, {"retry"}, {"x-request-id: trace-123"}, {"data"}, {"event"}, {"event:"}, {"event: "}, {"data:"}, {"data: "}, {"id", "retry", "event:", "event: response.completed", "event:"}} {
+		for _, position := range []string{"before-event", "in-event", "between-events"} {
+			for _, shape := range []string{"pair", "data-only", "alternating-data", "alternating-pair"} {
+				for _, count := range []int{1, 2, 9} {
+					t.Run(fmt.Sprintf("fields=%q/%s/%s/count=%d", fields, position, shape, count), func(t *testing.T) {
+						parts, after, want := gBoundaryFields(fields, position, shape, count)
+						r := newStreamChunkRewriter("grok-4.6")
+						r.format, r.frameRawJSONAsSSE = "openai-response", true
+						var got []byte
+						for i, part := range parts {
+							out, err := r.Write(part)
+							got = append(got, bytes.Join(out, nil)...)
+							if err != nil || string(got) != after[i] {
+								t.Fatalf("Write[%d]=%q cumulative=%q want=%q error=%v", i, part, got, after[i], err)
+							}
+						}
+						out, err := r.Finish()
+						got = append(got, bytes.Join(out, nil)...)
+						if err != nil || string(got) != want {
+							t.Fatalf("Finish=%q want=%q error=%v", got, want, err)
+						}
+						requireValidResponsesSSE(t, got, count)
+						for _, delimiter := range []string{"\n\n", "\r\n\r\n"} {
+							out, err := r.Write([]byte(delimiter))
+							if err != nil || len(bytes.TrimSpace(bytes.Join(out, nil))) != 0 {
+								t.Fatalf("late delimiter=%q output=%q error=%v", delimiter, out, err)
+							}
+						}
+						for _, finish := range []func() ([][]byte, error){r.Flush, r.Finish, r.Finish} {
+							out, err := finish()
+							if err != nil || len(bytes.TrimSpace(bytes.Join(out, nil))) != 0 {
+								t.Fatalf("repeat finish=%q error=%v", out, err)
+							}
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestFunctionalNativeSSEBoundaryContinuationFields(t *testing.T) {
+	for _, field := range []string{"id: cursor", "retry: 100", "x-request-id: trace-123"} {
+		t.Run("native-follow/"+field, func(t *testing.T) {
+			name, value, ok := strings.Cut(field, ":")
+			if !ok {
+				t.Fatal("fixture missing colon")
+			}
+			got := gNativeParts(t, "openai-response", true, []byte(name), []byte(":"+value), []byte("event: response.completed"), []byte("data: "+gNativeCompleted))
+			want := field + "\nevent: response.completed\ndata: " + gNativeCompletedWant + "\n\n"
+			if string(got) != want {
+				t.Fatalf("native continuation=%q want=%q", got, want)
+			}
+		})
+	}
+	for _, field := range []string{"event: response.completed", "data: " + gNativeCompleted, "x-request-id: trace-123"} {
+		for _, cut := range []int{1, len(strings.Split(field, ":")[0]), len(field) - 1} {
+			t.Run(fmt.Sprintf("field=%s/cut=%d", strings.Split(field, ":")[0], cut), func(t *testing.T) {
+				parts := [][]byte{[]byte(field[:cut]), nil, []byte(field[cut:])}
+				want := ""
+				switch {
+				case strings.HasPrefix(field, "event:"):
+					parts = append(parts, []byte("\ndata: "+gNativeCompleted+"\n\n"))
+					want = field + "\ndata: " + gNativeCompletedWant + "\n\n"
+				case strings.HasPrefix(field, "data:"):
+					parts = append(parts, []byte("\n\n"))
+					want = "data: " + gNativeCompletedWant + "\n\n"
+				default:
+					parts = append(parts, []byte("\nevent: response.completed\ndata: "+gNativeCompleted+"\n\n"))
+					want = field + "\nevent: response.completed\ndata: " + gNativeCompletedWant + "\n\n"
+				}
+				if got := gNativeParts(t, "openai-response", true, parts...); string(got) != want {
+					t.Fatalf("continued=%q want=%q", got, want)
+				}
+			})
+		}
+	}
+}
+
+func TestFunctionalNativeSSEBoundaryCompleteComment(t *testing.T) {
+	for _, field := range []string{"id", "retry", "x-request-id: trace-123", "data", "event:", "data: "} {
+		t.Run(field, func(t *testing.T) {
+			r := newStreamChunkRewriter("grok-4.6")
+			r.format, r.frameRawJSONAsSSE = "openai-response", true
+			for _, part := range []string{"data: " + gNativeCompleted, field} {
+				if out, err := r.Write([]byte(part)); err != nil || len(out) != 0 {
+					t.Fatalf("pending=%q output=%q error=%v", part, out, err)
+				}
+			}
+			out, err := r.Write([]byte(": keepalive\n\n"))
+			want := "data: " + gNativeCompletedWant + "\n\n" + field + "\n: keepalive\n\n"
+			if err != nil || string(bytes.Join(out, nil)) != want {
+				t.Fatalf("complete comment=%q want=%q error=%v", out, want, err)
+			}
+			if out, err := r.Finish(); err != nil || len(out) != 0 {
+				t.Fatalf("finish=%q error=%v", out, err)
+			}
+		})
+	}
+}
+
+func TestFunctionalNativeSSEBoundaryAmbiguity(t *testing.T) {
+	for _, tc := range gNativeMetadataCases()[:2] {
+		t.Run("metadata-prefix/"+tc.name, func(t *testing.T) {
+			want := append([]byte("id\n"), tc.want...)
+			if got := gNativeParts(t, "openai-response", true, []byte("id"), tc.header, tc.terminal); !bytes.Equal(got, want) {
+				t.Fatalf("opaque native header=%q want=%q", got, want)
+			}
+		})
+	}
+	for _, parts := range [][][]byte{
+		{[]byte("id")}, {[]byte("retry")}, {[]byte("event:")}, {[]byte("data: ")}, {[]byte("x-request-id: trace-123")},
+		{[]byte("id"), []byte("event: response.completed"), []byte(`data: {"type":"response.created","model":"grok-4.7"}`)},
+		{[]byte("x-request-id: event: response.completed data: " + gNativeCompleted)},
+	} {
+		if got, want := gNativeParts(t, "openai-response", true, parts...), bytes.Join(parts, nil); !bytes.Equal(got, want) {
+			t.Fatalf("unresolved=%q output=%q want=%q", parts, got, want)
+		}
+	}
+	for _, field := range []string{"true-field: opaque event: response.created data: grok-4.7 中文", "false-field: trace", "null-field: trace", "1-field: trace", "-field: trace"} {
+		got := gNativeParts(t, "openai-response", true, []byte(field), []byte("event: response.completed"), []byte("data: "+gNativeCompleted))
+		want := []byte(field + "\nevent: response.completed\ndata: " + gNativeCompletedWant + "\n\n")
+		if !bytes.Equal(got, want) {
+			t.Fatalf("extension=%q output=%q want=%q", field, got, want)
+		}
+	}
+}
+
+func TestFunctionalNativeSSEBoundaryForwarder(t *testing.T) {
+	for _, field := range []string{"id", "retry", "x-request-id: trace-123", "data", "event", "event:", "data: "} {
+		for _, terminal := range []string{"natural", "done-payload", "in-band-error", "callback-error", "decode-error", "cleanup-errors", "emit-error"} {
+			t.Run(field+"/"+terminal, func(t *testing.T) {
+				reads := []pluginapi.HostModelStreamReadResponse{{Payload: []byte(field)}, {Payload: []byte("data: " + gNativeCompleted)}, {Done: true}}
+				if terminal == "done-payload" {
+					reads[1].Done = true
+				} else if terminal == "in-band-error" || terminal == "cleanup-errors" {
+					reads[1].Done, reads[1].Error = true, "original boundary error"
+				}
+				readErr, hostErr, pluginErr, emitErr := errors.New("boundary callback error"), errors.New("boundary host close error"), errors.New("boundary plugin close error"), errors.New("boundary emit error")
+				var got []byte
+				var order []string
+				closeText := ""
+				readCount, hostCloses, pluginCloses := 0, 0, 0
+				stream := &executorStream{pluginStreamID: "boundary", hostStreamID: "boundary-host", originalModel: "grok-4.6", format: "openai-response", frameRawJSONAsSSE: true}
+				stream.call = func(method string, payload any) (json.RawMessage, error) {
+					switch method {
+					case pluginabi.MethodHostModelStreamRead:
+						readCount++
+						if readCount == 3 && terminal == "callback-error" {
+							return nil, readErr
+						}
+						if readCount == 3 && terminal == "decode-error" {
+							return json.RawMessage(`{"payload":`), nil
+						}
+						if len(reads) == 0 {
+							return nil, errors.New("unexpected extra boundary read")
+						}
+						read := reads[0]
+						reads = reads[1:]
+						return json.Marshal(read)
+					case pluginabi.MethodHostStreamEmit:
+						order = append(order, "emit")
+						raw, err := json.Marshal(payload)
+						if err != nil {
+							return nil, err
+						}
+						var emit struct{ Payload []byte }
+						if err := json.Unmarshal(raw, &emit); err != nil {
+							return nil, err
+						}
+						got = append(got, emit.Payload...)
+						if terminal == "emit-error" {
+							return nil, emitErr
+						}
+					case pluginabi.MethodHostModelStreamClose:
+						hostCloses++
+						order = append(order, "host-close")
+						if terminal == "cleanup-errors" {
+							return nil, hostErr
+						}
+					case pluginabi.MethodHostStreamClose:
+						pluginCloses++
+						order = append(order, "plugin-close")
+						raw, err := json.Marshal(payload)
+						if err != nil {
+							return nil, err
+						}
+						var closed struct{ Error string }
+						if err := json.Unmarshal(raw, &closed); err != nil {
+							return nil, err
+						}
+						closeText = closed.Error
+						if terminal == "cleanup-errors" {
+							return nil, pluginErr
+						}
+					default:
+						return nil, fmt.Errorf("unexpected callback %s", method)
+					}
+					return json.RawMessage(`{}`), nil
+				}
+				err := runStreamForward(stream)
+				want := field + "\ndata: " + gNativeCompletedWant + "\n\n"
+				wantOrder := "emit,host-close,plugin-close"
+				wantReads := 3
+				if terminal == "done-payload" || terminal == "in-band-error" || terminal == "cleanup-errors" {
+					wantReads = 2
+				}
+				if terminal == "callback-error" || terminal == "decode-error" {
+					wantOrder = "emit,host-close"
+				}
+				if string(got) != want || strings.Join(order, ",") != wantOrder || readCount != wantReads || hostCloses != 1 || pluginCloses != strings.Count(wantOrder, "plugin-close") {
+					t.Fatalf("forwarded=%q want=%q order=%v want=%s reads=%d want=%d closes=%d/%d", got, want, order, wantOrder, readCount, wantReads, hostCloses, pluginCloses)
+				}
+				switch terminal {
+				case "callback-error":
+					if !errors.Is(err, readErr) {
+						t.Fatal(err)
+					}
+				case "decode-error":
+					if err == nil || !strings.Contains(err.Error(), "decode host stream chunk") {
+						t.Fatal(err)
+					}
+				case "cleanup-errors":
+					if !errors.Is(err, hostErr) || !errors.Is(err, pluginErr) || !strings.Contains(closeText, "original boundary error") || !strings.Contains(closeText, hostErr.Error()) {
+						t.Fatalf("error=%v close=%s", err, closeText)
+					}
+				default:
+					wantError := ""
+					if terminal == "in-band-error" {
+						wantError = "original boundary error"
+					} else if terminal == "emit-error" {
+						wantError = "emit flushed stream chunk: boundary emit error"
+					}
+					if err != nil || closeText != wantError {
+						t.Fatalf("error=%v close=%s want=%s", err, closeText, wantError)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestFunctionalNativeSSEBoundaryRPC(t *testing.T) {
+	for _, terminal := range []string{"natural", "done-payload", "error-done", "emit-error"} {
+		t.Run(terminal, func(t *testing.T) {
+			resetExecutorStreamLifecycle()
+			setLoadedConfigForTest(Config{GlobalRules: "grok-4.6=>grok-4.7"})
+			t.Cleanup(func() {
+				shutdownExecutorStreams()
+				resetExecutorStreamLifecycle()
+				setHostCallbackForTest(nil)
+				setLoadedConfigForTest(defaultConfig())
+			})
+			var mu sync.Mutex
+			var output []byte
+			var order []string
+			var closeText string
+			reads, hostCloses, pluginCloses := 0, 0, 0
+			closed := make(chan struct{})
+			respond := func(payload any) ([]byte, error) {
+				raw, err := json.Marshal(payload)
+				if err != nil {
+					return nil, err
+				}
+				return json.Marshal(pluginabi.Envelope{OK: true, Result: raw})
+			}
+			setHostCallbackForTest(func(method string, request []byte) ([]byte, error) {
+				mu.Lock()
+				defer mu.Unlock()
+				switch method {
+				case pluginabi.MethodHostModelExecuteStream:
+					var req pluginapi.HostModelExecutionRequest
+					if err := json.Unmarshal(request, &req); err != nil {
+						return nil, err
+					}
+					if req.Model != "grok-4.7" || string(req.Body) != `{"model":"grok-4.7","input":"grok-4.6"}` || req.Headers.Get("X-Boundary") != "preserved" || req.ExitProtocol != "openai-response" || !req.Stream {
+						return nil, fmt.Errorf("outbound request=%+v", req)
+					}
+					return respond(pluginapi.HostModelStreamResponse{StreamID: "rpc-boundary-host", StatusCode: 200, Headers: http.Header{"Content-Type": {"text/event-stream"}, "X-Boundary": {"response"}}})
+				case pluginabi.MethodHostModelStreamRead:
+					reads++
+					chunk := pluginapi.HostModelStreamReadResponse{}
+					switch reads {
+					case 1:
+						chunk.Payload = []byte("id")
+					case 2:
+						chunk.Payload = []byte("data: " + gNativeCompleted)
+						chunk.Done = terminal == "done-payload" || terminal == "error-done"
+						if terminal == "error-done" {
+							chunk.Error = "original RPC terminal error"
+						}
+					case 3:
+						chunk.Done = true
+					default:
+						return nil, errors.New("unexpected extra RPC read")
+					}
+					return respond(chunk)
+				case pluginabi.MethodHostStreamEmit:
+					var emit struct {
+						StreamID string `json:"stream_id"`
+						Payload  []byte `json:"payload"`
+					}
+					if err := json.Unmarshal(request, &emit); err != nil || emit.StreamID != "rpc-boundary" {
+						return nil, fmt.Errorf("emit=%s error=%v", request, err)
+					}
+					output = append(output, emit.Payload...)
+					order = append(order, "emit")
+					if terminal == "emit-error" {
+						return json.Marshal(pluginabi.Envelope{OK: false, Error: &pluginabi.Error{Code: "test_emit", Message: "RPC emit failed"}})
+					}
+					return respond(struct{}{})
+				case pluginabi.MethodHostModelStreamClose:
+					hostCloses++
+					order = append(order, "host-close")
+					return respond(struct{}{})
+				case pluginabi.MethodHostStreamClose:
+					var value struct{ Error string }
+					if err := json.Unmarshal(request, &value); err != nil {
+						return nil, err
+					}
+					closeText = value.Error
+					pluginCloses++
+					order = append(order, "plugin-close")
+					close(closed)
+					return respond(struct{}{})
+				default:
+					return nil, fmt.Errorf("unexpected RPC callback=%s", method)
+				}
+			})
+			req := executorRPCRequest{StreamID: "rpc-boundary", Model: "grok-4.6", Format: "openai-response", SourceFormat: "openai-response", OriginalRequest: []byte(`{"model":"grok-4.6","input":"grok-4.6"}`), Headers: http.Header{"X-Boundary": {"preserved"}}}
+			raw, err := json.Marshal(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response, err := handleMethod(pluginabi.MethodExecutorExecuteStream, raw)
+			var envelope pluginabi.Envelope
+			if err != nil || json.Unmarshal(response, &envelope) != nil || !envelope.OK {
+				t.Fatalf("RPC response=%s error=%v", response, err)
+			}
+			select {
+			case <-closed:
+			case <-time.After(2 * time.Second):
+				t.Fatal("RPC stream did not close")
+			}
+			executorStreamLifecycle.wg.Wait()
+			mu.Lock()
+			defer mu.Unlock()
+			wantError, wantReads := "", 3
+			if terminal == "done-payload" || terminal == "error-done" {
+				wantReads = 2
+			}
+			if terminal == "error-done" {
+				wantError = "original RPC terminal error"
+			} else if terminal == "emit-error" {
+				wantError = "emit flushed stream chunk: RPC emit failed"
+			}
+			if string(output) != "id\ndata: "+gNativeCompletedWant+"\n\n" || closeText != wantError || reads != wantReads || hostCloses != 1 || pluginCloses != 1 || strings.Join(order, ",") != "emit,host-close,plugin-close" {
+				t.Fatalf("RPC output=%q close=%q reads=%d closes=%d/%d order=%v", output, closeText, reads, hostCloses, pluginCloses, order)
+			}
+		})
 	}
 }
 
