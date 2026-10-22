@@ -32,6 +32,7 @@ type delimiterlessResponsesEventScanner struct {
 	headerStart         int
 	headerScan          int
 	nativeHeader        bool
+	emptyEventHeader    bool
 	metadataEnd         int
 	eventType           string
 	dataStart           int
@@ -157,8 +158,8 @@ func (r *sseRewriter) Write(p []byte) ([][]byte, error) {
 		}
 		if !s.jsonStarted || s.completeEnd > 0 {
 			r.nativeFields = r.nativeFields || candidate
-			if r.nativeFields && len(r.buf) > 0 && (bytes.HasPrefix(p, []byte("event:")) || bytes.HasPrefix(p, []byte("data:")) ||
-				bytes.Equal(p, []byte("id")) || bytes.Equal(p, []byte("retry")) || isResponsesEmptyField(p) || isResponsesExtensionField(p)) {
+			if r.nativeFields && len(r.buf) > 0 && isResponsesNativeField(p) &&
+				(!bytes.HasPrefix(p, []byte(":")) || len(p) > 1 && !bytes.ContainsAny(p, "\r\n")) {
 				// 只记录 field-shaped callback 的起点，完整 typed data 验证前不补写分隔符。
 				r.nativeBoundaries = append(r.nativeBoundaries, len(r.buf))
 			}
@@ -622,6 +623,9 @@ func (r *sseRewriter) responsesMetadataEnd(start int, eof bool) (int, bool, bool
 			continue
 		}
 		part := r.buf[start:boundary]
+		if bytes.IndexByte(part, ':') < 0 && bytes.HasPrefix(r.buf[boundary:], []byte(":")) {
+			continue
+		}
 		if !isResponsesNativeField(part) || bytes.HasPrefix(part, []byte("data:")) && !isResponsesEmptyField(part) {
 			continue
 		}
@@ -632,7 +636,7 @@ func (r *sseRewriter) responsesMetadataEnd(start int, eof bool) (int, bool, bool
 	}
 	if n > 0 || missing {
 		part := r.buf[start:end]
-		metadata := bytes.Equal(part, []byte("id")) || bytes.Equal(part, []byte("retry")) || isResponsesExtensionField(part) || isResponsesEmptyField(part)
+		metadata := bytes.Equal(part, []byte("id")) || bytes.Equal(part, []byte("retry")) || isResponsesMetadataField(part) || isResponsesExtensionField(part) || isResponsesEmptyField(part)
 		if bytes.Equal(part, []byte("event")) || bytes.HasPrefix(part, []byte("event:")) && (r.nativeFields || r.delimiterless.headerComplete) {
 			typ := ""
 			if bytes.HasPrefix(part, []byte("event:")) {
@@ -640,6 +644,7 @@ func (r *sseRewriter) responsesMetadataEnd(start int, eof bool) (int, bool, bool
 			}
 			if typ == "" || isResponsesNativeEventType(typ) {
 				r.delimiterless.eventType = typ
+				r.delimiterless.emptyEventHeader = typ == ""
 				r.delimiterless.nativeHeader = r.delimiterless.nativeHeader || typ != "" && missing
 				metadata = true
 			}
@@ -828,7 +833,7 @@ func (r *sseRewriter) findDelimiterlessResponsesEventEnd(eof bool) (int, bool) {
 			matched = json.Unmarshal(value, &typed) == nil && (s.eventType != "" && typed.Type == s.eventType ||
 				s.eventType == "response.done" && typed.Type == "response.completed" ||
 				s.eventType == "" && (strings.HasPrefix(typed.Type, "response.") ||
-					s.dataStart == s.headerStart && (typed.Type == "error" || typed.Type == "keepalive")))
+					(s.dataStart == s.headerStart || s.emptyEventHeader) && (typed.Type == "error" || typed.Type == "keepalive")))
 		case "interactions":
 			if s.eventType == "done" {
 				matched = bytes.Equal(bytes.TrimSpace(value), []byte("[DONE]"))

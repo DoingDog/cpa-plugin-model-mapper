@@ -2298,6 +2298,36 @@ func TestFunctionalNativeSSEBoundaryContinuationFields(t *testing.T) {
 	}
 }
 
+func TestFunctionalNativeSSEBoundaryEmptyEventTerminal(t *testing.T) {
+	for _, typ := range []string{"error", "keepalive"} {
+		for _, empty := range []string{"event", "event:", "event: "} {
+			t.Run(typ+"/"+empty, func(t *testing.T) {
+				data := `{"type":"` + typ + `","opaque":{"n":1.00,"text":"grok-4.7 中文"}}`
+				parts := [][]byte{[]byte("event: " + typ), []byte(empty), []byte("data: " + data), []byte("event: response.completed"), []byte("data: " + gNativeCompleted)}
+				want := []byte("event: " + typ + "\n" + empty + "\ndata: " + data + "\n\nevent: response.completed\ndata: " + gNativeCompletedWant + "\n\n")
+				for _, finish := range []bool{false, true} {
+					if got := gNativeParts(t, "openai-response", finish, parts...); !bytes.Equal(got, want) {
+						t.Fatalf("empty event terminal=%q want=%q finish=%v", got, want, finish)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestFunctionalNativeSSEBoundaryCommentCallback(t *testing.T) {
+	for _, field := range []string{"event:", "event: ", "data:", "data: ", "x-request-id: trace-123"} {
+		t.Run(field, func(t *testing.T) {
+			got := gNativeParts(t, "openai-response", true, []byte(field), []byte(": heartbeat"), []byte("event: response.completed"), []byte("data: "+gNativeCompleted))
+			want := []byte(field + "\n: heartbeat\nevent: response.completed\ndata: " + gNativeCompletedWant + "\n\n")
+			if !bytes.Equal(got, want) {
+				t.Fatalf("comment callback=%q want=%q", got, want)
+			}
+			gRequireNativeFrames(t, got, []string{"response.completed"}, false)
+		})
+	}
+}
+
 func TestFunctionalNativeSSEBoundaryCompleteComment(t *testing.T) {
 	for _, field := range []string{"id", "retry", "x-request-id: trace-123", "data", "event:", "data: "} {
 		t.Run(field, func(t *testing.T) {

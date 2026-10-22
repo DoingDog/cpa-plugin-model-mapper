@@ -3752,6 +3752,106 @@ func gCPARunBoundarySequences(t *testing.T, provider string, p *gCPALocalProduce
 	hCPASaveEvidence(t, "boundary-sequences-"+provider+".json", evidence)
 }
 
+func gCPARunBoundaryCombinations(t *testing.T, provider string, p *gCPALocalProducer, host *Host, server *httptest.Server) {
+	t.Helper()
+	cases := []struct {
+		name, wire              string
+		fields, names, payloads []string
+	}{{"comment-callback", "event:\n: heartbeat\nevent: response.completed\ndata: " + gCPACompleted + "\n\n", []string{"event:", ": heartbeat", "event: response.completed", "data: " + gCPACompleted}, []string{"response.completed"}, []string{gCPACompleted}}}
+	if provider == "codex" {
+		for _, empty := range []string{"event", "event:", "event: "} {
+			data := `{"type":"keepalive","opaque":{"n":1.00,"text":"grok-4.7 中文"}}`
+			fields := []string{"event: keepalive", empty, "data: " + data, "event: response.completed", "data: " + gCPACompleted}
+			cases = append(cases, struct {
+				name, wire              string
+				fields, names, payloads []string
+			}{"empty-event-terminal/" + empty, strings.Join(fields[:3], "\n") + "\n\n" + strings.Join(fields[3:], "\n") + "\n\n", fields, []string{"message", "response.completed"}, []string{data, gCPACompleted}})
+		}
+	}
+	var evidence []map[string]any
+	for _, tc := range cases {
+		for _, step := range []int{0, 1} {
+			t.Run(fmt.Sprintf("%s/step=%d", tc.name, step), func(t *testing.T) {
+				wire, fields := []byte(tc.wire), tc.fields
+				set := func() {
+					p.base.SetPluginHost(nil)
+					p.base.SetModelRouterHost(nil)
+					p.mu.Lock()
+					p.fixture = gCPAFieldsFixture{name: t.Name(), contentType: "text/event-stream", eol: "\n", count: 1, step: step}
+					p.wire, p.records = bytes.Clone(wire), nil
+					p.mu.Unlock()
+				}
+				set()
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				defer cancel()
+				if core, hostFields := gCPACoreFields(t, p, ctx), gCPAHostFields(t, p, ctx); !reflect.DeepEqual(core, fields) || !reflect.DeepEqual(hostFields, fields) {
+					t.Fatalf("combination core=%q host=%q want=%q", core, hostFields, fields)
+				}
+				var directRequest []byte
+				for _, consumer := range []string{"direct-http", "mapped-native", "mapped-http", "direct-ws", "mapped-ws"} {
+					t.Run(consumer, func(t *testing.T) {
+						set()
+						model := "grok-4.7"
+						if strings.HasPrefix(consumer, "mapped") {
+							model = "grok-4.6"
+							p.base.SetPluginHost(host)
+							p.base.SetModelRouterHost(host)
+						}
+						payloads := append([]string(nil), tc.payloads...)
+						payloads[len(payloads)-1] = strings.Replace(gCPACompleted, `"model":"grok-4.7"`, `"model":"`+model+`"`, 1)
+						var raw []byte
+						if consumer == "mapped-native" {
+							result, err := host.activeRecords()[0].plugin.Capabilities.Executor.ExecuteStream(ctx, eNativeRequest(model, "openai-response", true))
+							if err != nil {
+								t.Fatal(err)
+							}
+							var errs []string
+							raw, errs = eNativeDrain(t, result.Chunks)
+							want := []byte(strings.Replace(tc.wire, gCPACompleted, payloads[len(payloads)-1], 1))
+							if len(errs) != 0 || !bytes.Equal(raw, want) {
+								t.Errorf("combination native=%q want=%q errors=%q", raw, want, errs)
+							}
+						} else if strings.HasSuffix(consumer, "-ws") {
+							ws, err := eWS(t, server, model)
+							if err != nil || !reflect.DeepEqual(ws, payloads) {
+								t.Fatalf("combination WS=%q want=%q error=%v", ws, payloads, err)
+							}
+							raw = []byte(strings.Join(ws, "\n"))
+						} else {
+							status, headers, body := eHTTP(t, server, "/v1/responses", gCPARequest(model, true))
+							raw = body
+							if status != 200 || !strings.HasPrefix(headers.Get("Content-Type"), "text/event-stream") {
+								t.Fatalf("combination HTTP status=%d headers=%v raw=%q", status, headers, raw)
+							}
+						}
+						if !strings.HasSuffix(consumer, "-ws") {
+							names := tc.names
+							if consumer == "direct-http" && tc.name == "empty-event-terminal/event" {
+								// 原 CPA 将 colonless event 拼进前一 header，此项单独保留 direct 行为。
+								names = []string{"keepaliveevent", "response.completed"}
+							}
+							gCPARequireBoundaryEvents(t, raw, names, payloads)
+						}
+						p.mu.Lock()
+						records := append([]gCPAUpstreamRecord(nil), p.records...)
+						p.mu.Unlock()
+						if len(records) != 1 || records[0].model != "grok-4.7" || records[0].path != "/v1/responses" || !bytes.Equal(records[0].response, wire) {
+							t.Fatalf("combination upstream=%+v", records)
+						}
+						if consumer == "direct-http" {
+							directRequest = bytes.Clone(records[0].body)
+						} else if consumer == "mapped-http" && !bytes.Equal(directRequest, records[0].body) {
+							t.Fatal("combination mapped/direct upstream request differs")
+						}
+						evidence = append(evidence, map[string]any{"case": t.Name(), "consumer": consumer, "producer_units": fields, "raw": string(raw), "request": string(records[0].body)})
+					})
+				}
+			})
+		}
+	}
+	hCPASaveEvidence(t, "boundary-combinations-"+provider+".json", evidence)
+}
+
 func TestModelMapperFunctionalNativeSSEBoundaries(t *testing.T) {
 	for _, provider := range []string{"xai", "codex"} {
 		t.Run(provider, func(t *testing.T) {
@@ -3859,6 +3959,7 @@ func TestModelMapperFunctionalNativeSSEBoundaries(t *testing.T) {
 					}
 				})
 			}
+			gCPARunBoundaryCombinations(t, provider, p, host, server)
 			gCPARunBoundaryArchive(t, provider, p, host, server)
 			gCPARunBoundarySequences(t, provider, p, host, server)
 		})
