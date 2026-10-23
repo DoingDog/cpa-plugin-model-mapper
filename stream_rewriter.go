@@ -388,7 +388,11 @@ trimmed:
 		}
 		if valid {
 			if r.frameRawJSONAsSSE {
-				return [][]byte{r.frameRawJSON(restored)}, len(p), true, false, nil
+				framed, err := r.frameRawJSON(restored)
+				if err != nil {
+					return nil, 0, true, false, err
+				}
+				return [][]byte{framed}, len(p), true, false, nil
 			}
 			if !changed {
 				return [][]byte{bytes.Clone(p)}, len(p), true, false, nil
@@ -420,7 +424,11 @@ trimmed:
 			return out, cursor, true, false, err
 		}
 		if r.frameRawJSONAsSSE {
-			out = append(out, r.frameRawJSON(restored))
+			framed, err := r.frameRawJSON(restored)
+			if err != nil {
+				return out, cursor, true, false, err
+			}
+			out = append(out, framed)
 		} else {
 			chunk := make([]byte, 0, start-cursor+len(restored))
 			chunk = append(chunk, p[cursor:start]...)
@@ -530,7 +538,14 @@ func (r *streamChunkRewriter) Finish() ([][]byte, error) {
 	return chunks, nil
 }
 
-func (r *streamChunkRewriter) frameRawJSON(p []byte) []byte {
+func (r *streamChunkRewriter) frameRawJSON(p []byte) ([]byte, error) {
+	if r.format == "openai-response" {
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, p); err != nil {
+			return nil, err
+		}
+		p = compact.Bytes()
+	}
 	r.framedRawJSON = true
 	r.rawJSONBoundary = true
 	eventType := ""
@@ -542,7 +557,7 @@ func (r *streamChunkRewriter) frameRawJSON(p []byte) []byte {
 			eventType = event.Type
 		}
 	}
-	return frameSSEEvent(p, eventType)
+	return frameSSEEvent(p, eventType), nil
 }
 
 func hasSSEFieldPrefix(p []byte) bool {

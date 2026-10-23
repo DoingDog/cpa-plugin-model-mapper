@@ -1018,6 +1018,179 @@ func TestModelMapperFunctionalNativeProtocolAndErrors(t *testing.T) {
 	}
 }
 
+func eRequireLoadedLibrary(t *testing.T, host *Host, evidenceName string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		host.mu.Lock()
+		client := reflect.ValueOf(host.loaded["model-mapper"].client.(*guardedPluginClient).inner).Elem()
+		host.mu.Unlock()
+		dll := client.FieldByName("dll").Elem()
+		path := dll.FieldByName("Name").String()
+		library, err := os.ReadFile(path)
+		if err != nil || dll.FieldByName("Handle").Uint() == 0 || path != client.FieldByName("tempPath").String() {
+			t.Fatalf("actual loaded DLL=%s error=%v", path, err)
+		}
+		canonical, err := os.ReadFile(os.Getenv("CPA_SMOKE_PLUGIN"))
+		if err != nil || !bytes.Equal(library, canonical) {
+			t.Fatalf("loaded DLL differs from canonical: %v", err)
+		}
+		hCPASaveEvidence(t, evidenceName, map[string]any{"pid": os.Getpid(), "path": path, "sha256": fmt.Sprintf("%x", sha256.Sum256(library)), "canonical": os.Getenv("CPA_SMOKE_PLUGIN")})
+		t.Logf("actual loaded DLL pid=%d path=%s SHA256=%x", os.Getpid(), path, sha256.Sum256(library))
+	}
+}
+
+// 仅替代外部 provider 的输出；native ABI、validator 和 HTTP/WS 消费者保持实际实现。
+type ePrettyJSONEmptyHeaderProvider struct{ *eControlledProvider }
+
+func (p *ePrettyJSONEmptyHeaderProvider) ExecuteStream(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	result, err := p.eControlledProvider.ExecuteStream(ctx, auth, req, opts)
+	if err != nil {
+		return nil, err
+	}
+	result.Headers = http.Header{}
+	return result, nil
+}
+
+func TestModelMapperFunctionalResponsesRawPrettyJSON(t *testing.T) {
+	pretty := []byte(`{
+"type":"response.completed",
+"response":{"id":"resp_pretty","object":"response","model":"grok-4.7","status":"completed","output":[]}
+}`)
+	if !json.Valid(pretty) || bytes.Count(pretty, []byte{'\n'}) != 3 {
+		t.Fatal("fixture must contain three actual LF bytes in a complete JSON value")
+	}
+	const compact = `{"type":"response.completed","response":{"id":"resp_pretty","object":"response","model":"grok-4.7","status":"completed","output":[]}}`
+	const restored = `{"type":"response.completed","response":{"id":"resp_pretty","object":"response","model":"grok-4.6","status":"completed","output":[]}}`
+	provider := &eControlledProvider{}
+	base := eControlledBase(t, provider)
+	base.AuthManager.RegisterExecutor(&ePrettyJSONEmptyHeaderProvider{provider})
+	host := eNativeHost(t, base)
+	eRequireLoadedLibrary(t, host, "responses-raw-pretty-loaded.json")
+	for _, shape := range []struct {
+		name, body, want, output string
+	}{
+		{"pretty", string(pretty), restored, `[]`},
+		{"compact", compact, restored, `[]`},
+		{"pretty-opaque", "{\n\"type\":\"response.completed\",\n\"response\":{\"id\":\"resp_pretty\",\"object\":\"response\",\"model\":\"grok-4.7\",\"status\":\"completed\",\"output\":" + gCPAOutput + "}\n}", `{"type":"response.completed","response":{"id":"resp_pretty","object":"response","model":"grok-4.6","status":"completed","output":` + gCPAOutput + `}}`, gCPAOutput},
+	} {
+		t.Run(shape.name, func(t *testing.T) {
+			requireCompletion := func(raw []byte, model string) {
+				t.Helper()
+				var event struct {
+					Type     string
+					Response struct {
+						ID, Object, Model, Status string
+						Output                    json.RawMessage
+					}
+				}
+				if err := json.Unmarshal(raw, &event); err != nil {
+					t.Fatalf("completion=%q error=%v", raw, err)
+				}
+				if event.Type != "response.completed" || event.Response.ID != "resp_pretty" || event.Response.Object != "response" || event.Response.Model != model || event.Response.Status != "completed" || !bytes.Equal(event.Response.Output, []byte(shape.output)) {
+					t.Fatalf("unexpected full completion=%q", raw)
+				}
+			}
+			requireSSE := func(raw []byte) {
+				t.Helper()
+				events, err := sse.Decode(bytes.NewReader(raw))
+				if err != nil || len(events) != 1 || events[0].Event != "response.completed" {
+					t.Fatalf("SSE events=%+v error=%v wire=%q", events, err, raw)
+				}
+				data, ok := events[0].Data.(string)
+				if !ok {
+					t.Fatalf("SSE data type=%T", events[0].Data)
+				}
+				requireCompletion([]byte(data), "grok-4.6")
+			}
+			provider.parts = [][]byte{[]byte(shape.body)}
+			base.SetPluginHost(nil)
+			base.SetModelRouterHost(nil)
+			validated, msg := base.ExecuteModelStream(context.Background(), handlers.ModelExecutionRequest{EntryProtocol: "openai-response", ExitProtocol: "openai-response", Model: "grok-4.7", Stream: true, Body: gCPARequest("grok-4.7", true)})
+			if msg != nil {
+				t.Fatal(msg.Error)
+			}
+			var before [][]byte
+			for chunk := range validated.Chunks {
+				if chunk.Err != nil {
+					t.Fatal(chunk.Err)
+				}
+				before = append(before, chunk.Payload)
+			}
+			if len(validated.Headers) != 0 || len(before) != 1 || string(before[0]) != shape.body {
+				t.Fatalf("pre-ABI headers=%v chunks=%q want original raw JSON and empty headers", validated.Headers, before)
+			}
+			requireCompletion(before[0], "grok-4.7")
+			provider.calls = nil
+			native, err := host.activeRecords()[0].plugin.Capabilities.Executor.ExecuteStream(context.Background(), eNativeRequest("grok-4.6", "openai-response", true))
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, errs := eNativeDrain(t, native.Chunks)
+			wantWire := "event: response.completed\ndata: " + shape.want + "\n\n"
+			if len(errs) != 0 || native.Headers.Get("Content-Type") != "text/event-stream" || string(raw) != wantWire || len(provider.calls) != 1 || provider.calls[0].Model != "grok-4.7" || string(provider.calls[0].Payload) != `{"model":"grok-4.7","stream":true}` {
+				t.Errorf("native headers=%v wire=%q want=%q errors=%q calls=%+v", native.Headers, raw, wantWire, errs, provider.calls)
+			}
+			requireSSE(raw)
+			for _, mode := range []string{"disabled", "enabled-unmapped", "mapped"} {
+				t.Run(mode, func(t *testing.T) {
+					base.SetPluginHost(nil)
+					base.SetModelRouterHost(nil)
+					model := "grok-4.7"
+					if mode != "disabled" {
+						base.SetPluginHost(host)
+						base.SetModelRouterHost(host)
+					}
+					if mode == "mapped" {
+						model = "grok-4.6"
+					}
+					server := eResponsesServer(t, base)
+					provider.calls = nil
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					conn, _, err := websocket.DefaultDialer.DialContext(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/v1/responses/ws", nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer conn.Close()
+					if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+						t.Fatal(err)
+					}
+					if err := conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.create","model":%q,"input":[]}`, model))); err != nil {
+						t.Fatal(err)
+					}
+					kind, completion, readErr := conn.ReadMessage()
+					if len(provider.calls) != 1 || provider.calls[0].Model != "grok-4.7" {
+						t.Fatalf("WS upstream calls=%+v", provider.calls)
+					}
+					if readErr != nil {
+						t.Errorf("complete valid raw JSON lost before WS completion: message=%q error=%v", completion, readErr)
+					} else {
+						if kind != websocket.TextMessage {
+							t.Fatalf("WS message kind=%d", kind)
+						}
+						requireCompletion(completion, model)
+						if err := conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(5*time.Second)); err != nil {
+							t.Fatal(err)
+						}
+						_, extra, closeErr := conn.ReadMessage()
+						if len(extra) != 0 || !websocket.IsCloseError(closeErr, websocket.CloseNormalClosure) {
+							t.Errorf("WS close after exactly one completion: extra=%q error=%v", extra, closeErr)
+						}
+					}
+					if mode == "mapped" {
+						provider.calls = nil
+						status, headers, body := eHTTP(t, server, "/v1/responses", gCPARequest(model, true))
+						if status != http.StatusOK || !strings.HasPrefix(headers.Get("Content-Type"), "text/event-stream") || len(provider.calls) != 1 || provider.calls[0].Model != "grok-4.7" {
+							t.Fatalf("HTTP status=%d headers=%v body=%q calls=%+v", status, headers, body, provider.calls)
+						}
+						requireSSE(body)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestModelMapperFunctionalResponsesWS(t *testing.T) {
 	endpoint, key := os.Getenv("CPA_FUNCTIONAL_WS_URL"), os.Getenv("CPA_FUNCTIONAL_LOCAL_KEY")
 	if endpoint == "" || key == "" {
