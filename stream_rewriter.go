@@ -387,6 +387,9 @@ trimmed:
 			valid = true
 		}
 		if valid {
+			if !eof && end == len(p) && (value[0] == '-' || value[0] >= '0' && value[0] <= '9') {
+				return nil, 0, false, true, nil
+			}
 			if r.frameRawJSONAsSSE {
 				framed, err := r.frameRawJSON(restored)
 				if err != nil {
@@ -485,6 +488,9 @@ func splitJSONValues(p []byte, framed, eof bool) ([][]byte, int, bool, bool) {
 			return nil, 0, false, false
 		}
 		end := int(dec.InputOffset())
+		if !eof && end == len(p) && (raw[0] == '-' || raw[0] >= '0' && raw[0] <= '9') {
+			return values, consumed, len(values) > 0, true
+		}
 		if raw[0] == '{' || raw[0] == '[' {
 			scalarStart, scalarOffset = len(values)+1, end
 		} else if start > 0 {

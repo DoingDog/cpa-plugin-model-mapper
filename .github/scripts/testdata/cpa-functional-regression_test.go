@@ -1303,6 +1303,102 @@ func eMetadataParts() []string {
 	return []string{"event: response.created", `data: {"type":"response.created","response":{"model":"grok-4.7","status":"in_progress","output":[]}}`, "event: response.completed", "data: " + gCPACompleted}
 }
 
+func TestModelMapperFunctionalRawNumberContinuation(t *testing.T) {
+	// 固定 CPA 不保留 controlled provider 的 Content-Type；openai 仍走未 framing 路径。
+	const format = "openai"
+	p := &eControlledProvider{}
+	base := eControlledBase(t, p)
+	host := eNativeHost(t, base)
+	if runtime.GOOS == "windows" {
+		host.mu.Lock()
+		client := reflect.ValueOf(host.loaded["model-mapper"].client.(*guardedPluginClient).inner).Elem()
+		host.mu.Unlock()
+		dll := client.FieldByName("dll").Elem()
+		path := dll.FieldByName("Name").String()
+		library, err := os.ReadFile(path)
+		if err != nil || dll.FieldByName("Handle").Uint() == 0 || path != client.FieldByName("tempPath").String() {
+			t.Fatalf("actual loaded DLL=%s error=%v", path, err)
+		}
+		canonical, err := os.ReadFile(os.Getenv("CPA_SMOKE_PLUGIN"))
+		if err != nil || !bytes.Equal(library, canonical) {
+			t.Fatalf("loaded DLL differs from canonical: %v", err)
+		}
+		hCPASaveEvidence(t, "raw-number-loaded.json", map[string]any{"pid": os.Getpid(), "path": path, "sha256": fmt.Sprintf("%x", sha256.Sum256(library)), "canonical": os.Getenv("CPA_SMOKE_PLUGIN")})
+		t.Logf("actual loaded DLL pid=%d path=%s SHA256=%x", os.Getpid(), path, sha256.Sum256(library))
+	}
+	for _, number := range []string{"1.5", "1e+3", "-1.5"} {
+		for _, split := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/split=%v", number, split), func(t *testing.T) {
+				input := number + " " + gCPACompleted
+				parts := [][]byte{[]byte(input)}
+				if split {
+					cut := 1
+					if number[0] == '-' {
+						cut++
+					}
+					parts = [][]byte{[]byte(input[:cut]), []byte(input[cut:])}
+				}
+				for _, route := range []string{"direct", "enabled-unmapped", "mapped-native"} {
+					t.Run(route, func(t *testing.T) {
+						p.parts, p.calls = parts, nil
+						base.SetPluginHost(nil)
+						base.SetModelRouterHost(nil)
+						ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+						defer cancel()
+						want := input
+						var raw []byte
+						if route == "mapped-native" {
+							result, err := host.activeRecords()[0].plugin.Capabilities.Executor.ExecuteStream(ctx, eNativeRequest("grok-4.6", format, true))
+							if err != nil {
+								t.Fatal(err)
+							}
+							if result.Headers.Get("Content-Type") != "text/event-stream" {
+								t.Fatalf("native headers=%v", result.Headers)
+							}
+							var errs []string
+							raw, errs = eNativeDrain(t, result.Chunks)
+							if len(errs) != 0 {
+								t.Fatalf("native errors=%q output=%q", errs, raw)
+							}
+							want = number + " " + strings.Replace(gCPACompleted, `"model":"grok-4.7"`, `"model":"grok-4.6"`, 1)
+						} else {
+							if route == "enabled-unmapped" {
+								base.SetPluginHost(host)
+								base.SetModelRouterHost(host)
+							}
+							result, msg := base.ExecuteModelStream(ctx, handlers.ModelExecutionRequest{EntryProtocol: format, ExitProtocol: format, Model: "grok-4.7", Stream: true, Body: gCPARequest("grok-4.7", true)})
+							if msg != nil {
+								t.Fatal(msg.Error)
+							}
+							if result.Headers.Get("Content-Type") != "" {
+								t.Fatalf("host headers=%v", result.Headers)
+							}
+							var received [][]byte
+							for chunk := range result.Chunks {
+								if chunk.Err != nil {
+									t.Fatal(chunk.Err)
+								}
+								received = append(received, chunk.Payload)
+							}
+							if !reflect.DeepEqual(received, parts) {
+								t.Fatalf("host/validator changed units=%q, want %q", received, parts)
+							}
+							raw = bytes.Join(received, nil)
+						}
+						if len(p.calls) != 1 || p.calls[0].Model != "grok-4.7" {
+							t.Fatalf("provider calls=%+v", p.calls)
+						}
+						t.Logf("route=%s input=%q output=%q providerModel=%s", route, parts, raw, p.calls[0].Model)
+						if string(raw) != want {
+							t.Errorf("output=%q, want %q", raw, want)
+						}
+					})
+				}
+			})
+		}
+	}
+}
+
 func TestModelMapperFunctionalMetadataBuiltin(t *testing.T) {
 	for _, name := range []string{"xai", "codex"} {
 		t.Run(name, func(t *testing.T) {
