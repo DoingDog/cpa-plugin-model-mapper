@@ -1,0 +1,132 @@
+---
+title: Raw/SSE Stream Classification Fixes
+type: fix
+date: 2026-10-24
+baseline: 2e0b34c6429da77b0a1bc710de134833dd25f455
+---
+
+# Raw/SSE Stream Classification Fixes
+
+## Goal and scope
+
+Correct both confirmed input families in the shared raw/SSE classifier: A, neutral raw JSON whitespace that establishes SSE state; B, JSON-shaped SSE unknown fields that remain trapped in raw scanning after a callback split. Mapped streams must restore the Client-Requested Model at the existing raw and SSE seams, preserve ordered bytes and protocol interpretation, and emit complete units promptly. The [implementation plan](../plans/2026-10-24-stream-classification-implementation.md) defines one test-first repair, native/HTTP verification, review, and delivery without adding a feature or performance target.
+
+This specification owns R1-R15 and AE1-AE8. The documentation task revises and renames only this new specification and its companion plan. It changes no production code, tests, older documentation, CPA source, dependencies, or release automation, and runs no tests, builds, or publication operations.
+
+---
+
+## Baseline and evidence
+
+The source baseline is `2e0b34c6429da77b0a1bc710de134833dd25f455`. `go.mod` declares Go `1.26.0` and CPA `v7.2.152`. `Makefile` pins integration to CPA revision `c76dfd4e0edabab9000628b1560ab8ab379eadb8`; the existing overlay verifies module Sum `h1:FkvGzpOCvuDGswaOyoVfbY5Ua7OlP/wMXw3agiNMUQI=`.
+
+The original checkout's ignored `dist/functional-audit-20261024-coordination-ef6a16a7/verified-findings.md` records the supplied independent evidence. Its completed second-family verification supersedes its earlier pending-candidate wording. These are prior executions, not runs performed by the documentation owner. Escape notation below denotes actual CR/LF bytes.
+
+| Family and layer | Input and partition | Observed result |
+| --- | --- | --- |
+| A, shared rewriter | `{}\n\n1.5 {"model":"upstream"}` | Whole input restores `client`. Writes containing `{}`, two LF bytes, then the scalar/object, or bytewise writes, leave `upstream` without error. Two-way offsets 2, 5, 6 and 7 fail. |
+| A, minimal document | `\r\n\r\n{"model":"upstream"}` | Whole input restores `client`; split after `\r\n\r` leaves `upstream`. The same partition affects Gemini `modelVersion`. |
+| A, RPC/envelopes | LF witness through `handleMethod(executor.execute_stream)` and real callback envelopes | Missed restoration is reproduced with the expected outbound model/body and normal host/plugin closure. |
+| A, production forwarder helper | Both witnesses, all five formats with `application/json`; also unframed `openai` with `text/event-stream` | Missed restoration is reproduced. This is five-format helper coverage; new A native acceptance remains required. |
+| B, shared rewriter/RPC | `format=claude`, raw-to-SSE enabled, first callback `{`, then `\nevent: message_start\ndata: {"type":"message_start","message":{"model":"upstream"}}\n\n` | The 86-byte whole event emits with `client`. Splits 1 through 82 and bytewise input emit nothing during Write; Flush/Finish emits `upstream` without error. |
+| B, loaded ABI/bridge and Claude HTTP | Pinned CPA, baseline DLL SHA256 `8af6cf53b33ffa061aeab50f1a09d6d4a0f8591d83a8f095f1ab9c42357eb9a7`, controlled-provider chunks | Two repeated native/HTTP runs return the wrong `grok-4.7` for mapped split/bytewise input; whole mapped returns `grok-4.6`. `/v1/messages` returns 200/event-stream, the existing gin SSE decoder accepts it, provider Calls=1, and termination is normal. |
+| Controls | Genuine scalar-looking SSE, ordinary `x-vendor-field`, valid pretty raw JSON, genuinely incomplete raw JSON, whole/raw object-leading and mixed raw-to-SSE cases | Expected controls pass. Unknown SSE lines remain opaque; only whitelisted JSON in `data:` is restored. Standard JSON Decoder accepts the legal raw sequences. |
+
+B's independent workflow `wf_317f6ea0-512` completed dynamic, contract and causal verification after final critic `wf_790c8b55-e65` raised the candidate. The provider replay is controlled; the native ABI, CPA validator/bridge and HTTP handler are real. Neither family establishes naturally occurring stock-provider chunking or external Anthropic SDK coverage.
+
+The [README rewrite boundaries](../../../README.md#rewrite-boundaries) promise preservation of unframed separators. The [2026-10-23 specification](2026-10-23-functional-stream-corrections-design.md#requirements), especially its R9, R11, and R12, already requires raw partition consistency, immediate containers, preserved separators, and distinct helper/native evidence.
+
+### Causal trace
+
+For A, `streamChunkRewriter.Write` checks `isSSEChunk` before its whitespace-only branch. Blank separators can set `sse.started` or leave a terminal CR in `sse.buf`; buffered-SSE and scalar early returns then bypass raw restoration. Both standalone whitespace callbacks and blank prefixes attached to a scalar/container need correction. Established SSE retains continuation ownership.
+
+For B, `retainPending` activates `rawScan` on `{`, `[` or string-shaped candidates. Its depth/string completion scan can keep waiting after later bytes already make the first raw JSON value syntactically impossible. The brace witness remains at depth 1. At EOF, the raw container path can forward those SSE bytes without data restoration. Standard `json.Decoder.Decode` of the first value supplies the distinction: `*json.SyntaxError` excludes that raw candidate, `io.ErrUnexpectedEOF` still needs input, and successful Decode preserves the completed raw prefix even when an SSE suffix follows. Whole-document Unmarshal failure does not distinguish these cases.
+
+### Completed baseline and coverage
+
+All 85 tracked baseline files have assigned coverage with no file-level omission. Initial audit `wf_da56fea4-40a` completed all 12 partitions, parser-dependency audit `wf_83b68004-18b` completed, both final-critic assignments in `wf_790c8b55-e65` completed, and both families have completed independent verification. No initial inspection is outstanding. The prior document review `wf_ebcdd159-073` requires the explicit scalar-looking genuine-SSE control now specified in R5/AE3; review of these corrected two-family documents remains a U3 prerequisite.
+
+Baseline owner `a2192d31030fed3e4` retained evidence under the original checkout's ignored `dist/functional-audit-20261024-baseline-c3d75821/`. Recursive unit/vet/race in the original checkout failed discovery/build on old ignored Go SDK negative-test sources; root unit passed. Race also had one payload-error blocked-emission witness timeout at its unchanged two-second deadline, without a `DATA RACE` report. Exact clean tracked snapshots then passed recursive unit/vet, five unchanged focused race repetitions, full race and actual integration. Original-checkout integration also passed. Full race and full integration ran sequentially. Keep these failed attempts and successful repetitions distinct, with their actual cwd/exit receipts.
+
+There are two distinct baseline native receipts: `native/raw-number-loaded.json` records PID 10020, shadow `cliproxy-plugin-model-mapper-d1bcd3b3ba8060cafed231e13cc7709c.dll`, SHA256 `d1bcd3b3ba8060cafed231e13cc7709c0f17aa9e5876b1520e3bcb28ac8580c0`; `verification-013f38ed5c/loaded-identities.json` records PID 14280, shadow `cliproxy-plugin-model-mapper-de8be72f4e5f43b658366962e3a6ee51.dll`, SHA256 `de8be72f4e5f43b658366962e3a6ee516c5c4a1df1fb63ccd7d7a15d3bdc0470`. Each receipt records its own canonical and actual loaded path. The latter independently reconciles 29 functional tests plus two bridge controls, the four exact capture-key sets and four exports; focused registration/ABI unit and race checks passed. These receipts do not establish one shared DLL identity across the two baseline runs. Retain the actual tested copies and manifests; a later binary at the same filename cannot inherit an earlier pass. Some mutable indexes had concurrent writers, so command cwd/exit and loaded-identity receipts govern attribution.
+
+Windows skipped `TestWriteChecksumFileAtomicallySetsMode`, `TestRunRejectsAliasedOutputsThroughSymlinkThenParent` and `TestWriteSmokeConfigTightensPermissions`; the ordinary smoke-helper run skipped `TestCPAPluginIntegration`, which the actual integration entry separately executed. These are completed baseline observations, not repaired-source acceptance.
+
+### Repair feasibility and measured limits
+
+A's temporary overlays demonstrated both a private-boolean approach and a two-Write correction without additional state; the refined overlay passed old root/vet and partition controls. U3 must choose and TDD-prove its final implementation. B's read-only overlay used incremental SSE-line evidence plus standard Decoder confirmation within `stream_rewriter.go`; functional/root/vet/allocation checks and large-unit controls passed. A naive colon trigger added allocations and was rejected. Refined allocations matched baseline, but repeated paired median time ratios remained 1.047 for fragmented objects, 1.133 for pretty bytewise JSON, 1.051 for pretty 8192-byte chunks and 1.195 for colon-rich pretty JSON.
+
+These prototypes establish feasibility, not a completed repair or performance acceptance. The [existing hot-path plan](../plans/2026-09-01-model-mapper-hot-path-performance.md#task-5-full-verification-and-independent-review), baseline line 844, requires an explained trade-off and rerun for repeated median regressions greater than 10%. Preserve its hard allocation/size limits and incremental complexity. U3 must minimize unnecessary probes and measure alternating baseline/final variants in the same process; explain and rerun any remaining material correctness-check cost without asserting zero additional CPU time or an unmeasured absence of regression.
+
+---
+
+## Requirements
+
+### Raw classification and output
+
+- R1. At existing supported raw-input seams, legal raw JSON sequences must produce the same final ordered bytes and whitelisted model restoration under whole input, every two-way split including empty parts, and bytewise writes.
+- R2. Preserve exact unframed leading, inter-value, array-adjacent, and trailing JSON whitespace: space, tab, LF, and CR, including CRLF and mixed line endings. Whitespace alone must not commit a raw or undecided stream to SSE.
+- R3. Recognize neutral JSON whitespace both in separate callbacks and at the start of callbacks containing scalars or containers. A blank delimiter heuristic alone must not prevent raw restoration at those seams.
+- R4. Preserve immediate emission of complete objects, raw array elements, and completed prefixes. Keep unresolved trailing numbers pending until an actual boundary or EOF, including decimal, exponent, negative, and incomplete numeric continuations.
+
+### JSON-shaped SSE classification
+
+- R15. At generic and `claude` SSE seams, a JSON-shaped unknown first field followed by real SSE fields must produce the complete restored event during Write once its existing event boundary is available, for whole, specified split, every two-way including empty parts, and bytewise input. Cover `{` and necessary `[`/string-shaped same-family controls. Reclassify a pending raw candidate only when standard Decoder first-value decoding returns `*json.SyntaxError` and real SSE-field evidence exists. Continue waiting on `io.ErrUnexpectedEOF`; successful Decode retains the valid raw prefix. Blank lines, colons or `data:`-looking opaque string content alone must not reclassify valid pretty raw JSON. Apply the distinction consistently at Flush/Finish, preserving genuine incomplete-raw errors, completed-prefix-plus-error output and non-replay.
+
+### Existing protocol and data boundaries
+
+- R5. Preserve established SSE continuation ownership, standard/unknown/colonless fields, Responses native-field and logical-event precedence, framing decisions, batching, event names, DONE handling, and the existing BOM behavior. In the genuine SSE input `1.5\n{"model":"upstream"}\ndata: {"model":"upstream"}\n\n`, only the data JSON model becomes `client`; the unknown object line remains `upstream`. Keep permanent baseline-GREEN controls for number, `true`, `false`, `null` and string-shaped first fields with LF, CR and CRLF, with unchanged repaired assertions. Retain the scalar SSE gate's required behavior. Raw partition consistency does not redefine native callback units or framed scalar/unknown-field interpretation.
+- R6. Keep request rewriting top-level-only and response restoration limited to `model`, `modelVersion`, `response.model`, `response.modelVersion`, `message.model`, and `interaction.model`. Preserve all other token bytes, duplicate members/order, escapes, Unicode, numeric lexemes, opaque content/tool text, and existing changed-body header policy.
+- R7. Preserve input/output ownership, complete-prefix-plus-error delivery, `maxPendingStreamBytes = 16 << 20` for an incomplete unit, large complete-unit acceptance, cumulative-traffic behavior, and existing allocation ceilings. Keep all original tests, expected values, deadlines, limits, sizes, and capture members.
+- R8. Preserve clean/error Flush and Finish behavior, earlier primary errors, known rewrite/flush error selection before blocked emission, emit-failure non-replay, shutdown ordering, and existing host/plugin close-once behavior and failed-close remedy.
+- R9. Keep production changes in shared `stream_rewriter.go` classification, including necessary private `Write`/`rawScan`/`retainPending`/Flush reach; `sseRewriter.Write` may change only when formal TDD proves it necessary. Preserve the incremental rawScan optimization. Necessary private scanner indexes/state, including a boolean, are allowed; introduce no parallel JSON parser, per-byte full-pending parse, unnecessary state machine, dependency, configuration, provider branch, public interface or performance target. Reuse existing JSON/whitespace/SSE helpers and `encoding/json`. CPA, registration, supported formats, C ABI, routing and release entry points remain unchanged.
+
+### Proof and delivery
+
+- R10. Extend permanent root regressions and the existing executor helper for `openai`, `openai-response`, `claude`, `gemini`, and `interactions` with `application/json` for A, and generic/Claude event-stream helper paths for B. Assert applicable model fields, upstream request/model rewriting, exact returned bytes, timely complete-event output and host/plugin closure; retain the `openai` event-stream-header raw control. Preserve distinct `handleMethod`/callback-envelope proof for both families.
+- R11. Extend the sole permanent native fixture, `.github/scripts/testdata/cpa-functional-regression_test.go`: existing OpenAI raw-number controls for A, and existing generic Claude native/protocol-HTTP blocks for B. Prove the same permanent defect assertions fail with baseline production/DLL and pass with repaired production/DLL, while correct controls stay GREEN. Include whole, specified split and bytewise mapped input plus direct, disabled, enabled-unmapped and ordinary unknown-field controls. B uses a complete realistic `message_start` payload, normal termination and `/v1/messages`, with exact wire and existing gin SSE Decoder assertions. Repeat focused tests at least twice for each family and complete same-library `make integration`. Save the actual tested library copy and built/canonical/loaded PID/path/hash identities in per-owner, per-attempt directories; separate default and patch artifacts. Controlled replay proves real ABI/CPA/HTTP behavior and does not establish stock-provider chunking or external SDK coverage. Five A helper formats do not establish five native formats.
+- R12. The initial full functional audit, dependency check, final critics and independent verification of both families are complete. Before production editing, resolve the outstanding document-review correction and review the corrected two-family spec/plan. Each owner completes checks, review, corrections, re-review and a task-only English commit in an independent worktree. One exclusive repair owner completes both families' shared classifier and root/helper/RPC/native/HTTP work together; neither family is deferred beyond this delivery. The coordinator merges only completed, conflict-checked work.
+- R13. Final acceptance requires full clean-worktree unit/race/vet, all three explicit script suites, all existing benchmarks, paired baseline/final classification measurements under the existing hot-path trade-off/rerun rule, actual default and injected patch registration, C ABI, exact native capture membership, independent specification/quality/test review, corrections and re-review. Keep hard allocation/size/complexity limits; optimize unnecessary scanning and explain any material remaining correctness-check cost with repeated measurements. Full race and full integration run sequentially. Baseline/prototype passes, skips, timeout or zero-match selectors do not establish repaired-source acceptance.
+- R14. Deliver the requested patch through the existing VERSION/linker and main/tag workflow under actual user publication authority. Recheck remote/latest and use an unused patch, expected `v0.5.17` if available. Verify final-SHA Ubuntu integration, all seven platform builds, downloaded archive structure/binary build info/version/LICENSE/checksums, and remove only this run's clean, fully merged, unused worktrees/branches and temporary files. Preserve old `.claude/`, `dist/`, and worktrees; report runtime and cleanup limits accurately.
+
+---
+
+## Design and change reach
+
+Use the existing pending/raw/SSE machinery for both families. A must keep neutral whitespace from establishing SSE ownership while preserving its exact raw bytes and the genuine scalar-looking SSE oracle. B needs the least incremental SSE-evidence probing that can release an impossible first raw candidate; standard Decoder confirmation owns JSON validity. A successful first raw Decode retains raw-prefix priority, and `io.ErrUnexpectedEOF` retains pending input. Genuine buffered SSE and native field ownership keep their existing priority.
+
+Confirm constructors, callers, recursive Write, scanner retention/reset, size accounting and Flush/Finish before choosing the final TDD implementation. Private scanner indexes/state are permitted where necessary. Preserve incremental processing; do not repeatedly scan or fully decode all pending bytes on each bytewise callback. Reuse `sseLineEnding`, `couldStartJSONValue`, `hasSSEFieldPrefix`, existing whitespace helpers and Decoder/RawMessage where applicable. Do not create a JSON grammar or use trimming that changes token bytes or admits non-JSON whitespace.
+
+| Surface | Reach |
+| --- | --- |
+| `stream_rewriter.go` | Shared `Write`, `rawScan`, `retainPending`, Flush and necessary private classification helpers; preserve recursive raw arrays, raw numbers/prefixes, framing and Finish behavior. |
+| `sse_rewriter.go` | Read existing helpers and ownership; `sseRewriter.Write` is permitted only with its own formal failing proof. Preserve delimiter/native scanner behavior. |
+| `stream_raw_number_regression_test.go` | Extend A's partition/separator/trace/immediate-container and five-format helper coverage. |
+| `main_test.go`, `stream_protocol_regression_test.go` | B's focused classification/timing/EOF and helper/RPC regressions at existing seams; A's explicit scalar-looking genuine-SSE permanent controls. Reuse existing helpers. |
+| `stream_native_fields_regression_test.go`, `stream_responses_raw_framing_regression_test.go`, `stream_lifecycle_regression_test.go`, `performance_regression_test.go`, existing benchmarks | Preserve all raw/SSE/native, ownership, size, lifecycle and allocation oracles; add only focused B correctness/performance coverage needed by R9/R13/R15. |
+| `.github/scripts/testdata/cpa-functional-regression_test.go` | One owner extends `TestModelMapperFunctionalRawNumberContinuation` near baseline line 1400, Claude controls in `TestModelMapperFunctionalNativeProtocolAndErrors` near 947, and `TestModelMapperFunctionalProtocolHTTP` near 1677. Reuse controlled provider, loader, request, drain, gin SSE decoder and identity helpers; keep one fixture. |
+| `executor_stream.go`, `json_model.go`, `main.go`, `abi_cgo.go` | Read-only call chain and invariants; no production edits planned. |
+| `.github/scripts/smoke-local.go`, `smoke-local_test.go`, `Makefile`, `.github/workflows/build.yml`, release scripts | Existing integration, overlay, VERSION injection, compatibility and publication entry points remain unchanged. |
+| Configuration/routing/DSL files, module manifests, README, `CONCEPTS.md`, previous docs, CPA source/module cache, pre-existing artifacts | Unchanged. |
+
+The [project vocabulary](../../../CONCEPTS.md) supplies Client-Requested Model, Upstream Model, CPA Native Plugin, and Plugin Release Package. The [release automation solution](../../solutions/workflow-issues/model-mapper-release-automation-alignment.md) explains the existing VERSION/package boundaries; current Makefile/workflow remains the execution reference.
+
+---
+
+## Acceptance examples
+
+- AE1. Covers R1-R3, R6. Actual CRLF CRLF followed by `{"model":"upstream"}` produces exactly the original whitespace plus `{"model":"client"}` as whole input, split after CRLF CR, every two-way split, and bytewise input. Repeat for `modelVersion` and all LF/CR/CRLF pairs, including mixed pairs.
+- AE2. Covers R1-R4. `{}\n\n1.5 {"model":"upstream"}`, using actual LF bytes, restores the later model for whole, `{}` / two-LF / remaining-input, every two-way, and bytewise writes. Repeat with blank separators attached to the scalar callback, at stream start, after containers, around arrays, and at EOF; preserve every separator and numeric spelling.
+- AE3. Covers R4-R9. The genuine whole SSE event `1.5\n{"model":"upstream"}\ndata: {"model":"upstream"}\n\n` yields exactly `1.5\n{"model":"upstream"}\ndata: {"model":"client"}\n\n`. Permanent number/`true`/`false`/`null`/JSON-string first-field variants with LF, CR and CRLF are baseline GREEN and retain identical repaired assertions; preserve existing scalar partition controls and native-unit priority. Complete raw objects/arrays/prefixes still emit during Write; unresolved numbers wait for boundary/EOF. Existing BOM, buffered `data:` continuation, native Responses, mixed raw-to-SSE, complete-prefix/error, limit, ownership, batching, allocation and lifecycle assertions remain unchanged.
+- AE4. Covers R6, R10, R15. A's five `application/json` helper formats forward the Upstream Model and top-level rewritten request, restore applicable model fields, preserve opaque/token bytes and headers, and close host/plugin. B's generic/Claude event-stream helper and separate RPC/envelope witnesses restore data JSON and emit complete events without waiting for EOF. Keep the unframed `openai` event-stream-header raw control distinct from native evidence.
+- AE5. Covers R11, R15. The rebuilt DLL loaded by pinned CPA restores A's partitioned CRLF container and blank-separated scalar/object sequence on `openai`, and B's unknown-first-line Claude stream through native execution and `/v1/messages`. B uses a complete realistic `message_start` and normal terminal events, preserving unknown lines and opaque content. Both families' whole/specified-split/bytewise native outputs match explicit bytes; B's Claude HTTP additionally matches mature SSE-decoded data. Direct, disabled, enabled-unmapped and ordinary unknown-field controls keep their expected output and calls. At least two focused runs for each family and full integration agree on actual tested library identity, with saved tested copies and loaded PID/path/hash.
+- AE6. Covers R7-R9, R12-R13. Owner and independent reviews complete, all required final-source checks pass without weakened oracles, all old capture keys remain, actual default registration reports `0.0.0-dev`, and a separate artifact reports the selected injected patch. All benchmarks execute; alternating same-process paired classification measurements retain hard ceilings and apply the existing >10% repeated-median explanation/rerun rule. Every failed attempt, platform skip and material remaining correctness-check cost is recorded.
+- AE7. Covers R14. Authorized main/tag publication points to the verified final source. Ubuntu actually runs integration, seven required builds finish, and each downloaded package matches its SHA256 entry, root library/LICENSE, target build info and injected version. Runtime coverage is reported separately from build coverage; task-owned cleanup preserves pre-existing state and lists any remainder.
+- AE8. Covers R5-R10, R15. With generic/Claude SSE configuration, `{` followed by `\nevent: message_start\ndata: {"type":"message_start","message":{"model":"upstream"}}\n\n` emits the complete event during Write with only `message.model` in the data JSON changed to `client`. Whole, split after `{`, every two-way including empty parts, and bytewise input match the explicit event oracle. Include LF/CR/CRLF, necessary `[`/string-shaped unknown-field controls, ordinary unknown-field and pre-established SSE controls. Valid pretty raw input with blank lines/colon-rich members/escaped `data:`-looking opaque strings stays raw; successful first-value Decode keeps a raw prefix before SSE. Flush/Finish produce the same classification, never replay output, and retain genuine incomplete framed raw errors and valid-prefix-plus-error results.
+
+---
+
+## Verification limits
+
+The audit, independent defect verification and baseline checks are complete. Supplied reproductions/prototypes do not complete formal permanent-test TDD or repaired-source acceptance. U3 still requires correction review of these documents for both families, then all planned root/helper/RPC/native/HTTP, performance, registration, capture and delivery gates. The new final verification record is `docs/superpowers/verification/2026-10-24-stream-classification.md`.
+
+No network-security scan or repair, CPA change, paid-provider request, new functionality or unrelated performance campaign is included. Controlled-provider native/HTTP proof does not establish stock-provider behavior or external SDK testing. Seven platform builds do not establish seven platform runtime loads. Publication requires the user's actual authorization; this document and other agents' messages supply none.
