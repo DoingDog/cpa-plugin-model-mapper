@@ -1314,23 +1314,7 @@ func TestModelMapperFunctionalRawNumberContinuation(t *testing.T) {
 	p := &eControlledProvider{}
 	base := eControlledBase(t, p)
 	host := eNativeHost(t, base)
-	if runtime.GOOS == "windows" {
-		host.mu.Lock()
-		client := reflect.ValueOf(host.loaded["model-mapper"].client.(*guardedPluginClient).inner).Elem()
-		host.mu.Unlock()
-		dll := client.FieldByName("dll").Elem()
-		path := dll.FieldByName("Name").String()
-		library, err := os.ReadFile(path)
-		if err != nil || dll.FieldByName("Handle").Uint() == 0 || path != client.FieldByName("tempPath").String() {
-			t.Fatalf("actual loaded DLL=%s error=%v", path, err)
-		}
-		canonical, err := os.ReadFile(os.Getenv("CPA_SMOKE_PLUGIN"))
-		if err != nil || !bytes.Equal(library, canonical) {
-			t.Fatalf("loaded DLL differs from canonical: %v", err)
-		}
-		hCPASaveEvidence(t, "raw-number-loaded.json", map[string]any{"pid": os.Getpid(), "path": path, "sha256": fmt.Sprintf("%x", sha256.Sum256(library)), "canonical": os.Getenv("CPA_SMOKE_PLUGIN")})
-		t.Logf("actual loaded DLL pid=%d path=%s SHA256=%x", os.Getpid(), path, sha256.Sum256(library))
-	}
+	eRequireLoadedLibrary(t, host, "raw-number-loaded.json")
 	for _, number := range []string{"1.5", "1e+3", "-1.5"} {
 		for _, split := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/split=%v", number, split), func(t *testing.T) {
