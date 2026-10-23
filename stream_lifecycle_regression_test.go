@@ -628,6 +628,308 @@ func testFunctionalShutdownPreservesErrors(t *testing.T, inBand, directFails, ov
 	}
 }
 
+func TestFunctionalShutdownPreservesFlushErrorAtBackpressure(t *testing.T) {
+	for _, mode := range []string{"natural", "in-band", "shutdown"} {
+		t.Run(mode, func(t *testing.T) {
+			resetExecutorStreamLifecycle()
+			setLoadedConfigForTest(Config{GlobalRules: "grok-4.6=>grok-4.7"})
+			queue := make(chan []byte, 16)
+			blocked := make(chan []byte, 1)
+			downstreamClosed := make(chan struct{})
+			terminal := make(chan string, 1)
+			shutdownDone := make(chan struct{})
+			var downstreamOnce, shutdownOnce sync.Once
+			var reads, emits atomic.Int32
+			startShutdown := func() {
+				shutdownOnce.Do(func() {
+					go func() { shutdownExecutorStreams(); close(shutdownDone) }()
+				})
+			}
+			t.Cleanup(func() {
+				downstreamOnce.Do(func() { close(downstreamClosed) })
+				startShutdown()
+				select {
+				case <-shutdownDone:
+					resetExecutorStreamLifecycle()
+					setLoadedConfigForTest(defaultConfig())
+				case <-time.After(2 * time.Second):
+					t.Error("shutdown did not return after callback release")
+				}
+			})
+			call := func(method string, payload any) (json.RawMessage, error) {
+				switch method {
+				case pluginabi.MethodHostModelExecuteStream:
+					return json.Marshal(pluginapi.HostModelStreamResponse{StatusCode: 200, StreamID: "host-flush-error", Headers: map[string][]string{"Content-Type": {"text/event-stream"}}})
+				case pluginabi.MethodHostModelStreamRead:
+					n := reads.Add(1)
+					if n <= int32(cap(queue)) {
+						return json.Marshal(pluginapi.HostModelStreamReadResponse{Payload: []byte(`{"model":"grok-4.7"}`)})
+					}
+					if n == int32(cap(queue)+1) {
+						return json.Marshal(pluginapi.HostModelStreamReadResponse{Payload: []byte("1 2 [")})
+					}
+					chunk := pluginapi.HostModelStreamReadResponse{Done: true}
+					if mode == "in-band" {
+						chunk.Error = "primary upstream error"
+					}
+					return json.Marshal(chunk)
+				case pluginabi.MethodHostStreamEmit:
+					emits.Add(1)
+					raw, err := json.Marshal(payload)
+					if err != nil {
+						return nil, err
+					}
+					var emit struct{ Payload []byte }
+					if err := json.Unmarshal(raw, &emit); err != nil {
+						return nil, err
+					}
+					if len(queue) == cap(queue) {
+						blocked <- bytes.Clone(emit.Payload)
+					}
+					select {
+					case queue <- emit.Payload:
+						return json.RawMessage(`{}`), nil
+					case <-downstreamClosed:
+						return nil, errors.New("downstream closed during shutdown")
+					}
+				case pluginabi.MethodHostModelStreamClose:
+					return json.RawMessage(`{}`), nil
+				case pluginabi.MethodHostStreamClose:
+					raw, err := json.Marshal(payload)
+					if err != nil {
+						return nil, err
+					}
+					var closePayload struct{ Error string }
+					if err := json.Unmarshal(raw, &closePayload); err != nil {
+						return nil, err
+					}
+					terminal <- closePayload.Error
+					downstreamOnce.Do(func() { close(downstreamClosed) })
+					return json.RawMessage(`{}`), nil
+				default:
+					return nil, fmt.Errorf("unexpected callback %s", method)
+				}
+			}
+			raw, err := json.Marshal(rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+				Model: "grok-4.6", Format: "claude", SourceFormat: "claude", Stream: true,
+				OriginalRequest: []byte(`{"model":"grok-4.6","stream":true}`),
+			}, StreamID: "plugin-flush-error"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := handleExecutorExecuteStream(raw, call); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case pending := <-blocked:
+				if string(pending) != "data: 1\n\ndata: 2\n\n" || reads.Load() != 18 || emits.Load() != 17 || len(queue) != cap(queue) {
+					t.Fatalf("blocked output=%q reads=%d emits=%d queued=%d", pending, reads.Load(), emits.Load(), len(queue))
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("flush output did not reach full queue")
+			}
+			executorStreamLifecycle.mu.Lock()
+			for stream := range executorStreamLifecycle.active {
+				t.Logf("blocked flush terminalSelected=%v terminalErr=%v", stream.terminalSelected, stream.terminalErr)
+			}
+			executorStreamLifecycle.mu.Unlock()
+			if mode == "natural" {
+				for range cap(queue) {
+					<-queue
+				}
+			} else {
+				startShutdown()
+				select {
+				case <-shutdownDone:
+				case <-time.After(2 * time.Second):
+					t.Fatal("shutdown did not finish")
+				}
+			}
+			select {
+			case got := <-terminal:
+				t.Logf("terminal error=%q", got)
+				want := "flush stream rewriter: incomplete raw JSON stream"
+				if mode == "in-band" {
+					want = "primary upstream error"
+				}
+				if !strings.HasPrefix(got, want) || strings.Contains(got, errExecutorStreamShutdown.Error()) {
+					t.Errorf("terminal error=%q, want known primary %q without generic interruption", got, want)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("terminal close missing")
+			}
+		})
+	}
+}
+
+func TestFunctionalShutdownPreservesPayloadErrorAtBackpressure(t *testing.T) {
+	const wantPrefix = "data: 1\n\ndata: 2\n\n"
+	// 分段预填 pending，最后的小尾段触发真实限额错误并产生完整 scalar prefix。
+	payload := []byte("1 2 data: " + strings.Repeat("x", maxPendingStreamBytes-10))
+	parts := [][]byte{payload[:len(payload)/4], payload[len(payload)/4 : len(payload)/2], payload[len(payload)/2 : 3*len(payload)/4], payload[3*len(payload)/4:], []byte("xxxxxx")}
+	witness := newStreamChunkRewriter("client")
+	witness.format, witness.frameRawJSONAsSSE = "claude", true
+	for _, part := range parts[:len(parts)-1] {
+		if chunks, err := witness.Write(part); err != nil || len(chunks) != 0 {
+			t.Fatalf("real Write setup: output=%q error=%v", chunks, err)
+		}
+	}
+	chunks, rewriteErr := witness.Write(parts[len(parts)-1])
+	if rewriteErr == nil || rewriteErr.Error() != "stream pending data exceeds 16777216 bytes" || string(bytes.Join(chunks, nil)) != wantPrefix {
+		t.Fatalf("real Write witness: output=%q error=%v", chunks, rewriteErr)
+	}
+	for _, mode := range []string{"natural", "in-band", "shutdown"} {
+		t.Run(mode, func(t *testing.T) {
+			resetExecutorStreamLifecycle()
+			setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+			blocked := make(chan []byte, 1)
+			readRequested := make(chan struct{}, len(parts))
+			releaseEmit := make(chan struct{})
+			downstreamClosed := make(chan struct{})
+			terminal := make(chan string, 1)
+			shutdownDone := make(chan struct{})
+			var releaseOnce, downstreamOnce, shutdownOnce sync.Once
+			var reads, emits, hostCloses, pluginCloses atomic.Int32
+			var accepted []byte
+			readRaw := make([]json.RawMessage, len(parts))
+			for n, part := range parts {
+				chunk := pluginapi.HostModelStreamReadResponse{Payload: part}
+				if mode == "in-band" && n == len(parts)-1 {
+					chunk.Error = "primary upstream error"
+				}
+				var err error
+				readRaw[n], err = json.Marshal(chunk)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			startShutdown := func() {
+				shutdownOnce.Do(func() { go func() { shutdownExecutorStreams(); close(shutdownDone) }() })
+			}
+			t.Cleanup(func() {
+				releaseOnce.Do(func() { close(releaseEmit) })
+				startShutdown()
+				select {
+				case <-shutdownDone:
+					resetExecutorStreamLifecycle()
+					setLoadedConfigForTest(defaultConfig())
+				case <-time.After(2 * time.Second):
+					t.Error("shutdown did not return after callback release")
+				}
+			})
+			call := func(method string, request any) (json.RawMessage, error) {
+				switch method {
+				case pluginabi.MethodHostModelExecuteStream:
+					return json.Marshal(pluginapi.HostModelStreamResponse{StatusCode: 200, StreamID: "host-payload-error", Headers: map[string][]string{"Content-Type": {"text/event-stream"}}})
+				case pluginabi.MethodHostModelStreamRead:
+					n := int(reads.Add(1))
+					if n > len(readRaw) {
+						return nil, errors.New("unexpected read after rewrite error")
+					}
+					readRequested <- struct{}{}
+					return readRaw[n-1], nil
+				case pluginabi.MethodHostStreamEmit:
+					emits.Add(1)
+					raw, err := json.Marshal(request)
+					if err != nil {
+						return nil, err
+					}
+					var emit struct{ Payload []byte }
+					if err := json.Unmarshal(raw, &emit); err != nil {
+						return nil, err
+					}
+					blocked <- bytes.Clone(emit.Payload)
+					select {
+					case <-releaseEmit:
+						accepted = bytes.Clone(emit.Payload)
+						return json.RawMessage(`{}`), nil
+					case <-downstreamClosed:
+						return nil, errors.New("downstream closed during shutdown")
+					}
+				case pluginabi.MethodHostModelStreamClose:
+					hostCloses.Add(1)
+					return json.RawMessage(`{}`), nil
+				case pluginabi.MethodHostStreamClose:
+					pluginCloses.Add(1)
+					raw, err := json.Marshal(request)
+					if err != nil {
+						return nil, err
+					}
+					var closePayload struct{ Error string }
+					if err := json.Unmarshal(raw, &closePayload); err != nil {
+						return nil, err
+					}
+					terminal <- closePayload.Error
+					downstreamOnce.Do(func() { close(downstreamClosed) })
+					return json.RawMessage(`{}`), nil
+				default:
+					return nil, fmt.Errorf("unexpected callback %s", method)
+				}
+			}
+			raw, err := json.Marshal(rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+				Model: "client", Format: "claude", SourceFormat: "claude", Stream: true,
+				OriginalRequest: []byte(`{"model":"client","stream":true}`),
+			}, StreamID: "plugin-payload-error"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := handleExecutorExecuteStream(raw, call); err != nil {
+				t.Fatal(err)
+			}
+			for range parts {
+				select {
+				case <-readRequested:
+				case <-time.After(2 * time.Second):
+					t.Fatal("pending payload did not reach the next host read")
+				}
+			}
+			select {
+			case prefix := <-blocked:
+				if string(prefix) != wantPrefix {
+					t.Fatalf("completed prefix=%q, want %q", prefix, wantPrefix)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("rewrite-error output did not reach blocked emission")
+			}
+			if mode == "natural" {
+				releaseOnce.Do(func() { close(releaseEmit) })
+			} else {
+				startShutdown()
+				select {
+				case <-shutdownDone:
+				case <-time.After(2 * time.Second):
+					t.Fatal("shutdown waits on rewrite-error emission")
+				}
+			}
+			select {
+			case got := <-terminal:
+				want := "rewrite stream chunk: stream pending data exceeds 16777216 bytes"
+				if mode == "in-band" {
+					want = "primary upstream error"
+				}
+				if !strings.HasPrefix(got, want) || strings.Contains(got, errExecutorStreamShutdown.Error()) {
+					t.Errorf("terminal error=%q, want known primary %q without generic interruption", got, want)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("terminal close missing")
+			}
+			startShutdown()
+			select {
+			case <-shutdownDone:
+			case <-time.After(2 * time.Second):
+				t.Fatal("shutdown did not finish")
+			}
+			wantAccepted := ""
+			if mode == "natural" {
+				wantAccepted = wantPrefix
+			}
+			if string(accepted) != wantAccepted || reads.Load() != int32(len(parts)) || emits.Load() != 1 || hostCloses.Load() != 1 || pluginCloses.Load() != 1 || len(terminal) != 0 {
+				t.Errorf("accepted=%q reads=%d emits=%d closes=%d/%d extra terminal=%d", accepted, reads.Load(), emits.Load(), hostCloses.Load(), pluginCloses.Load(), len(terminal))
+			}
+		})
+	}
+}
+
 func TestFunctionalShutdownPreservesInBandErrorAtBackpressure(t *testing.T) {
 	for _, directFails := range []bool{false, true} {
 		t.Run(fmt.Sprintf("direct-fails=%v", directFails), func(t *testing.T) {

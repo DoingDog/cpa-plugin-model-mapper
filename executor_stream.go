@@ -361,6 +361,7 @@ func (s *executorStream) processPayload(rewriter *streamChunkRewriter, payload [
 	chunks, rewriteErr := rewriter.Write(payload)
 	if rewriteErr != nil {
 		rewriteErr = fmt.Errorf("rewrite stream chunk: %w", rewriteErr)
+		s.selectTerminal(rewriteErr, false)
 	}
 	emitErr := emitRewritten(chunks, rewriter.batchSSEOutput, s.emit)
 	if emitErr != nil {
@@ -382,6 +383,7 @@ func (s *executorStream) flushAndEmit(rewriter *streamChunkRewriter, cleanComple
 	}
 	if err != nil {
 		err = fmt.Errorf("flush stream rewriter: %w", err)
+		s.selectTerminal(err, false)
 	}
 	if rewriter.emitFailed {
 		return err

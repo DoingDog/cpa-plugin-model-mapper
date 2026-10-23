@@ -742,6 +742,111 @@ func TestModelMapperFunctionalNativeUnload(t *testing.T) {
 	}
 }
 
+func TestModelMapperFunctionalNativeFlushErrorAtBackpressure(t *testing.T) {
+	for _, mode := range []string{"natural", "in-band", "shutdown"} {
+		t.Run(mode, func(t *testing.T) {
+			input := make(chan handlers.ModelExecutionChunk, streamBridgeBufferSize+3)
+			for i := 0; i < streamBridgeBufferSize+1; i++ {
+				input <- handlers.ModelExecutionChunk{Payload: []byte(fmt.Sprintf(`{"model":"grok-4.7","index":%d}`, i))}
+			}
+			input <- handlers.ModelExecutionChunk{Payload: []byte("1 2 [")}
+			if mode == "in-band" {
+				input <- handlers.ModelExecutionChunk{Err: &handlers.ModelExecutionStreamError{StatusCode: 502, Message: "primary upstream error"}}
+			}
+			close(input)
+			executor := &fakeHostModelExecutor{executeModelStream: func(_ context.Context, req handlers.ModelExecutionRequest) (handlers.ModelExecutionStream, *interfaces.ErrorMessage) {
+				if req.Model != "grok-4.7" || req.EntryProtocol != "claude" || req.ExitProtocol != "claude" {
+					t.Errorf("upstream request=%+v", req)
+				}
+				return handlers.ModelExecutionStream{StatusCode: 200, Headers: http.Header{"Content-Type": {"text/event-stream"}}, Chunks: input}, nil
+			}}
+			host := eNativeHost(t, executor)
+			if runtime.GOOS == "windows" {
+				host.mu.Lock()
+				client := reflect.ValueOf(host.loaded["model-mapper"].client.(*guardedPluginClient).inner).Elem()
+				host.mu.Unlock()
+				dll := client.FieldByName("dll").Elem()
+				path := dll.FieldByName("Name").String()
+				library, err := os.ReadFile(path)
+				if err != nil || dll.FieldByName("Handle").Uint() == 0 || path != client.FieldByName("tempPath").String() {
+					t.Fatalf("actual loaded DLL=%s error=%v", path, err)
+				}
+				canonical, err := os.ReadFile(os.Getenv("CPA_SMOKE_PLUGIN"))
+				if err != nil || !bytes.Equal(library, canonical) {
+					t.Fatalf("loaded DLL differs from canonical: %v", err)
+				}
+				hCPASaveEvidence(t, "flush-loaded-"+mode+".json", map[string]any{"pid": os.Getpid(), "path": path, "sha256": fmt.Sprintf("%x", sha256.Sum256(library)), "canonical": os.Getenv("CPA_SMOKE_PLUGIN")})
+				t.Logf("actual loaded DLL pid=%d path=%s SHA256=%x", os.Getpid(), path, sha256.Sum256(library))
+			}
+			result, err := host.activeRecords()[0].plugin.Capabilities.Executor.ExecuteStream(context.Background(), eNativeRequest("grok-4.6", "claude", true))
+			if err != nil {
+				t.Fatal(err)
+			}
+			unloadDone := make(chan bool, 1)
+			launched, finished := false, false
+			startUnload := func() {
+				if !launched {
+					launched = true
+					go func() { unloadDone <- host.UnloadPlugin("model-mapper") }()
+				}
+			}
+			t.Cleanup(func() {
+				startUnload()
+				if !finished {
+					go func() {
+						for range result.Chunks {
+						}
+					}()
+					select {
+					case <-unloadDone:
+					case <-time.After(10 * time.Second):
+						t.Error("first unload did not finish during teardown")
+					}
+				}
+			})
+			waitFunctionalNativeEmitBlocked(t)
+			host.modelStreams.mu.Lock()
+			upstreamRemaining := len(host.modelStreams.streams)
+			host.modelStreams.mu.Unlock()
+			if len(input) != 0 || upstreamRemaining != 0 {
+				t.Fatalf("blocked before terminal read: queued source=%d host model streams=%d", len(input), upstreamRemaining)
+			}
+			t.Logf("actual bridge emit blocked after %d raw JSON units, tail consumed and terminal read completed", streamBridgeBufferSize+1)
+			if mode != "natural" {
+				startUnload()
+				select {
+				case ok := <-unloadDone:
+					finished = true
+					if !ok {
+						t.Fatal("first unload returned false")
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("unload did not return")
+				}
+			}
+			raw, errs := eNativeDrain(t, result.Chunks)
+			t.Logf("consumer errors=%q output bytes=%d", errs, len(raw))
+			want := "flush stream rewriter: incomplete raw JSON stream"
+			if mode == "in-band" {
+				want = "primary upstream error"
+			}
+			if len(errs) != 1 || !strings.HasPrefix(errs[0], want) || strings.Contains(errs[0], "executor stream interrupted during shutdown") {
+				t.Errorf("consumer errors=%q, want known primary %q without generic interruption", errs, want)
+			}
+			var prefix bytes.Buffer
+			for i := 0; i < streamBridgeBufferSize+1; i++ {
+				fmt.Fprintf(&prefix, "data: {\"model\":\"grok-4.6\",\"index\":%d}\n\n", i)
+			}
+			if mode == "natural" {
+				prefix.WriteString("data: 1\n\ndata: 2\n\n")
+			}
+			if !bytes.Equal(raw, prefix.Bytes()) {
+				t.Errorf("consumer output=%q, want %q", raw, prefix.Bytes())
+			}
+		})
+	}
+}
+
 func TestModelMapperFunctionalNativeRequestDuplicates(t *testing.T) {
 	const input = `{"model":"grok-4.6","messages":[{"role":"user","content":"first"}],"model":"grok-4.6","messages":[{"role":"user","content":"second"}]}`
 	const want = `{"model":"grok-4.7","messages":[{"role":"user","content":"first"}],"messages":[{"role":"user","content":"second"}]}`
