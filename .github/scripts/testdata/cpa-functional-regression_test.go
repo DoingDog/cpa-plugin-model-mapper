@@ -913,6 +913,27 @@ func TestModelMapperFunctionalNativeProtocolAndErrors(t *testing.T) {
 	}
 }
 
+func eRequireLoadedLibrary(t *testing.T, host *Host, evidenceName string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		host.mu.Lock()
+		client := reflect.ValueOf(host.loaded["model-mapper"].client.(*guardedPluginClient).inner).Elem()
+		host.mu.Unlock()
+		dll := client.FieldByName("dll").Elem()
+		path := dll.FieldByName("Name").String()
+		library, err := os.ReadFile(path)
+		if err != nil || dll.FieldByName("Handle").Uint() == 0 || path != client.FieldByName("tempPath").String() {
+			t.Fatalf("actual loaded DLL=%s error=%v", path, err)
+		}
+		canonical, err := os.ReadFile(os.Getenv("CPA_SMOKE_PLUGIN"))
+		if err != nil || !bytes.Equal(library, canonical) {
+			t.Fatalf("loaded DLL differs from canonical: %v", err)
+		}
+		hCPASaveEvidence(t, evidenceName, map[string]any{"pid": os.Getpid(), "path": path, "sha256": fmt.Sprintf("%x", sha256.Sum256(library)), "canonical": os.Getenv("CPA_SMOKE_PLUGIN")})
+		t.Logf("actual loaded DLL pid=%d path=%s SHA256=%x", os.Getpid(), path, sha256.Sum256(library))
+	}
+}
+
 // 仅替代外部 provider 的输出；native ABI、validator 和 HTTP/WS 消费者保持实际实现。
 type ePrettyJSONEmptyHeaderProvider struct{ *eControlledProvider }
 
@@ -939,23 +960,7 @@ func TestModelMapperFunctionalResponsesRawPrettyJSON(t *testing.T) {
 	base := eControlledBase(t, provider)
 	base.AuthManager.RegisterExecutor(&ePrettyJSONEmptyHeaderProvider{provider})
 	host := eNativeHost(t, base)
-	if runtime.GOOS == "windows" {
-		host.mu.Lock()
-		client := reflect.ValueOf(host.loaded["model-mapper"].client.(*guardedPluginClient).inner).Elem()
-		host.mu.Unlock()
-		dll := client.FieldByName("dll").Elem()
-		path := dll.FieldByName("Name").String()
-		library, err := os.ReadFile(path)
-		if err != nil || dll.FieldByName("Handle").Uint() == 0 || path != client.FieldByName("tempPath").String() {
-			t.Fatalf("actual loaded DLL=%s error=%v", path, err)
-		}
-		canonical, err := os.ReadFile(os.Getenv("CPA_SMOKE_PLUGIN"))
-		if err != nil || !bytes.Equal(library, canonical) {
-			t.Fatalf("loaded DLL differs from canonical: %v", err)
-		}
-		hCPASaveEvidence(t, "responses-raw-pretty-loaded.json", map[string]any{"pid": os.Getpid(), "path": path, "sha256": fmt.Sprintf("%x", sha256.Sum256(library)), "canonical": os.Getenv("CPA_SMOKE_PLUGIN")})
-		t.Logf("actual loaded DLL pid=%d path=%s SHA256=%x", os.Getpid(), path, sha256.Sum256(library))
-	}
+	eRequireLoadedLibrary(t, host, "responses-raw-pretty-loaded.json")
 	for _, shape := range []struct {
 		name, body, want, output string
 	}{
