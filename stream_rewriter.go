@@ -19,6 +19,7 @@ type streamChunkRewriter struct {
 	rawJSONBoundary   bool
 	sse               *sseRewriter
 	pending           []byte
+	pendingWhitespace bool
 	rawJSONArray      bool
 	rawScan           rawJSONScan
 }
@@ -29,6 +30,37 @@ type rawJSONScan struct {
 	depth    int
 	inString bool
 	escaped  bool
+	lineFrom int
+	lineScan int
+}
+
+func (s *rawJSONScan) rejectsRawJSON(p []byte, eof bool) bool {
+	for {
+		// 多字节片段无换行时跳过行扫描，单个字节 callback 不增加搜索。
+		if !eof && len(p)-s.lineScan > 1 && bytes.IndexAny(p[s.lineScan:], "\r\n") < 0 {
+			s.lineScan = len(p)
+			return false
+		}
+		end, n, next := sseLineEnding(p, s.lineScan, eof)
+		if n == 0 && !eof {
+			s.lineScan = next
+			return false
+		}
+		if n == 0 {
+			end = len(p)
+		}
+		line := bytes.TrimLeft(p[s.lineFrom:end], " \t")
+		s.lineFrom, s.lineScan = end+n, end+n
+		// JSON 成员的逗号、冒号和闭括号行不提供 SSE field 证据。
+		if len(line) > 0 && line[0] != ',' && line[0] != ':' && line[0] != '}' && line[0] != ']' && !couldStartJSONValue(line) && hasSSEFieldPrefix(line) {
+			var value json.RawMessage
+			_, invalid := json.NewDecoder(bytes.NewReader(p)).Decode(&value).(*json.SyntaxError)
+			return invalid
+		}
+		if n == 0 || s.lineFrom == len(p) {
+			return false
+		}
+	}
 }
 
 func (s *rawJSONScan) advance(p []byte) bool {
@@ -68,6 +100,7 @@ func newStreamChunkRewriter(originalModel string) *streamChunkRewriter {
 
 func (r *streamChunkRewriter) retainPending(p []byte) error {
 	r.rawScan = rawJSONScan{}
+	r.pendingWhitespace = false
 	incompleteBytes := len(p)
 	if incompleteBytes > maxPendingStreamBytes && r.frameRawJSONAsSSE && couldStartJSONValue(p) {
 		_, consumed, ok, _ := splitJSONValues(p, false, false)
@@ -82,6 +115,7 @@ func (r *streamChunkRewriter) retainPending(p []byte) error {
 	}
 	r.pending = bytes.Clone(p)
 	start := skipTopLevelModelJSONSpace(r.pending, 0)
+	r.pendingWhitespace = !r.sse.started && start == len(r.pending)
 	if start < len(r.pending) && (r.pending[start] == '{' || r.pending[start] == '[' || r.pending[start] == '"') {
 		scan := rawJSONScan{active: true, scanFrom: start}
 		if !scan.advance(r.pending) {
@@ -106,8 +140,25 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 			return nil, nil
 		}
 	}
+	if r.pendingWhitespace {
+		if skipTopLevelModelJSONSpace(p, 0) == len(p) {
+			if len(p) > maxPendingStreamBytes-len(r.pending) {
+				r.pending, r.pendingWhitespace = nil, false
+				return nil, fmt.Errorf("stream pending data exceeds %d bytes", maxPendingStreamBytes)
+			}
+			r.pending = append(r.pending, p...)
+			return nil, nil
+		}
+		r.pendingWhitespace = false
+	}
 	if r.rawScan.active {
 		r.pending = append(r.pending, p...)
+		if !r.rawJSONArray && r.rawScan.rejectsRawJSON(r.pending, false) {
+			p, r.pending = r.pending, nil
+			r.rawScan = rawJSONScan{}
+			r.batchSSEOutput = true
+			return r.writeSSESuffix(p)
+		}
 		if !r.rawScan.advance(r.pending) {
 			if len(r.pending) > maxPendingStreamBytes {
 				r.pending = nil
@@ -137,6 +188,9 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 		return r.writeRawJSONArray(p, false)
 	}
 	start := skipTopLevelModelJSONSpace(p, 0)
+	if !r.sse.started && start == len(p) {
+		return nil, r.retainPending(p)
+	}
 	if !r.frameRawJSONAsSSE && start < len(p) && p[start] == '[' {
 		return r.writeRawJSONArray(p, true)
 	}
@@ -156,7 +210,12 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 	}
 	trimmed := bytes.TrimSpace(p)
 	if len(trimmed) > 0 && trimmed[0] != '{' && trimmed[0] != '[' && couldStartJSONValue(p) {
-		if r.sse.started || isSSEChunk(p) {
+		sseChunk := isSSEChunk(p)
+		if sseChunk && !r.frameRawJSONAsSSE && !r.sse.started {
+			_, consumed, ok, incomplete := splitJSONValues(p, false, false)
+			sseChunk = !incomplete && (!ok || consumed < len(p))
+		}
+		if r.sse.started || sseChunk {
 			if r.frameRawJSONAsSSE && len(p) > maxPendingStreamBytes {
 				// 完整 scalar 转为 SSE unknown field 后仍不计入未完成 suffix 限额。
 				_, r.sse.rawJSONPrefix, _, _ = splitJSONValues(p, false, false)
@@ -193,6 +252,11 @@ func (r *streamChunkRewriter) Write(p []byte) ([][]byte, error) {
 			return chunks, nil
 		}
 		if incomplete {
+			scan := rawJSONScan{}
+			if scan.rejectsRawJSON(p, false) {
+				r.batchSSEOutput = true
+				return r.sse.Write(p)
+			}
 			if err := r.retainPending(p); err != nil {
 				return nil, err
 			}
@@ -307,7 +371,7 @@ func (r *streamChunkRewriter) writeRawJSONArray(p []byte, opening bool) ([][]byt
 }
 
 func (r *streamChunkRewriter) writeSSESuffix(p []byte) ([][]byte, error) {
-	if r.frameRawJSONAsSSE {
+	if r.frameRawJSONAsSSE && r.rawJSONBoundary {
 		p = bytes.TrimLeft(p, " \t\r\n")
 	}
 	r.rawJSONBoundary = false
@@ -482,6 +546,15 @@ func splitJSONValues(p []byte, framed, eof bool) ([][]byte, int, bool, bool) {
 			if err == io.ErrUnexpectedEOF {
 				return values, consumed, len(values) > 0, true
 			}
+			if len(values) > 0 && start < len(suffix) && (suffix[start] == '{' || suffix[start] == '[' || suffix[start] == '"') {
+				scan := rawJSONScan{}
+				if scan.rejectsRawJSON(suffix, true) {
+					return values, consumed, true, false
+				}
+				if !eof {
+					return values, consumed, true, true
+				}
+			}
 			if len(values) > 0 && start < len(suffix) && suffix[start] != '{' && suffix[start] != '[' && (isSSEChunk(suffix) || isIncompleteSSEPrefix(suffix)) {
 				return splitBeforeSSESuffix(start)
 			}
@@ -503,6 +576,8 @@ func splitJSONValues(p []byte, framed, eof bool) ([][]byte, int, bool, bool) {
 
 func (r *streamChunkRewriter) Flush() ([][]byte, error) {
 	r.batchSSEOutput = r.frameRawJSONAsSSE
+	r.pendingWhitespace = false
+	pendingSSE := r.rawScan.active && !r.rawJSONArray && r.rawScan.rejectsRawJSON(r.pending, true)
 	r.rawScan = rawJSONScan{}
 	if r.rawJSONArray {
 		r.rawJSONArray = false
@@ -518,13 +593,17 @@ func (r *streamChunkRewriter) Flush() ([][]byte, error) {
 		pending := append([]byte(nil), r.pending...)
 		r.pending = nil
 		start := skipTopLevelModelJSONSpace(pending, 0)
-		if couldStartJSONValue(pending) && (pending[start] == '{' || pending[start] == '[' || !isSSEChunk(pending)) {
+		if !pendingSSE && couldStartJSONValue(pending) && (pending[start] == '{' || pending[start] == '[' || !isSSEChunk(pending)) {
 			chunks, err := r.rawJSONChunks(pending)
 			flushed, flushErr := r.sse.Flush()
 			return append(chunks, flushed...), joinStreamErrors(err, flushErr)
 		}
 		r.batchSSEOutput = true
-		chunks, err := r.sse.Write(pending)
+		write := r.sse.Write
+		if pendingSSE {
+			write = r.writeSSESuffix
+		}
+		chunks, err := write(pending)
 		flushed, flushErr := r.sse.Flush()
 		return append(chunks, flushed...), joinStreamErrors(err, flushErr)
 	}

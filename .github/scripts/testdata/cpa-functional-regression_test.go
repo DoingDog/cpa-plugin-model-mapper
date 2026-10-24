@@ -945,6 +945,71 @@ func TestModelMapperFunctionalNativeFormatsAndHeaders(t *testing.T) {
 }
 
 func TestModelMapperFunctionalNativeProtocolAndErrors(t *testing.T) {
+	for _, field := range []string{"{", "x-vendor-field"} {
+		for _, split := range []int{0, 1, -1} {
+			t.Run(fmt.Sprintf("classification-claude/field=%s/split=%d", field, split), func(t *testing.T) {
+				start := field + "\nevent: message_start\ndata: " + eClaudeClassificationStart + "\n\n"
+				wantStart := strings.Replace(start, `"model":"grok-4.7"`, `"model":"grok-4.6"`, 1)
+				parts := eClassificationParts([]byte(start), split)
+				source := make(chan handlers.ModelExecutionChunk, len(parts)+2)
+				for _, part := range parts {
+					source <- handlers.ModelExecutionChunk{Payload: part}
+				}
+				calls := 0
+				executor := &fakeHostModelExecutor{executeModelStream: func(_ context.Context, req handlers.ModelExecutionRequest) (handlers.ModelExecutionStream, *interfaces.ErrorMessage) {
+					calls++
+					if req.Model != "grok-4.7" || string(req.Body) != `{"model":"grok-4.7","stream":true}` || req.EntryProtocol != "claude" || req.ExitProtocol != "claude" {
+						t.Errorf("upstream=%+v", req)
+					}
+					return handlers.ModelExecutionStream{StatusCode: 200, Headers: http.Header{"Content-Type": {"text/event-stream"}}, Chunks: source}, nil
+				}}
+				host := eNativeHost(t, executor)
+				closed := false
+				t.Cleanup(func() {
+					if !closed {
+						close(source)
+					}
+				})
+				eRequireLoadedLibrary(t, host, fmt.Sprintf("classification-claude-%s-%d-loaded.json", field, split))
+				result, err := host.activeRecords()[0].plugin.Capabilities.Executor.ExecuteStream(context.Background(), eNativeRequest("grok-4.6", "claude", true))
+				if err != nil {
+					t.Fatal(err)
+				}
+				var before []byte
+				deadline := time.After(2 * time.Second)
+				for len(before) < len(wantStart) {
+					select {
+					case chunk, ok := <-result.Chunks:
+						if !ok || chunk.Err != nil {
+							t.Fatalf("start closed=%v error=%v", !ok, chunk.Err)
+						}
+						before = append(before, chunk.Payload...)
+					case <-deadline:
+						t.Fatal("complete start event waited for upstream EOF")
+					}
+				}
+				if string(before) != wantStart {
+					t.Fatalf("start=%q want=%q", before, wantStart)
+				}
+				source <- handlers.ModelExecutionChunk{Payload: []byte(eClaudeClassificationTail)}
+				close(source)
+				closed = true
+				tail, errs := eNativeDrain(t, result.Chunks)
+				if string(tail) != eClaudeClassificationTail || len(errs) != 0 || calls != 1 {
+					t.Fatalf("tail=%q errors=%v calls=%d", tail, errs, calls)
+				}
+				host.modelStreams.mu.Lock()
+				upstream := len(host.modelStreams.streams)
+				host.modelStreams.mu.Unlock()
+				host.streams.mu.Lock()
+				downstream := len(host.streams.streams)
+				host.streams.mu.Unlock()
+				if upstream != 0 || downstream != 0 {
+					t.Fatalf("open stream counts=%d/%d", upstream, downstream)
+				}
+			})
+		}
+	}
 	var parts [][]byte
 	var terminal *handlers.ModelExecutionStreamError
 	var calls int
@@ -964,6 +1029,7 @@ func TestModelMapperFunctionalNativeProtocolAndErrors(t *testing.T) {
 		return handlers.ModelExecutionStream{StatusCode: 200, Headers: http.Header{"Content-Type": {"text/event-stream; charset=utf-8"}}, Chunks: chunks}, nil
 	}}
 	host := eNativeHost(t, executor)
+	eRequireLoadedLibrary(t, host, "classification-native-eof-loaded.json")
 	mixed := []byte(`{"type":"response.created","response":{"model":"grok-4.7"}}` + "\n" + `{"type":"response.in_progress","response":{"model":"grok-4.7"}}` + "\n\n" + "event: response.completed\ndata: " + `{"type":"response.completed","response":{"model":"grok-4.7"}}` + "\n\n")
 	// F11 固定 220 字节输入使用原 upstream 值，不改变输入规模。
 	mixed = []byte(strings.ReplaceAll(string(mixed), "grok-4.7", "upstream"))
@@ -978,6 +1044,9 @@ func TestModelMapperFunctionalNativeProtocolAndErrors(t *testing.T) {
 	}{
 		{"F11-mixed", "openai-response", [][]byte{mixed}, []byte("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"model\":\"grok-4.6\"}}\n\nevent: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{\"model\":\"grok-4.6\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"grok-4.6\"}}\n\n"), ""},
 		{"F14-split", "openai-response", [][]byte{[]byte("x-vendor-field\nd"), []byte("ata: {\"model\":\"upstream\"}\n\n")}, []byte("x-vendor-field\ndata: {\"model\":\"grok-4.6\"}\n\n"), ""},
+		{"classification-claude-whole", "claude", eClassificationParts([]byte("{\nevent: message_start\ndata: "+eClaudeClassificationStart+"\n\n"+eClaudeClassificationTail), 0), []byte("{\nevent: message_start\ndata: " + strings.Replace(eClaudeClassificationStart, `"model":"grok-4.7"`, `"model":"grok-4.6"`, 1) + "\n\n" + eClaudeClassificationTail), ""},
+		{"classification-claude-split", "claude", eClassificationParts([]byte("{\nevent: message_start\ndata: "+eClaudeClassificationStart+"\n\n"+eClaudeClassificationTail), 1), []byte("{\nevent: message_start\ndata: " + strings.Replace(eClaudeClassificationStart, `"model":"grok-4.7"`, `"model":"grok-4.6"`, 1) + "\n\n" + eClaudeClassificationTail), ""},
+		{"classification-claude-bytewise", "claude", eClassificationParts([]byte("{\nevent: message_start\ndata: "+eClaudeClassificationStart+"\n\n"+eClaudeClassificationTail), -1), []byte("{\nevent: message_start\ndata: " + strings.Replace(eClaudeClassificationStart, `"model":"grok-4.7"`, `"model":"grok-4.6"`, 1) + "\n\n" + eClaudeClassificationTail), ""},
 		{"claude-unknown-fields", "claude", [][]byte{[]byte("true\nfalse\nnull\n123\nevent: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"grok-4.7\"},\"opaque\":\"grok-4.7\"}\n\n")}, []byte("true\nfalse\nnull\n123\nevent: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"grok-4.6\"},\"opaque\":\"grok-4.7\"}\n\n"), ""},
 		{"gemini-raw-array", "gemini", [][]byte{[]byte(`[{"modelVersion":"grok-4.7","candidates":[{"content":{"model":"grok-4.7","text":"工具"}}]}]`)}, []byte(`[{"modelVersion":"grok-4.6","candidates":[{"content":{"model":"grok-4.7","text":"工具"}}]}]`), ""},
 		{"terminal-error", "openai-response", [][]byte{[]byte("event: response.completed\ndata: " + gCPACompleted + "\n\n")}, []byte("event: response.completed\ndata: " + strings.Replace(gCPACompleted, `"model":"grok-4.7"`, `"model":"grok-4.6"`, 1) + "\n\n"), "probe upstream error"},
@@ -1475,7 +1544,87 @@ func TestModelMapperFunctionalRawNumberContinuation(t *testing.T) {
 			})
 		}
 	}
+	for _, witness := range []struct {
+		name, input, want string
+		split             int
+	}{
+		{"document", "\r\n\r\n{\"model\":\"grok-4.7\"}", "\r\n\r\n{\"model\":\"grok-4.6\"}", 3},
+		{"sequence", "{}\n\n1.5 {\"model\":\"grok-4.7\"}", "{}\n\n1.5 {\"model\":\"grok-4.6\"}", 4},
+	} {
+		for _, split := range []int{0, witness.split, -1} {
+			for _, route := range []string{"direct", "disabled", "enabled-unmapped", "mapped-native"} {
+				t.Run(fmt.Sprintf("classification/%s/split=%d/%s", witness.name, split, route), func(t *testing.T) {
+					p.parts, p.calls = eClassificationParts([]byte(witness.input), split), nil
+					base.SetPluginHost(nil)
+					base.SetModelRouterHost(nil)
+					model, want := "grok-4.7", witness.input
+					upstreamModel := "grok-4.7"
+					if route == "disabled" {
+						model, upstreamModel = "grok-4.6", "grok-4.6"
+						disabled := gCPALoadNative(t, &gCPALocalProducer{base: base}, false)
+						base.SetPluginHost(disabled)
+						base.SetModelRouterHost(disabled)
+					}
+					if route == "enabled-unmapped" || route == "mapped-native" {
+						base.SetPluginHost(host)
+						base.SetModelRouterHost(host)
+					}
+					if route == "mapped-native" {
+						model, want = "grok-4.6", witness.want
+					}
+					result, msg := base.ExecuteModelStream(context.Background(), handlers.ModelExecutionRequest{EntryProtocol: format, ExitProtocol: format, Model: model, Stream: true, Body: []byte(fmt.Sprintf(`{"model":%q,"stream":true}`, model))})
+					if msg != nil {
+						t.Fatal(msg.Error)
+					}
+					var raw []byte
+					for chunk := range result.Chunks {
+						if chunk.Err != nil {
+							t.Fatal(chunk.Err)
+						}
+						raw = append(raw, chunk.Payload...)
+					}
+					if string(raw) != want || len(p.calls) != 1 || p.calls[0].Model != upstreamModel || string(p.calls[0].Payload) != fmt.Sprintf(`{"model":%q,"stream":true}`, upstreamModel) {
+						t.Fatalf("output=%q want=%q calls=%+v", raw, want, p.calls)
+					}
+				})
+			}
+		}
+	}
+	// 两个独立空行和附着在 scalar callback 上的空行均保留原字节。
+	for _, parts := range [][][]byte{
+		{[]byte("{}"), []byte("\n\n"), []byte(`1.5 {"model":"grok-4.7"}`)},
+		{[]byte("{}"), []byte("\n\n1.5 {\"model\":\"grok-4.7\"}")},
+	} {
+		t.Run(fmt.Sprintf("classification/attached/parts=%d", len(parts)), func(t *testing.T) {
+			p.parts, p.calls = parts, nil
+			result, err := host.activeRecords()[0].plugin.Capabilities.Executor.ExecuteStream(context.Background(), eNativeRequest("grok-4.6", format, true))
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, errs := eNativeDrain(t, result.Chunks)
+			if string(raw) != "{}\n\n1.5 {\"model\":\"grok-4.6\"}" || len(errs) != 0 || len(p.calls) != 1 {
+				t.Fatalf("output=%q errors=%v calls=%+v", raw, errs, p.calls)
+			}
+		})
+	}
 }
+
+func eClassificationParts(input []byte, split int) [][]byte {
+	if split > 0 {
+		return [][]byte{input[:split], input[split:]}
+	}
+	if split == 0 {
+		return [][]byte{input}
+	}
+	parts := make([][]byte, len(input))
+	for i := range input {
+		parts[i] = input[i : i+1]
+	}
+	return parts
+}
+
+const eClaudeClassificationStart = `{"type":"message_start","message":{"id":"msg-classification","type":"message","role":"assistant","model":"grok-4.7","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":7,"output_tokens":0}},"opaque":{"model":"grok-4.7","text":"data: upstream 中文"}}`
+const eClaudeClassificationTail = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 
 func TestModelMapperFunctionalMetadataBuiltin(t *testing.T) {
 	for _, name := range []string{"xai", "codex"} {
@@ -1689,6 +1838,54 @@ func TestModelMapperFunctionalProtocolHTTP(t *testing.T) {
 	router.POST("/v1beta/interactions", gemini.Interactions)
 	server := httptest.NewServer(router)
 	t.Cleanup(server.Close)
+	eRequireLoadedLibrary(t, host, "classification-http-loaded.json")
+	for _, field := range []string{"{", "x-vendor-field"} {
+		for _, split := range []int{0, 1, -1} {
+			for _, route := range []string{"direct", "disabled", "enabled-unmapped", "mapped"} {
+				t.Run(fmt.Sprintf("classification-claude/field=%s/split=%d/%s", field, split, route), func(t *testing.T) {
+					base.SetPluginHost(nil)
+					base.SetModelRouterHost(nil)
+					model, outputModel, upstreamModel := "grok-4.7", "grok-4.7", "grok-4.7"
+					if route == "disabled" {
+						model, upstreamModel = "grok-4.6", "grok-4.6"
+						disabled := gCPALoadNative(t, &gCPALocalProducer{base: base}, false)
+						base.SetPluginHost(disabled)
+						base.SetModelRouterHost(disabled)
+					}
+					if route == "enabled-unmapped" || route == "mapped" {
+						base.SetPluginHost(host)
+						base.SetModelRouterHost(host)
+					}
+					if route == "mapped" {
+						model, outputModel = "grok-4.6", "grok-4.6"
+					}
+					wire := field + "\nevent: message_start\ndata: " + eClaudeClassificationStart + "\n\n" + eClaudeClassificationTail
+					p.parts, p.calls = eClassificationParts([]byte(wire), split), nil
+					body := []byte(fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hello"}],"max_tokens":10,"stream":true}`, model))
+					status, headers, raw := eHTTP(t, server, "/v1/messages", body)
+					want := strings.Replace(wire, `"model":"grok-4.7"`, `"model":"`+outputModel+`"`, 1)
+					if status != 200 || !strings.HasPrefix(headers.Get("Content-Type"), "text/event-stream") || string(raw) != want || len(p.calls) != 1 || p.calls[0].Model != upstreamModel || gjson.GetBytes(p.calls[0].Payload, "model").String() != upstreamModel || !gjson.GetBytes(p.calls[0].Payload, "stream").Bool() {
+						t.Fatalf("HTTP status=%d headers=%v wire=%q want=%q calls=%+v", status, headers, raw, want, p.calls)
+					}
+					events, err := sse.Decode(bytes.NewReader(raw))
+					if err != nil || len(events) != 3 {
+						t.Fatalf("decoded events=%+v error=%v", events, err)
+					}
+					for i, name := range []string{"message_start", "message_delta", "message_stop"} {
+						data, ok := events[i].Data.(string)
+						if !ok || events[i].Event != name || gjson.Get(data, "type").String() != name {
+							t.Fatalf("event=%+v", events[i])
+						}
+						if i == 0 && (gjson.Get(data, "message.model").String() != outputModel || gjson.Get(data, "opaque.model").String() != "grok-4.7") {
+							t.Fatalf("start=%s", data)
+						}
+					}
+				})
+			}
+		}
+	}
+	base.SetPluginHost(host)
+	base.SetModelRouterHost(host)
 	for _, model := range []string{"grok-4.6", "grok-4.7"} {
 		t.Run(model, func(t *testing.T) {
 			for _, stream := range []bool{false, true} {

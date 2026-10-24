@@ -5,12 +5,497 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	pluginabi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	pluginapi "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
+
+func TestEstablishedSSEWhitespaceContinuation(t *testing.T) {
+	for _, format := range []string{"", "claude"} {
+		for _, size := range []int{2, maxPendingStreamBytes} {
+			t.Run(fmt.Sprintf("%s/bytes=%d", format, size), func(t *testing.T) {
+				r := newStreamChunkRewriter("client")
+				r.format, r.frameRawJSONAsSSE = format, true
+				if chunks, err := r.Write([]byte("data: {}\n\n")); err != nil || string(bytes.Join(chunks, nil)) != "data: {}\n\n" {
+					t.Fatalf("initial SSE Write=(%q,%v)", chunks, err)
+				}
+				if chunks, err := r.Write([]byte(" ")); err != nil || len(chunks) != 0 {
+					t.Fatalf("partial field Write=(%q,%v)", chunks, err)
+				}
+				input := bytes.Repeat([]byte{'\n'}, size)
+				want := append([]byte(" "), input...)
+				chunks, err := r.Write(input)
+				if got := bytes.Join(chunks, nil); err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("complete SSE Write bytes=%d error=%v, want exact %d bytes before EOF", len(got), err, len(want))
+				}
+				if chunks, err := r.Finish(); err != nil || len(chunks) != 0 {
+					t.Fatalf("Finish=(%q,%v), want no replay", chunks, err)
+				}
+			})
+		}
+	}
+}
+
+func TestJSONShapedSSEPrettyLinearAllocations(t *testing.T) {
+	for _, lines := range []int{64, 128, 1024} {
+		t.Run(fmt.Sprint(lines), func(t *testing.T) {
+			input := []byte("{\n\"model\":\"upstream\"\n" + strings.Repeat(", \"x\": 0\n", lines) + "}")
+			want := bytes.Replace(input, []byte(`"upstream"`), []byte(`"client"`), 1)
+			parts := bytes.SplitAfter(input, []byte{'\n'})
+			if got := functionalProtocolParts(t, "claude", parts...); string(got) != "data: "+strings.ReplaceAll(string(want), "\n", "\ndata: ")+"\n\n" {
+				t.Fatalf("pretty raw output=%q", got)
+			}
+			allocs := testing.AllocsPerRun(5, func() {
+				r := newStreamChunkRewriter("client")
+				r.format, r.frameRawJSONAsSSE = "claude", true
+				for _, part := range parts[:len(parts)-1] {
+					if _, err := r.Write(part); err != nil {
+						panic(err)
+					}
+				}
+			})
+			// 换行成员不得逐行重新分配 Decoder 和完整 pending buffer。
+			if allocs > 64 {
+				t.Fatalf("%d lines: allocations=%v, want <=64 without per-line decoding", lines, allocs)
+			}
+		})
+	}
+}
+
+func TestJSONShapedSSEPrettyCRContinuation(t *testing.T) {
+	for _, eol := range []string{"\r", "\r\n", "\r\n\n\r"} {
+		for _, lines := range []int{1024, 8192} {
+			t.Run(fmt.Sprintf("eol=%q/lines=%d", eol, lines), func(t *testing.T) {
+				input := []byte("{" + eol + `"model":"upstream"` + eol + strings.Repeat(", \"x\": 0"+eol, lines) + "}")
+				if !json.Valid(input) {
+					t.Fatal("invalid pretty raw control")
+				}
+				want := bytes.Replace(input, []byte(`"upstream"`), []byte(`"client"`), 1)
+				for _, size := range []int{len(input), 8192, 1} {
+					r := newStreamChunkRewriter("client")
+					r.format = "claude"
+					if chunks, err := r.Write(input[:1]); err != nil || len(chunks) != 0 {
+						t.Fatalf("initial Write=(%q,%v)", chunks, err)
+					}
+					var got []byte
+					for offset := 1; offset < len(input); offset += size {
+						chunks, err := r.Write(input[offset:min(offset+size, len(input))])
+						if err != nil {
+							t.Fatal(err)
+						}
+						got = append(got, bytes.Join(chunks, nil)...)
+					}
+					if !bytes.Equal(got, want) {
+						t.Fatalf("callback size=%d output bytes=%d, want exact %d bytes before EOF", size, len(got), len(want))
+					}
+					if chunks, err := r.Finish(); err != nil || len(chunks) != 0 {
+						t.Fatalf("Finish=(%q,%v), want no replay", chunks, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestJSONShapedSSEEmitsDuringWrite(t *testing.T) {
+	const event = "{\nevent: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"upstream\"}}\n\n"
+	const want = "{\nevent: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"client\"}}\n\n"
+	r := newStreamChunkRewriter("client")
+	r.format, r.frameRawJSONAsSSE = "claude", true
+	first, err := r.Write([]byte(event[:1]))
+	if err != nil || len(first) != 0 {
+		t.Fatalf("first Write=(%q,%v)", first, err)
+	}
+	chunks, err := r.Write([]byte(event[1:]))
+	if got := string(bytes.Join(chunks, nil)); err != nil || got != want {
+		t.Fatalf("complete Write output=%q error=%v, want %q before EOF", got, err, want)
+	}
+}
+
+func TestJSONShapedSSELeadingWhitespace(t *testing.T) {
+	for _, prefix := range []string{"\n", " \t", "\r\n\r\n"} {
+		input := []byte(prefix + "{\ndata: {\"message\":{\"model\":\"upstream\"}}\n\n")
+		want := prefix + "{\ndata: {\"message\":{\"model\":\"client\"}}\n\n"
+		for i, parts := range classificationPartitions(input) {
+			if got := functionalProtocolParts(t, "claude", parts...); string(got) != want {
+				t.Fatalf("prefix=%q partition=%d output=%q, want %q", prefix, i, got, want)
+			}
+		}
+	}
+}
+
+func TestJSONShapedSSEAfterRawPrefix(t *testing.T) {
+	input := []byte("{\"model\":\"upstream\"}\n{\ndata: {\"message\":{\"model\":\"upstream\"}}\n\n")
+	const want = "data: {\"model\":\"client\"}\n\n{\ndata: {\"message\":{\"model\":\"client\"}}\n\n"
+	for i, parts := range classificationPartitions(input) {
+		if got := functionalProtocolParts(t, "claude", parts...); string(got) != want {
+			t.Errorf("partition=%d output=%q, want %q", i, got, want)
+		}
+	}
+}
+
+func TestJSONShapedSSEPartitions(t *testing.T) {
+	for _, format := range []string{"", "claude"} {
+		for _, field := range []string{"{", "[", `"vendor`, `"tag"suffix`, "x-vendor-field"} {
+			for _, eol := range []string{"\n", "\r", "\r\n"} {
+				t.Run(fmt.Sprintf("%s/field=%s/eol=%q", format, field, eol), func(t *testing.T) {
+					input := []byte(field + eol + "event: message_start" + eol + `data: {"type":"message_start","message":{"model":"upstream"},"opaque":{"model":"upstream"}}` + eol + eol)
+					want := field + eol + "event: message_start" + eol + `data: {"type":"message_start","message":{"model":"client"},"opaque":{"model":"upstream"}}` + eol + eol
+					for i, parts := range classificationPartitions(input) {
+						r := newStreamChunkRewriter("client")
+						r.format, r.frameRawJSONAsSSE = format, true
+						var out []byte
+						for _, part := range parts {
+							chunks, err := r.Write(part)
+							if err != nil {
+								t.Fatalf("partition=%d Write: %v", i, err)
+							}
+							out = append(out, bytes.Join(chunks, nil)...)
+						}
+						if eol == "\r" {
+							chunks, err := r.Write([]byte(": next"))
+							if err != nil {
+								t.Fatal(err)
+							}
+							out = append(out, bytes.Join(chunks, nil)...)
+						}
+						if string(out) != want {
+							t.Fatalf("partition=%d Write output=%q, want %q before EOF", i, out, want)
+						}
+						chunks, err := r.Finish()
+						wantTail := ""
+						if eol == "\r" {
+							wantTail = ": next"
+						}
+						if err != nil || string(bytes.Join(chunks, nil)) != wantTail {
+							t.Fatalf("Finish=(%q,%v), want %q", chunks, err, wantTail)
+						}
+						if chunks, err := r.Finish(); err != nil || len(chunks) != 0 {
+							t.Fatalf("replayed Finish=(%q,%v)", chunks, err)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestJSONShapedSSEUnterminatedEOF(t *testing.T) {
+	for _, finish := range []bool{false, true} {
+		for _, field := range []string{"{", "[", `"vendor`} {
+			t.Run(fmt.Sprintf("%s/finish=%v", field, finish), func(t *testing.T) {
+				r := newStreamChunkRewriter("client")
+				r.format, r.frameRawJSONAsSSE = "claude", true
+				input := []byte(field + "\ndata: {\"message\":{\"model\":\"upstream\"}}")
+				want := field + "\ndata: {\"message\":{\"model\":\"client\"}}"
+				for _, part := range [][]byte{input[:1], input[1:]} {
+					if chunks, err := r.Write(part); err != nil || len(chunks) != 0 {
+						t.Fatalf("unterminated Write=(%q,%v)", chunks, err)
+					}
+				}
+				var chunks [][]byte
+				var err error
+				if finish {
+					chunks, err = r.Finish()
+				} else {
+					chunks, err = r.Flush()
+				}
+				if got := string(bytes.Join(chunks, nil)); err != nil || got != want {
+					t.Fatalf("EOF output=%q error=%v, want %q", got, err, want)
+				}
+				if chunks, err := r.Finish(); err != nil || len(chunks) != 0 {
+					t.Fatalf("replayed EOF=(%q,%v)", chunks, err)
+				}
+			})
+		}
+	}
+}
+
+func TestJSONShapedSSEKeepsRawControls(t *testing.T) {
+	for _, input := range []string{
+		"{\n\n\"model\":\"upstream\",\n\"x:data:event\":\"data: opaque\\ntext\"\n}",
+		"{\n\"model\"\n: \"upstream\"\n, \"x\"\n: 0\n}",
+		"[\n{\"model\":\"upstream\"}\n,\ntrue\n]",
+		`"opaque data: event: upstream"`,
+	} {
+		for _, mode := range []struct {
+			format string
+			framed bool
+		}{{"", false}, {"claude", false}, {"", true}, {"claude", true}} {
+			for i, parts := range classificationPartitions([]byte(input)) {
+				r := newStreamChunkRewriter("client")
+				r.format, r.frameRawJSONAsSSE = mode.format, mode.framed
+				var out []byte
+				for _, part := range parts {
+					chunks, err := r.Write(part)
+					if err != nil {
+						t.Fatal(err)
+					}
+					out = append(out, bytes.Join(chunks, nil)...)
+				}
+				chunks, err := r.Finish()
+				out = append(out, bytes.Join(chunks, nil)...)
+				want := strings.Replace(input, `"model":"upstream"`, `"model":"client"`, 1)
+				want = strings.Replace(want, ": \"upstream\"", ": \"client\"", 1)
+				if mode.framed {
+					want = "data: " + strings.ReplaceAll(want, "\n", "\ndata: ") + "\n\n"
+				}
+				if err != nil || string(out) != want {
+					t.Fatalf("format=%s framed=%v partition=%d raw=%q error=%v want=%q", mode.format, mode.framed, i, out, err, want)
+				}
+			}
+		}
+	}
+	for _, suffix := range []string{`{`, `[`, `"unfinished`, `{"model":`, `{"text":"data: opaque`} {
+		for _, prefix := range []string{"", `{"model":"upstream"} `} {
+			for _, finish := range []bool{false, true} {
+				r := newStreamChunkRewriter("client")
+				r.format, r.frameRawJSONAsSSE = "claude", true
+				chunks, err := r.Write([]byte(prefix + suffix))
+				if err != nil {
+					t.Fatal(err)
+				}
+				var tail [][]byte
+				if finish {
+					tail, err = r.Finish()
+				} else {
+					tail, err = r.Flush()
+				}
+				want := ""
+				if prefix != "" {
+					want = "data: {\"model\":\"client\"}\n\n"
+				}
+				if err == nil || !strings.Contains(err.Error(), "incomplete raw JSON stream") || string(bytes.Join(append(chunks, tail...), nil)) != want {
+					t.Fatalf("prefix=%q suffix=%q output=%q error=%v", prefix, suffix, append(chunks, tail...), err)
+				}
+				if chunks, err := r.Finish(); err != nil || len(chunks) != 0 {
+					t.Fatalf("replay=(%q,%v)", chunks, err)
+				}
+			}
+		}
+	}
+}
+
+func TestJSONShapedSSEHostErrorFlush(t *testing.T) {
+	input := []byte("{\"model\":\"upstream\"}\n{\ndata: {\"message\":{\"model\":\"upstream\"}}")
+	const want = "data: {\"model\":\"client\"}\n\n{\ndata: {\"message\":{\"model\":\"client\"}}"
+	for _, parts := range classificationPartitions(input) {
+		reads, hostCloses, pluginCloses := 0, 0, 0
+		var emitted []byte
+		var closeText string
+		stream := &executorStream{originalModel: "client", format: "claude", frameRawJSONAsSSE: true, hostStreamID: "shaped-error-host", pluginStreamID: "shaped-error-plugin"}
+		stream.call = func(method string, payload any) (json.RawMessage, error) {
+			switch method {
+			case pluginabi.MethodHostModelStreamRead:
+				if reads == len(parts) {
+					return json.Marshal(pluginapi.HostModelStreamReadResponse{Error: "primary upstream error"})
+				}
+				part := parts[reads]
+				reads++
+				return json.Marshal(pluginapi.HostModelStreamReadResponse{Payload: part})
+			case pluginabi.MethodHostStreamEmit:
+				raw, err := json.Marshal(payload)
+				if err != nil {
+					return nil, err
+				}
+				var emit struct{ Payload []byte }
+				if err := json.Unmarshal(raw, &emit); err != nil {
+					return nil, err
+				}
+				emitted = append(emitted, emit.Payload...)
+			case pluginabi.MethodHostModelStreamClose:
+				hostCloses++
+			case pluginabi.MethodHostStreamClose:
+				pluginCloses++
+				raw, err := json.Marshal(payload)
+				if err != nil {
+					return nil, err
+				}
+				var closed struct{ Error string }
+				if err := json.Unmarshal(raw, &closed); err != nil {
+					return nil, err
+				}
+				closeText = closed.Error
+			default:
+				return nil, fmt.Errorf("unexpected callback %s", method)
+			}
+			return json.RawMessage(`{}`), nil
+		}
+		if err := runStreamForward(stream); err != nil || string(emitted) != want || closeText != "primary upstream error" || hostCloses != 1 || pluginCloses != 1 {
+			t.Fatalf("error=%v output=%q terminal=%q closes=%d/%d", err, emitted, closeText, hostCloses, pluginCloses)
+		}
+	}
+}
+
+func TestJSONShapedSSEPendingLimits(t *testing.T) {
+	prefix := []byte("{\ndata: {\"message\":{\"model\":\"upstream\"},\"text\":\"")
+	complete := append(bytes.Clone(prefix), bytes.Repeat([]byte{'x'}, maxPendingStreamBytes)...)
+	complete = append(complete, []byte("\"}\n\n")...)
+	want := bytes.Replace(complete, []byte(`"model":"upstream"`), []byte(`"model":"client"`), 1)
+	for _, split := range []int{0, 1, maxPendingStreamBytes} {
+		r := newStreamChunkRewriter("client")
+		r.format, r.frameRawJSONAsSSE = "claude", true
+		first, err := r.Write(complete[:split])
+		if err != nil {
+			t.Fatal(err)
+		}
+		chunks, err := r.Write(complete[split:])
+		if err != nil || !bytes.Equal(bytes.Join(append(first, chunks...), nil), want) {
+			t.Fatalf("complete split=%d error=%v", split, err)
+		}
+	}
+	for _, size := range []int{maxPendingStreamBytes, maxPendingStreamBytes + 1} {
+		r := newStreamChunkRewriter("client")
+		r.format, r.frameRawJSONAsSSE = "claude", true
+		if _, err := r.Write(prefix[:1]); err != nil {
+			t.Fatal(err)
+		}
+		input := append(bytes.Clone(prefix[1:]), bytes.Repeat([]byte{'x'}, size-len(prefix))...)
+		chunks, err := r.Write(input)
+		if len(chunks) != 0 || (err != nil) != (size > maxPendingStreamBytes) {
+			t.Fatalf("size=%d output=%d error=%v", size, len(chunks), err)
+		}
+		if size > maxPendingStreamBytes {
+			if !strings.Contains(err.Error(), "stream pending data exceeds") || r.pending != nil || r.sse.buf != nil {
+				t.Fatalf("overflow retained data: %v", err)
+			}
+			if chunks, err := r.Finish(); err != nil || len(chunks) != 0 {
+				t.Fatalf("overflow replay=%q error=%v", chunks, err)
+			}
+		}
+	}
+}
+
+func TestJSONShapedSSEForwarder(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	t.Cleanup(func() {
+		shutdownExecutorStreams()
+		resetExecutorStreamLifecycle()
+		setLoadedConfigForTest(defaultConfig())
+	})
+	for _, format := range []string{"openai", "claude"} {
+		input := []byte("{\nevent: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"upstream\"},\"opaque\":{\"model\":\"upstream\"}}\n\n")
+		want := "{\nevent: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"client\"},\"opaque\":{\"model\":\"upstream\"}}\n\n"
+		for i, parts := range classificationPartitions(input) {
+			reads := make([]pluginapi.HostModelStreamReadResponse, 0, len(parts)+1)
+			for _, part := range parts {
+				reads = append(reads, pluginapi.HostModelStreamReadResponse{Payload: part})
+			}
+			reads = append(reads, pluginapi.HostModelStreamReadResponse{Done: true})
+			req := rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{Model: "client", Format: format, SourceFormat: format, Stream: true, OriginalRequest: []byte(`{"model":"client","stream":true,"opaque":{"model":"client"}}`)}, StreamID: "shaped-helper"}
+			var forwarded pluginapi.HostModelExecutionRequest
+			emitted, hostClosed, pluginClosed, _, err := runExecutorStreamTestWithHostContentTypeAndForwarded(req, reads, "text/event-stream", &forwarded)
+			if err != nil || strings.Join(emitted, "") != want || !hostClosed || !pluginClosed || forwarded.Model != "upstream" || string(forwarded.Body) != `{"model":"upstream","stream":true,"opaque":{"model":"client"}}` {
+				t.Fatalf("format=%s partition=%d output=%q close=%v/%v forwarded=%+v error=%v", format, i, emitted, hostClosed, pluginClosed, forwarded, err)
+			}
+		}
+	}
+}
+
+func TestStreamClassificationRPCEnvelopes(t *testing.T) {
+	setLoadedConfigForTest(Config{GlobalRules: "client=>upstream"})
+	t.Cleanup(func() {
+		shutdownExecutorStreams()
+		resetExecutorStreamLifecycle()
+		setHostCallbackForTest(nil)
+		setLoadedConfigForTest(defaultConfig())
+	})
+	for _, tc := range []struct{ name, format, contentType, input, want string }{
+		{"A-document", "openai", "application/json", "\r\n\r\n{\"model\":\"upstream\"}", "\r\n\r\n{\"model\":\"client\"}"},
+		{"A-sequence", "openai", "application/json", "{}\n\n1.5 {\"model\":\"upstream\"}", "{}\n\n1.5 {\"model\":\"client\"}"},
+		{"B-generic", "openai", "text/event-stream", "{\nevent: message_start\ndata: {\"message\":{\"model\":\"upstream\"}}\n\n", "{\nevent: message_start\ndata: {\"message\":{\"model\":\"client\"}}\n\n"},
+		{"B-claude", "claude", "text/event-stream", "{\nevent: message_start\ndata: {\"message\":{\"model\":\"upstream\"}}\n\n", "{\nevent: message_start\ndata: {\"message\":{\"model\":\"client\"}}\n\n"},
+	} {
+		for i, parts := range classificationPartitions([]byte(tc.input)) {
+			t.Run(fmt.Sprintf("%s/partition=%d", tc.name, i), func(t *testing.T) {
+				var emitted []byte
+				var order []string
+				reads := 0
+				done := make(chan struct{})
+				setHostCallbackForTest(func(method string, raw []byte) ([]byte, error) {
+					var response any = struct{}{}
+					switch method {
+					case pluginabi.MethodHostModelExecuteStream:
+						var req pluginapi.HostModelExecutionRequest
+						if err := json.Unmarshal(raw, &req); err != nil {
+							return nil, err
+						}
+						if req.Model != "upstream" || string(req.Body) != `{"model":"upstream","stream":true,"opaque":{"model":"client"}}` || req.Headers.Get("Content-Length") != "" {
+							return nil, fmt.Errorf("forwarded=%+v", req)
+						}
+						response = pluginapi.HostModelStreamResponse{StatusCode: 200, StreamID: "rpc-host", Headers: http.Header{"Content-Type": {tc.contentType}, "Content-Length": {"999"}, "ETag": {"tag"}, "X-Opaque": {"keep"}}}
+					case pluginabi.MethodHostModelStreamRead:
+						if reads == len(parts) {
+							if string(emitted) != tc.want {
+								return nil, fmt.Errorf("complete output before terminal read=%q want=%q", emitted, tc.want)
+							}
+							response = pluginapi.HostModelStreamReadResponse{Done: true}
+						} else {
+							response = pluginapi.HostModelStreamReadResponse{Payload: parts[reads]}
+						}
+						reads++
+					case pluginabi.MethodHostStreamEmit:
+						var emit struct{ Payload []byte }
+						if err := json.Unmarshal(raw, &emit); err != nil {
+							return nil, err
+						}
+						emitted = append(emitted, emit.Payload...)
+					case pluginabi.MethodHostModelStreamClose:
+						order = append(order, "host-close")
+					case pluginabi.MethodHostStreamClose:
+						var closed struct{ Error string }
+						if err := json.Unmarshal(raw, &closed); err != nil {
+							return nil, err
+						}
+						order = append(order, "plugin-close")
+						if closed.Error != "" {
+							t.Errorf("terminal error=%q", closed.Error)
+						}
+						close(done)
+					default:
+						return nil, fmt.Errorf("unexpected callback %s", method)
+					}
+					payload, err := json.Marshal(response)
+					if err != nil {
+						return nil, err
+					}
+					return wrapEnvelope(payload, nil)
+				})
+				req := executorRPCRequest{Model: "client", Format: tc.format, SourceFormat: tc.format, StreamID: "rpc-plugin", Headers: http.Header{"Content-Length": {"999"}}, OriginalRequest: []byte(`{"model":"client","stream":true,"opaque":{"model":"client"}}`)}
+				raw, err := json.Marshal(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				result, err := handleMethod(pluginabi.MethodExecutorExecuteStream, raw)
+				var envelope pluginabi.Envelope
+				if decodeErr := json.Unmarshal(result, &envelope); err != nil || decodeErr != nil || !envelope.OK {
+					t.Fatalf("envelope=%s error=%v/%v", result, err, decodeErr)
+				}
+				var setup pluginapi.ExecutorStreamResponse
+				if err := json.Unmarshal(envelope.Result, &setup); err != nil {
+					t.Fatal(err)
+				}
+				if setup.Headers.Get("Content-Length") != "" || setup.Headers.Get("ETag") != "" || setup.Headers.Get("X-Opaque") != "keep" {
+					t.Fatalf("headers=%v", setup.Headers)
+				}
+				select {
+				case <-done:
+				case <-time.After(2 * time.Second):
+					t.Fatal("RPC stream did not close")
+				}
+				shutdownExecutorStreams()
+				resetExecutorStreamLifecycle()
+				if string(emitted) != tc.want || reads != len(parts)+1 || strings.Join(order, ",") != "host-close,plugin-close" {
+					t.Fatalf("output=%q reads=%d order=%v", emitted, reads, order)
+				}
+			})
+		}
+	}
+}
 
 func TestFunctionalOpenAIRawCoreChunks(t *testing.T) {
 	t.Cleanup(func() {
